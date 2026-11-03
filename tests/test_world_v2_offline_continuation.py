@@ -70,6 +70,96 @@ def test_online_world_continuation_refuses_a_different_holdout_split(tmp_path, m
         runpy.run_path(str(SCRIPT), run_name='__main__')
 
 
+def test_cpu_paired_replay_is_a_readonly_mmap_view(tmp_path, monkeypatch):
+    checkpoint, _, _ = fixture(tmp_path)
+    script = runpy.run_path(str(SCRIPT))
+    source, schema, _, _ = script['online_source'](checkpoint)
+    from supermimic_rl.world_model_v2.replay import CompactReplay
+    original = CompactReplay.from_state_dict
+    observed = []
+
+    def capture(cls, payload, device, **kwargs):
+        replay = original(payload, device, **kwargs)
+        observed.append(kwargs)
+        assert replay.data['ticks'].data_ptr() == payload['storage']['ticks'].data_ptr()
+        return replay
+
+    monkeypatch.setattr(CompactReplay, 'from_state_dict', classmethod(capture))
+    replay = script['paired_replay'](source, schema, 'cpu')
+    assert observed == [{'read_only': True}] and replay.read_only
+    with pytest.raises(RuntimeError, match='read-only'):
+        replay.add({}, {})
+
+
+def test_event_fit_normalizes_uniform_prefix_scores_full_batch_and_resumes_exactly(tmp_path, monkeypatch):
+    checkpoint, _, _ = fixture(tmp_path)
+    seen_observe, seen_terms = [], []
+    original_observe, original_terms = WorldModelFit.observe, WorldModelFit.terms
+
+    def observe(self, windows):
+        seen_observe.append(windows['action'].shape[0])
+        assert windows['action'].shape == (3, 8, 6)
+        assert not windows['action'][..., 0].any()
+        return original_observe(self, windows)
+
+    def terms(self, windows):
+        seen_terms.append(windows['action'].shape[0])
+        assert windows['action'].shape == (4, 8, 6)
+        assert not windows['action'][..., 0].any()
+        return original_terms(self, windows)
+
+    monkeypatch.setattr(WorldModelFit, 'observe', observe)
+    monkeypatch.setattr(WorldModelFit, 'terms', terms)
+    common = ['fit_world_v2', '--device', 'cpu', '--validation-horizon', '8', '--validation-batch', '2',
+              '--identified-bundle', str(ROOT / 'configs/identified/20261031'),
+              '--linkage', str(ROOT / 'configs/linkage/leg_linkage_e726d23c.json')]
+
+    def run(extra):
+        monkeypatch.setattr('sys.argv', common + extra)
+        runpy.run_path(str(SCRIPT), run_name='__main__')
+
+    first, resumed, full = (tmp_path / name for name in ('event.json', 'event-next.json', 'event-full.json'))
+    run(['--online-checkpoint', str(checkpoint), '--contact-event-fraction', '.25',
+         '--iterations', '1', '--output', str(first)])
+    run(['--resume', str(first.with_suffix('.checkpoint.pt')), '--iterations', '2', '--output', str(resumed)])
+    run(['--online-checkpoint', str(checkpoint), '--contact-event-fraction', '.25',
+         '--iterations', '2', '--output', str(full)])
+    actual = torch.load(resumed.with_suffix('.checkpoint.pt'), weights_only=True)
+    expected = torch.load(full.with_suffix('.checkpoint.pt'), weights_only=True)
+    assert actual['configuration']['contact_event_fraction'] == .25
+    assert actual['configuration']['normalization'] == 'update_on_uniform_prefix_only'
+    assert seen_observe == [3] * 4 and seen_terms == [4] * 4
+    assert actual['history'][-1]['uniform_windows'] == 3
+    assert actual['history'][-1]['contact_event_windows'] == 1
+    for name in actual['model']:
+        torch.testing.assert_close(actual['model'][name], expected['model'][name], rtol=0, atol=0)
+    assert torch.equal(actual['generator'], expected['generator'])
+    with pytest.raises(ValueError, match='model/data/training contract differs'):
+        run(['--resume', str(first.with_suffix('.checkpoint.pt')), '--contact-event-fraction', '0', '--iterations', '2'])
+
+
+def test_legacy_uniform_checkpoint_without_event_setting_resumes_as_fraction_zero(tmp_path, monkeypatch):
+    checkpoint, _, _ = fixture(tmp_path)
+    common = ['fit_world_v2', '--device', 'cpu', '--validation-horizon', '8', '--validation-batch', '2',
+              '--identified-bundle', str(ROOT / 'configs/identified/20261031'),
+              '--linkage', str(ROOT / 'configs/linkage/leg_linkage_e726d23c.json')]
+
+    def run(extra):
+        monkeypatch.setattr('sys.argv', common + extra)
+        runpy.run_path(str(SCRIPT), run_name='__main__')
+
+    first, output = tmp_path / 'uniform.json', tmp_path / 'legacy-next.json'
+    run(['--online-checkpoint', str(checkpoint), '--iterations', '1', '--output', str(first)])
+    path = first.with_suffix('.checkpoint.pt')
+    saved = torch.load(path, weights_only=True)
+    del saved['configuration']['contact_event_fraction']
+    torch.save(saved, path)
+    run(['--resume', str(path), '--iterations', '2', '--output', str(output)])
+    configuration = json.loads(output.read_text())['configuration']
+    assert configuration['contact_event_fraction'] == 0.
+    assert configuration['normalization'] == 'update_on_real_training_windows'
+
+
 def test_resume_allows_only_explicit_batch_change_and_preserves_adam_rng_and_source(tmp_path, monkeypatch):
     checkpoint, _, replay = fixture(tmp_path)
     common = ['fit_world_v2', '--device', 'cpu', '--replay-device', 'cpu', '--validation-horizon', '8',

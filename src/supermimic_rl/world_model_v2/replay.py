@@ -10,6 +10,7 @@ eligible.
 from __future__ import annotations
 
 from collections.abc import Sequence
+import math
 
 import torch
 from torch import Tensor
@@ -19,6 +20,7 @@ from .stair_task import STAIR_RECORD_DTYPES
 from .stair_source import TOF_RECORD_DTYPES
 from .jump_task import JUMP_RECORD_DTYPES, JUMP_TRIGGER_RECORD_DTYPES
 from .recovery_task import RECOVERY_RECORD_DTYPES
+from .physical import INCREMENT_DIM
 
 _NATIVE_RECORD_DTYPES = {**STAIR_RECORD_DTYPES, **TOF_RECORD_DTYPES, **JUMP_RECORD_DTYPES,
                          **JUMP_TRIGGER_RECORD_DTYPES, **RECOVERY_RECORD_DTYPES}
@@ -174,6 +176,8 @@ class CompactReplay:
         self.total_steps = sequence_id + 1
         self.size = min(self.size + 1, self.capacity)
         self.head = (slot + 1) % self.capacity
+        if getattr(self, '_contact_off_ticks', None) is not None:
+            self._contact_off_ticks[slot].copy_(self._wheel_off_ticks(record['ticks']))
         self._cache.clear()
 
     def _chronological(self) -> Tensor:
@@ -198,6 +202,51 @@ class CompactReplay:
                 chronological = {name: self.data[name][slots] for name in BOUNDARY_FIELDS}
                 eligible = eligible_windows(chronological, self.sequence[slots], horizon)
                 self._cache[key] = eligible.reshape(-1).nonzero().flatten()
+        return self._allowed(self._cache[key], env_ids)
+
+    @staticmethod
+    def _wheel_off_ticks(ticks: Tensor) -> Tensor:
+        """Native wheel support loads, not wheel resultant or body-normal forces."""
+        if ticks.ndim < 3 or ticks.shape[-2] != 4 or ticks.shape[-1] < INCREMENT_DIM + 2:
+            raise ValueError('Contact events require four recorded physics ticks with two wheel support loads')
+        return (ticks[..., INCREMENT_DIM:INCREMENT_DIM + 2] <= 2.).all(-1)
+
+    def contact_event_window_candidates(self, horizon: int, env_ids=None) -> Tensor:
+        """Legal windows containing at least two consecutive double-wheel-off ticks.
+
+        The 2 N threshold and two 5 ms ticks identify recorded loss of support,
+        not a successful jump. Pairs may straddle a 20 ms policy boundary but
+        never a replay boundary. The lazy boolean cache is ~16 MB at 4096x1000;
+        scanning contiguous slices avoids copying the multi-GB tick tensor.
+        """
+        candidates = self.window_candidates(horizon)
+        key = ('contact_event_window', horizon)
+        if key not in self._cache:
+            if not candidates.numel():
+                self._cache[key] = candidates
+            else:
+                if getattr(self, '_contact_off_ticks', None) is None:
+                    if 'ticks' not in self.data:
+                        raise ValueError('Contact event sampling requires recorded physics ticks')
+                    off = torch.zeros(self.capacity, self.num_envs, 4, dtype=torch.bool, device=self.device)
+                    first = (self.head - self.size) % self.capacity
+                    count = min(self.size, self.capacity - first)
+                    for lo, hi in ((first, first + count), (0, self.size - count)):
+                        for start in range(lo, hi, 64):
+                            end = min(start + 64, hi)
+                            off[start:end].copy_(self._wheel_off_ticks(self.data['ticks'][start:end]))
+                    self._contact_off_ticks = off
+                off = self._contact_off_ticks[self._chronological()]
+                within = (off[..., :-1] & off[..., 1:]).any(-1)
+                prefix = torch.cat((torch.zeros(1, self.num_envs, dtype=torch.int64, device=self.device),
+                                    within.cumsum(0)))
+                event = prefix[horizon:] > prefix[:-horizon]
+                if horizon > 1:
+                    across = off[:-1, :, -1] & off[1:, :, 0]
+                    prefix = torch.cat((torch.zeros(1, self.num_envs, dtype=torch.int64, device=self.device),
+                                        across.cumsum(0)))
+                    event |= prefix[horizon - 1:] > prefix[:-(horizon - 1)]
+                self._cache[key] = candidates[event.flatten()[candidates]]
         return self._allowed(self._cache[key], env_ids)
 
     def start_candidates(self, env_ids: Sequence[int] | None = None) -> Tensor:
@@ -254,6 +303,51 @@ class CompactReplay:
         for name in names:
             torch.index_select(self.data[name].flatten(0, 1), 0, flat, out=out[name].flatten(0, 1))
         return out
+
+    def sample_contact_windows(self, batch: int, horizon: int, *, contact_event_fraction: float = 0.,
+                               generator=None, env_ids=None, field_names: Sequence[str] | None = None,
+                               out: dict[str, Tensor] | None = None) -> tuple[dict[str, Tensor], int]:
+        """Mix uniform and event windows; return the uniform prefix length for normalization.
+
+        At least one row remains uniform. Empty event pools fall back to the
+        original uniform draw. Fraction zero takes exactly the old RNG path.
+        Validation should continue to use ``sample_windows`` on held-out envs.
+        """
+        if (not math.isfinite(contact_event_fraction) or not 0 <= contact_event_fraction < 1
+                or batch < 1):
+            raise ValueError('Contact event sampling needs a positive batch and fraction in [0, 1)')
+        partition = None if env_ids is None else tuple(torch.as_tensor(env_ids).cpu().tolist())
+        uniform_key = ('contact_sampling_uniform', horizon, partition)
+        if uniform_key not in self._cache:
+            self._cache[uniform_key] = self.window_candidates(horizon, env_ids)
+        candidates = self._cache[uniform_key]
+        event_count = min(batch - 1, int(batch * contact_event_fraction))
+        events = None
+        if event_count:
+            event_key = ('contact_sampling_event', horizon, partition)
+            if event_key not in self._cache:
+                self._cache[event_key] = self.contact_event_window_candidates(horizon, env_ids)
+            events = self._cache[event_key]
+        if not event_count or not events.numel():
+            return (self.sample_windows(batch, horizon, generator=generator, candidates=candidates,
+                                        field_names=field_names, out=out), batch)
+        uniform_count = batch - event_count
+        # Reuse pinned staging without allocating then concatenating two full batches.
+        names = tuple(self.data) if field_names is None else tuple(field_names)
+        if not names or len(set(names)) != len(names) or any(name not in self.data for name in names):
+            raise ValueError('Replay projection requires distinct existing field names')
+        if out is not None and any(value.ndim < 1 or value.shape[0] != batch for value in out.values()):
+            raise ValueError('Replay output buffers must contain the full mixed batch')
+        if out is None:
+            out = {name: torch.empty(batch, horizon, *self.data[name].shape[2:],
+                                    dtype=self.data[name].dtype, device=self.device) for name in names}
+        uniform = {name: value[:uniform_count] for name, value in out.items()}
+        focused = {name: value[uniform_count:] for name, value in out.items()}
+        self.sample_windows(uniform_count, horizon, generator=generator, candidates=candidates,
+                            field_names=names, out=uniform)
+        self.sample_windows(event_count, horizon, generator=generator,
+                            candidates=events, field_names=names, out=focused)
+        return out, uniform_count
 
     def sample_starts(self, batch: int, history: int, *, generator=None, env_ids=None, candidates=None):
         """Start-step fields ``[B, ...]`` and the actor's history frames ``[B, history, 45]``."""
