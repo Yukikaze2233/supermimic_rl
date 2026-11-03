@@ -168,18 +168,21 @@ def test_contact_floor_is_refit_after_each_world_fit_before_imagination(tmp_path
 
 def test_guard_judges_only_policy_cycles_and_restores_after_a_sustained_drop(tmp_path, monkeypatch):
     from supermimic_rl.world_model_v2.guard import NativeRegressionGuard
+    from supermimic_rl.world_model_v2.policy import EstimatorActor
 
     rewards = iter([.02, .09, .09, .09, .05, .04])
     trainer = _stub_trainer(tmp_path, monkeypatch, [], cycles=6, guard_drop_fraction=.1, guard_patience=2)
     learner = trainer.learner
-    learner.actor = torch.nn.Linear(2, 2)
-    learner.optimizers = {'actor': torch.optim.Adam(learner.actor.parameters(), lr=5e-5)}
+    learner.actor = EstimatorActor(history_length=1, estimator_hidden=(4,), actor_hidden=(4,), frame_dim=35)
+    learner.optimizers = {'actor': torch.optim.Adam(learner.actor.decoder.parameters(), lr=5e-5),
+                          'estimator': torch.optim.Adam(learner.actor.estimator.parameters(), lr=1e-3)}
     original = {name: value.clone() for name, value in learner.actor.state_dict().items()}
 
     def update_policy(start, frames, **kwargs):
         if kwargs['train_actor']:
             with torch.no_grad():
-                learner.actor.weight.add_(1.)
+                learner.actor.decoder[0].weight.add_(1.)
+                learner.actor.estimator[0].weight.add_(.25)
         return {'actor/updated': float(kwargs['train_actor'])}
 
     learner.update_policy = update_policy
@@ -190,5 +193,8 @@ def test_guard_judges_only_policy_cycles_and_restores_after_a_sustained_drop(tmp
     assert ['guard' in row for row in metrics] == [False, False, True, True, True, True]
     assert metrics[2]['guard']['best_student_reward'] == .09 and not metrics[4]['guard']['restored']
     assert metrics[5]['guard']['restored'] and metrics[5]['guard']['actor_learning_rate'] == 2.5e-5
+    assert not metrics[5]['guard']['estimator_optimizer_legacy_reset']
+    assert 'estimator_optimizer' in trainer.guard.best
     # Restored to the actor that collected the best (baseline) return, then that cycle's two updates.
-    torch.testing.assert_close(learner.actor.weight, original['weight'] + 2.)
+    torch.testing.assert_close(learner.actor.decoder[0].weight, original['decoder.0.weight'] + 2.)
+    torch.testing.assert_close(learner.actor.estimator[0].weight, original['estimator.0.weight'] + .5)

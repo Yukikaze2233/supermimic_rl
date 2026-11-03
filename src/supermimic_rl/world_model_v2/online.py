@@ -469,10 +469,12 @@ class OnlineTrainer:
             # From the first policy cycle on; its collection still uses the initial
             # actor and becomes the baseline best.
             guarded = self.guard is not None and cycle > cfg.policy_start_cycle
-            snapshot = self.guard.snapshot(learner.actor, learner.optimizers['actor']) if guarded else None
+            snapshot = (self.guard.snapshot(learner.actor, learner.optimizers['actor'],
+                        estimator_optimizer=learner.optimizers['estimator']) if guarded else None)
             collection = self.collector.collect(cfg.collection_steps, actor_updates=learner.updates['actor'])
             guard = (self.guard.observe(collection.get('student_reward_mean'), snapshot, learner.actor,
-                                        learner.optimizers['actor']) if guarded else None)
+                        learner.optimizers['actor'], estimator_optimizer=learner.optimizers['estimator'])
+                     if guarded else None)
             if getattr(self, 'task_norm_pending', False):
                 self.initialize_task_norm()
             collected_at = time.monotonic()
