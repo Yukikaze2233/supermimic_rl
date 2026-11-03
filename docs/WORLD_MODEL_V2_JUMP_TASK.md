@@ -38,7 +38,8 @@ Actor 输入。模块记录字段可选；普通平地旧 replay 不需要迁移
 自动请求复用原生 `3 + 5 * uniform` 秒间隔。调用方必须在整批 imagination 准备时提供
 `interval_uniform[N]`，不要在 microbatch 或重试内部重抽。传显式 `RequestCommand` 时自动源休眠。
 
-物理输入 `wheel_contact_force[N,4,2]` 是轮地接触**净力范数**，不是法向载荷。跳跃证据使用
+物理输入 `wheel_support_load[N,4,2]` 是两轮接触面法向力提供的向上支撑载荷，与原生
+`state.wheel_ground_force_n` 一致；不能用包含切向摩擦力的净力范数替代。跳跃证据使用
 base COM 的世界 z 速度；`com_velocity()` 根据已有 COM 偏移计算
 `v_origin + omega × (R @ com_offset)`。共享奖励跟踪仍使用 base_link 原点速度。
 倾角采用原生 `atan2(norm(gravity_xy), -gravity_z)`。
@@ -101,7 +102,7 @@ python scripts/check_native_jump_task.py /absolute/path/replay.pt \
   --output outputs/jump-native-consistency.json
 ```
 
-设备类型要与采集的 stair RNG 一致。入口直接解码四个已记录物理子步、轮接触净力和
+设备类型要与采集的 stair RNG 一致。入口直接解码四个已记录物理子步、轮法向支撑载荷和
 COM 偏移，推进 JumpTask；用真实下一记录的传感器队列与当前已部署估计推进命令、请求和台阶仲裁。
 对照相邻记录的 phase、腾空／上升标志、峰高、落地时间、paid ID、协议、可见 goal 和来源状态。
 最后一个真实子步还与单独记录的 `end_physical` 对照。

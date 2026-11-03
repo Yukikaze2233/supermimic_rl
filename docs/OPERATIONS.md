@@ -94,6 +94,8 @@ python scripts/report_world_v2_data.py --online-checkpoint <online>/training/res
 
 数据报告读取 checkpoint 中已有的接触滤波阈值，在同一批重新采样的留出窗口上同时报告原始预测和滤波后的接触事件 precision/recall；没有正样本时 recall 为 null。各预测时距的瞬时事件统计覆盖末尾区间四个物理子步；提供 SHA256 匹配的 `--runtime-json` 后，另按原生确认时间统计整个预测窗口中的接触终止误报/漏报。报告不会重拟合滤波阈值，也不会把滤波后的载荷误差冒充原始模型误差；报告样本与标定共享留出环境总体，不能据此声称使用了独立测试集。
 
+完整在线配对报告通过只读 mmap 视图读取 replay，避免再分配一份完整训练回放；采样窗口仍拥有独立存储。训练恢复默认复制数据，不受此选项影响。读取活跃运行时，应依据最后写入的 `resume.json` 固定同一代 checkpoint/replay，避免两槽轮换期间混用不同循环；报告记录对应循环和 replay 文件名。
+
 启用跳跃触发门控时，采集器额外记录上次请求结束时间与门控状态，想象按原生顺序检查上一时刻的指令高度、回合时间和冷却。Actor 与运动网络维度不变，Critic 追加三个任务特征。旧的无门控配对 checkpoint 可通过 `scripts/upgrade_online_jump_trigger.py --checkpoint <resume.pt> --reference-dataset <gated-native-replay.pt> --output <new-directory>` 显式扩展：保留运动监督，旧任务起点全部标为未知，重新采集后才用于想象；新增 Critic 列及 Adam 历史补零，再用新数据标定归一化。
 
 这项迁移只允许新增门控及其声明的参考轨迹，不允许同时更换奖励、课程、物理或传感器合同。跨奖励/课程版本的旧运行还需要单独验证这些合同的迁移，不能直接替换来源标识后续训。

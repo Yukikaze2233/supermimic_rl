@@ -44,6 +44,7 @@ class CompactReplay:
         self.data["segment_age"] = torch.zeros(capacity_steps, num_envs, dtype=torch.int64, device=self.device)
         self.sequence = torch.full((capacity_steps,), -1, dtype=torch.int64, device=self.device)
         self.size = self.head = self.total_steps = 0
+        self.read_only = False
         self._cache: dict = {}
 
     def __len__(self) -> int:
@@ -73,11 +74,22 @@ class CompactReplay:
                 'storage': {name: snapshot(value) for name, value in self.data.items()}}
 
     @classmethod
-    def from_state_dict(cls, payload: dict, device='cpu', *, capacity_steps=None, env_ids=None):
+    def from_state_dict(cls, payload: dict, device='cpu', *, capacity_steps=None, env_ids=None,
+                        read_only: bool = False):
+        """Restore training storage, or view chronological CPU storage for audit.
+
+        ``read_only=True`` aliases populated checkpoint tensors (including
+        mmap storage) instead of allocating another full ring. Appending is
+        disabled; sampled windows/starts still own their tensors. Callers must
+        treat ``data`` itself as read-only, as PyTorch has no immutable view.
+        Training resumes retain the independent-copy default.
+        """
         if payload.get('format') != 'supermimic-compact-replay-v1':
             raise ValueError('Unknown compact replay format')
         data, sequence = payload['storage'], payload['sequence']
         n, size, capacity = payload['num_envs'], len(sequence), payload['capacity']
+        if n < 1 or capacity < 1:
+            raise ValueError('Replay requires positive environment count and capacity')
         if (sequence.dtype != torch.int64 or sequence.ndim != 1 or size > capacity
                 or (size and (sequence[0] < 0 or sequence[-1] >= payload['total_steps']))
                 or (sequence[1:] <= sequence[:-1]).any()):
@@ -90,6 +102,25 @@ class CompactReplay:
                      else _NATIVE_RECORD_DTYPES.get(name, torch.float32))
             if value.shape[:2] != (size, n) or value.dtype != dtype:
                 raise ValueError('Invalid compact field shape/dtype: ' + name)
+        if read_only:
+            if (torch.device(device).type != 'cpu' or capacity_steps is not None or env_ids is not None
+                    or sequence.device.type != 'cpu' or any(value.device.type != 'cpu' for value in data.values())):
+                raise ValueError('Read-only replay requires CPU storage without capacity or environment overrides')
+            if size:
+                replay = cls.__new__(cls)
+                replay.num_envs, replay.device = n, torch.device('cpu')
+                # Serialized rows are already chronological. A full ring of
+                # only those rows preserves indexing without unused capacity.
+                replay.capacity = replay.size = size
+                replay.data, replay.sequence = dict(data), sequence
+                replay.head, replay.total_steps, replay._cache = 0, payload['total_steps'], {}
+            else:
+                # Empty checkpoints have no populated storage to alias.
+                replay = cls({name: tuple(value.shape[2:]) for name, value in data.items() if name not in reserved},
+                             n, 1, 'cpu')
+                replay.total_steps = payload['total_steps']
+            replay.read_only = True
+            return replay
         capacity = capacity if capacity_steps is None else capacity_steps
         if capacity < size:
             raise ValueError('Restoring replay may not silently discard recorded history')
@@ -111,6 +142,8 @@ class CompactReplay:
 
     @torch.no_grad()
     def add(self, record: dict[str, Tensor], boundary: dict[str, Tensor], *, sequence_id: int | None = None) -> None:
+        if self.read_only:
+            raise RuntimeError('Cannot append to a read-only replay audit view')
         sequence_id = self.total_steps if sequence_id is None else sequence_id
         if sequence_id < self.total_steps:
             raise ValueError("Replay sequence IDs must strictly increase")
