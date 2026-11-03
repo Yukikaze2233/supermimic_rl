@@ -240,6 +240,7 @@ def test_recovery_qualification_overrides_request_before_native_admission_and_pr
 
 
 def test_qualification_request_budget_uses_the_installed_physics_clock(adapter):
+    """Owned physics ticks, including those after handoff, govern request expiry."""
     from transformer_rl.formal.control.observation import CommandMode
     from transformer_rl.formal.lab_env.recovery_lifecycle import RecoveryLifecycle, RecoveryLifecycleConfig
     from transformer_rl.formal.tasks.protocol import CompletedEstimate
@@ -282,7 +283,12 @@ def test_qualification_request_budget_uses_the_installed_physics_clock(adapter):
             torch.testing.assert_close(admitted.requested[~rows], requested[~rows])
             for _ in range(4):
                 owner.observe_physics(**values)
-            now = torch.full((n,), .02 * (interval + 1), dtype=torch.float64)
+            if interval == 1:
+                values['policy_owned'].fill_(False)
+                owner.observe_physics(**values)
+                values['policy_owned'].fill_(True)
+            owned_time = torch.full((n,), .02 * (interval + 1), dtype=torch.float64)
+            now = owned_time + (.005 if interval >= 1 else 0.)
             estimate = CompletedEstimate(torch.zeros(n), torch.ones(n, 2), torch.zeros(n), torch.zeros(n),
                 now - .01, torch.ones(n, dtype=torch.bool))
             result = owner.finish_interval(now, estimate, policy_owned=values['policy_owned'],
@@ -290,7 +296,9 @@ def test_qualification_request_budget_uses_the_installed_physics_clock(adapter):
             if interval == 0:
                 assert result.handoff[rows].all()
                 assert not evaluator.recovery_evidence.qualification['open'][rows].any()
-            torch.testing.assert_close(plan.qualification_clock[rows], now[rows])
+            torch.testing.assert_close(plan.qualification_clock[rows], owned_time[rows])
+            if interval >= 1:
+                assert not torch.allclose(plan.qualification_clock[rows], now[rows])
             assert plan.qualification_clock[~rows].eq(0).all()
         # Physical success/handoff did not release the request early; only
         # the shared owned-time budget now permits the native request again.
@@ -300,7 +308,8 @@ def test_qualification_request_budget_uses_the_installed_physics_clock(adapter):
         torch.testing.assert_close(tasks.stream.step(requested).requested[rows], plan.qualification_commands[rows])
     finally:
         evaluator.close()
-    assert 'step' not in tasks.stream.__dict__ and 'observe_physics' not in owner.__dict__
+    assert 'step' not in tasks.stream.__dict__
+    assert not {'observe_physics', 'finish_interval', 'reset'} & owner.__dict__.keys()
 
 
 def test_fixed_physical_tiles_ignore_training_proficiency_and_ceiling_exploration(adapter):
