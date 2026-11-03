@@ -99,3 +99,19 @@ python scripts/report_world_v2_data.py --online-checkpoint <online>/training/res
 启用跳跃触发门控时，采集器额外记录上次请求结束时间与门控状态，想象按原生顺序检查上一时刻的指令高度、回合时间和冷却。Actor 与运动网络维度不变，Critic 追加三个任务特征。旧的无门控配对 checkpoint 可通过 `scripts/upgrade_online_jump_trigger.py --checkpoint <resume.pt> --reference-dataset <gated-native-replay.pt> --output <new-directory>` 显式扩展：保留运动监督，旧任务起点全部标为未知，重新采集后才用于想象；新增 Critic 列及 Adam 历史补零，再用新数据标定归一化。
 
 这项迁移只允许新增门控及其声明的参考轨迹，不允许同时更换奖励、课程、物理或传感器合同。跨奖励/课程版本的旧运行还需要单独验证这些合同的迁移，不能直接替换来源标识后续训。
+
+`scripts/upgrade_online_task_semantics.py` 专门处理 a05 到 R7 的任务语义变更。它要求真实目标原生数据、两份固定 runtime/course，以及在目标环境重新评价导出的同权重教师。runtime 只允许开启 ToF 模式标志；资产、物理、执行链、传感器必须相同，源和目标都不能包含助力或未建模外扰。参考轨迹以目标原生记录为准，短/长参考的选择仍由探针结果决定。
+
+迁移保留世界模型、Actor、估计器及其优化器，历史 replay 继续提供物理监督；所有旧任务有效标志清零，不伪造新任务历史。奖励改变后重建 Critic 和 Adam、重设回报回退基线，并在新原生数据上校准完整 Critic 输入、执行显式预热。课程坐标仅指定采样位置，不代表能力晋级；历史采样计数和 RNG 保留，任务混合配额重新开始。
+
+```sh
+python scripts/upgrade_online_task_semantics.py \
+  --checkpoint <a05>/resume-a.pt --reference-dataset <target-native>/replay.pt \
+  --source-runtime <a05-runtime.json> --target-runtime <tof-runtime-without-disturbances.json> \
+  --source-course <old-course.json> --target-course <v5-course.json> \
+  --source-teacher <old-teacher.pt> --target-teacher <reevaluated-same-teacher.pt> \
+  --course-coordinate <sampling-coordinate> --critic-warmup-cycles <warmup-cycles> \
+  --output <new-handoff-directory>
+```
+
+输出新的 checkpoint/replay 配对和配置，不覆盖源运行。启动前先用真实记录核验请求、冷却、ToF 和奖励链路，再检查按技能划分的预测与接触事件报告；软件迁移通过不等于跳跃、台阶或翻正已学会。完整推扰课程还需要为世界模型记录并推进外扰，不能直接复用 PPO 的有推扰 runtime。

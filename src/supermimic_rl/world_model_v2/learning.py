@@ -303,10 +303,11 @@ class Learner:
 
         A migration appends critic inputs with neutral statistics; the online
         trainer calibrates them once real records exist, keeping older columns.
+        ``first=0`` explicitly recalibrates a fresh critic after a reward change.
         """
         norm, imagination = self.critic.norm, self.imagination
-        if type(first) is not int or not 0 < first < len(norm.mean):
-            raise ValueError('Explicit appended critic feature range required')
+        if type(first) is not int or not 0 <= first < len(norm.mean):
+            raise ValueError('Explicit critic feature calibration range required')
         features = imagination.critic_features(decode_physical(start['physical']), start['height'], start['scan'],
             decode_memory(start['memory']), start['goal'], start['sim_context'], start['failure_memory'],
             start['failure_conditions'], torch.cat((start['reward_memory'], start['support_memory']), -1),
