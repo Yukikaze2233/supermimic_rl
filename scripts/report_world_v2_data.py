@@ -78,7 +78,7 @@ def main():
     from supermimic_rl.contracts import StateSchema
     from supermimic_rl.world_model_v2.replay import CompactReplay
 
-    state, hidden, contact_floor = None, None, None
+    state, hidden, contact_floor, pair_identity = None, None, None, {}
     if args.online_checkpoint is not None:
         saved = torch.load(args.online_checkpoint, map_location="cpu", weights_only=True, mmap=True)
         schema = StateSchema.from_dict(saved["schema"])
@@ -86,7 +86,8 @@ def main():
                              weights_only=True, mmap=True)
         if dataset["schema_fingerprint"] != schema.fingerprint or dataset["cycle"] != saved["cycle"]:
             raise ValueError("Online checkpoint and replay generation differ")
-        replay = CompactReplay.from_state_dict(dataset["replay"], "cpu")
+        pair_identity = {'checkpoint_cycle': saved['cycle'], 'replay_file': saved['replay_file']}
+        replay = CompactReplay.from_state_dict(dataset["replay"], "cpu", read_only=True)
         state, hidden = saved["learner"]["model"], saved["config"]["model_hidden"]
         contact_floor = checkpoint_contact_floor(saved['learner'], args.device)
         fraction = saved["config"].get("validation_fraction", args.validation_fraction)
@@ -107,7 +108,7 @@ def main():
                     generator=torch.Generator().manual_seed(args.seed), device=args.device,
                     contact_floor=contact_floor, termination=pinned_termination(schema, args.runtime_json))
     result.update(schema_fingerprint=schema.fingerprint, validation_env_ids=[valid_ids[0], valid_ids[-1]],
-                  source=str((args.online_checkpoint or args.replay).resolve()))
+                  source=str((args.online_checkpoint or args.replay).resolve()), **pair_identity)
     args.output.parent.mkdir(parents=True, exist_ok=True)
     args.output.write_text(json.dumps(result, indent=2) + "\n")
     print(json.dumps({name: entry["coverage"].get("transitions") for name, entry in result["populations"].items()}))
