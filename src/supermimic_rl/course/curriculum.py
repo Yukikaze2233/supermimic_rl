@@ -73,6 +73,10 @@ class CourseCurriculumConfig:
     jump_standing_fraction_of_stage: float = .25
     jump_full_motion_fraction_of_stage: float = .80
     moving_jump_min_fraction: float = .10
+    # Stage over which the requested jump height range widens from the
+    # initial to the full domain (jump-first course). "active_jump" grows the
+    # upper height inside the jump stage so every later stage samples all heights.
+    jump_height_stage: str = "combined_dr"
 
     def __post_init__(self):
         budgets = tuple(self.stage_transition_budgets)
@@ -120,6 +124,8 @@ class CourseCurriculumConfig:
             value = getattr(self, name)
             if type(value) not in (float, int) or not math.isfinite(value) or not 0 < value <= 1:
                 raise ValueError(name + " must lie in (0, 1]")
+        if self.jump_height_stage not in STAGE_NAMES:
+            raise ValueError("jump_height_stage must name a course stage")
         if self.jump_standing_fraction_of_stage >= self.jump_full_motion_fraction_of_stage:
             raise ValueError("Jump moving exposure must follow standing exposure")
         object.__setattr__(self, "stage_transition_budgets", budgets)

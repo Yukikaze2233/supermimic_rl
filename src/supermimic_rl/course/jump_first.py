@@ -98,7 +98,7 @@ class JumpFirstCurriculum(SuperMimicCurriculum):
         terrain = interpolate_domain(self.initial_domain, self.domain,
                                      self._stage_fraction('terrain_foundation'))
         jump = interpolate_domain(self.initial_domain, self.domain,
-                                  self._stage_fraction('combined_dr'))
+                                  self._stage_fraction(self.config.jump_height_stage))
         return replace(command, height_m=height.height_m,
             slope_rad=terrain.slope_rad, roughness_m=terrain.roughness_m,
             step_up_m=terrain.step_up_m, step_down_m=terrain.step_down_m,

@@ -173,4 +173,27 @@ def test_explicit_factory_selection_and_pinned_configuration():
     path = Path(__file__).resolve().parents[1] / 'configs/gpufree/ppo-course-jump-first.json'
     configured = make_course_curriculum(2, 'cpu', 7, json.loads(path.read_text()))
     original = json.loads(path.with_name('ppo-course.json').read_text())
-    assert configured.config.to_dict() == original
+    assert configured.config.to_dict() == {**original, 'jump_height_stage': 'combined_dr'}
+
+
+def test_jump_height_range_widens_inside_the_configured_stage():
+    import json
+    from supermimic_rl.course.curriculum import CourseCurriculumConfig
+    from supermimic_rl.course.jump_first import JumpFirstCurriculum
+    from support import REPO_ROOT
+
+    base = json.loads((REPO_ROOT / 'configs/gpufree/ppo-course-gated-v4.json').read_text())['base']
+    uppers = {}
+    for stage in ('combined_dr', 'active_jump'):
+        curriculum = JumpFirstCurriculum(4, 'cpu', 7, CourseCurriculumConfig.from_dict({**base, 'jump_height_stage': stage}))
+        start = sum(curriculum.stage_budgets[:curriculum.stage_names.index('active_jump')])
+        values = []
+        for fraction in (0., .5, 1.):
+            curriculum.set_progress(start + int(fraction * curriculum.stage_budgets[2]), 0)
+            values.append(curriculum._effective_domain().jump_m[1])
+        uppers[stage] = values
+    assert uppers['combined_dr'] == [pytest.approx(.1)] * 3
+    low, mid, high = uppers['active_jump']
+    assert low == pytest.approx(.1) and .1 < mid < .4 and high == pytest.approx(.4)
+    with pytest.raises(ValueError, match='jump_height_stage'):
+        CourseCurriculumConfig.from_dict({**base, 'jump_height_stage': 'nope'})
