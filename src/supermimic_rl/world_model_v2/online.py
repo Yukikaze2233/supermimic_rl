@@ -302,12 +302,8 @@ class OnlineTrainer:
             raise ValueError('Online learning needs distinct training and validation environment rows')
         self.train_ids = list(range(environment.num_envs - held))
         self.validation_ids = list(range(environment.num_envs - held, environment.num_envs))
-        self.guard = (NativeRegressionGuard(config.guard_drop_fraction, config.guard_patience,
-                                            config.learning.actor_learning_rate)
-                      if config.guard_drop_fraction else None)
+        self._initialize_guard(saved)
         if saved is not None:
-            if self.guard is not None and saved.get('guard') is not None:
-                self.guard.load_state_dict(saved['guard'])
             self.collector.steps = saved['collection_steps']
             self.collector.generator.set_state(saved['collection_rng'])
             if 'mixing' in saved:
@@ -321,6 +317,23 @@ class OnlineTrainer:
         self.mixing.actor_updates = self.learner.updates['actor']
         self._write_json(self.output / 'configuration.json', asdict(config))
         self._write_json(self.output / 'resume-migrations.json', self.resume_migrations)
+
+    def _initialize_guard(self, saved):
+        config = self.config
+        self.guard = (NativeRegressionGuard(config.guard_drop_fraction, config.guard_patience,
+                                            config.learning.actor_learning_rate)
+                      if config.guard_drop_fraction else None)
+        self.guard_cold_cycles_remaining = 0
+        self.guard_cold_previous_bad_cycles = None
+        if saved is not None and self.guard is not None:
+            if saved.get('guard') is not None:
+                self.guard.load_state_dict(saved['guard'])
+            # Native resume resets the full population physically. Reuse the
+            # existing startup observation budget without restarting learning.
+            if config.policy_start_cycle:
+                self.guard_cold_cycles_remaining = config.policy_start_cycle
+                self.guard_cold_previous_bad_cycles = self.guard.bad_cycles
+                self.guard.bad_cycles = 0
 
     def _check_saved(self, saved):
         if (saved.get('format') != CHECKPOINT_FORMAT or saved['model_contract'] != MODEL_CONTRACT
@@ -468,13 +481,23 @@ class OnlineTrainer:
             self.mixing.actor_updates = learner.updates['actor']
             # From the first policy cycle on; its collection still uses the initial
             # actor and becomes the baseline best.
-            guarded = self.guard is not None and cycle > cfg.policy_start_cycle
+            guard_deferred = self.guard is not None and self.guard_cold_cycles_remaining > 0
+            guarded = self.guard is not None and cycle > cfg.policy_start_cycle and not guard_deferred
             snapshot = (self.guard.snapshot(learner.actor, learner.optimizers['actor'],
                         estimator_optimizer=learner.optimizers['estimator']) if guarded else None)
             collection = self.collector.collect(cfg.collection_steps, actor_updates=learner.updates['actor'])
             guard = (self.guard.observe(collection.get('student_reward_mean'), snapshot, learner.actor,
                         learner.optimizers['actor'], estimator_optimizer=learner.optimizers['estimator'])
                      if guarded else None)
+            if guard_deferred:
+                self.guard_cold_cycles_remaining -= 1
+                guard = {'student_reward': collection.get('student_reward_mean'),
+                    'best_student_reward': self.guard.best_reward, 'bad_cycles': self.guard.bad_cycles,
+                    'restored': False, 'restorations': self.guard.restorations,
+                    'actor_learning_rate': learner.optimizers['actor'].param_groups[0]['lr'],
+                    'deferred_reason': 'cold_resume',
+                    'remaining_cycles': self.guard_cold_cycles_remaining,
+                    'cold_resume_previous_bad_cycles': self.guard_cold_previous_bad_cycles}
             if getattr(self, 'task_norm_pending', False):
                 self.initialize_task_norm()
             collected_at = time.monotonic()
