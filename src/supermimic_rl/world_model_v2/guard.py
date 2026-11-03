@@ -31,7 +31,7 @@ class NativeRegressionGuard:
 
     def observe(self, reward: float | None, snapshot: dict, actor, optimizer, *, estimator_optimizer=None) -> dict:
         """Judge one collection made by ``snapshot``; restore the best actor if it regressed."""
-        restored = legacy_estimator_reset = False
+        restored = legacy_actor_reset = legacy_estimator_reset = False
         if reward is not None:
             if self.best_reward is None or reward > self.best_reward:
                 self.best_reward, self.best, self.bad_cycles = reward, snapshot, 0
@@ -39,17 +39,19 @@ class NativeRegressionGuard:
                 self.bad_cycles += 1
                 if self.bad_cycles >= self.patience:
                     actor.load_state_dict(self.best['actor'])
-                    # Adam may reuse loaded moment tensors on the same device.
-                    # Subsequent updates must not mutate the saved best state.
-                    optimizer.load_state_dict(copy.deepcopy(self.best['optimizer']))
-                    if estimator_optimizer is not None:
-                        if 'estimator_optimizer' in self.best:
+                    if estimator_optimizer is not None and 'estimator_optimizer' not in self.best:
+                        # Old joint snapshots lack estimator moments, and their
+                        # decoder moments could alias live Adam after a prior
+                        # restore. Neither history can be paired reliably now.
+                        optimizer.state.clear()
+                        estimator_optimizer.state.clear()
+                        legacy_actor_reset = legacy_estimator_reset = True
+                    else:
+                        # Adam may reuse loaded moment tensors on the same device.
+                        # Subsequent updates must not mutate the saved best state.
+                        optimizer.load_state_dict(copy.deepcopy(self.best['optimizer']))
+                        if estimator_optimizer is not None:
                             estimator_optimizer.load_state_dict(copy.deepcopy(self.best['estimator_optimizer']))
-                        else:
-                            # Legacy snapshots lack matching estimator moments.
-                            # Reset only on restoration, retaining its groups/LR.
-                            estimator_optimizer.state.clear()
-                            legacy_estimator_reset = True
                     self.restorations += 1
                     self.bad_cycles, restored = 0, True
             else:
@@ -59,7 +61,8 @@ class NativeRegressionGuard:
         return {'student_reward': reward, 'best_student_reward': self.best_reward, 'bad_cycles': self.bad_cycles,
                 'restored': restored, 'restorations': self.restorations, 'actor_learning_rate': self.learning_rate(),
                 **({} if estimator_optimizer is None else
-                   {'estimator_optimizer_legacy_reset': legacy_estimator_reset})}
+                   {'actor_optimizer_legacy_reset': legacy_actor_reset,
+                    'estimator_optimizer_legacy_reset': legacy_estimator_reset})}
 
     def state_dict(self) -> dict:
         return {'best_reward': self.best_reward, 'best': self.best, 'bad_cycles': self.bad_cycles,

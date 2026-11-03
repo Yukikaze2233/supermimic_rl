@@ -90,6 +90,7 @@ def test_joint_actor_estimator_restore_matches_both_adams_and_keeps_best_snapsho
     result = guard.observe(.1, guard.snapshot(actor, optimizer, estimator_optimizer=estimator_optimizer),
                            actor, optimizer, estimator_optimizer=estimator_optimizer)
     assert result['restored'] and not result['estimator_optimizer_legacy_reset']
+    assert not result['actor_optimizer_legacy_reset']
     torch.testing.assert_close(actor.state_dict(), frozen_best['actor'], rtol=0, atol=0)
     expected_decoder = copy.deepcopy(frozen_best['optimizer'])
     expected_decoder['param_groups'][0]['lr'] *= .5
@@ -115,35 +116,55 @@ def test_joint_actor_estimator_restore_matches_both_adams_and_keeps_best_snapsho
     again = resumed.observe(.1, resumed.snapshot(actor, optimizer, estimator_optimizer=estimator_optimizer),
                             actor, optimizer, estimator_optimizer=estimator_optimizer)
     assert again['restorations'] == 2 and not again['estimator_optimizer_legacy_reset']
+    assert not again['actor_optimizer_legacy_reset']
     torch.testing.assert_close(actor.state_dict(), frozen_best['actor'], rtol=0, atol=0)
     expected_decoder['param_groups'][0]['lr'] *= .5
     assert_optimizer_state(optimizer, expected_decoder)
     assert_optimizer_state(estimator_optimizer, frozen_best['estimator_optimizer'])
 
 
-def test_legacy_best_resets_estimator_adam_only_on_real_restore_and_preserves_its_groups():
+@pytest.mark.parametrize('previous_legacy_restore', [False, True])
+def test_legacy_joint_best_resets_both_adams_only_on_real_restore_and_preserves_groups(previous_legacy_restore):
     actor, optimizer, estimator_optimizer = estimated_actor_and_optimizers()
     for target in (1., -1.):
         update_estimated_actor(actor, optimizer, estimator_optimizer, target)
     legacy = NativeRegressionGuard(.1, 2, 1e-3)
     best = legacy.snapshot(actor, optimizer)  # Historical snapshot has no estimator Adam.
     legacy.observe(1., best, actor, optimizer)
+    if previous_legacy_restore:
+        # Reproduce the old code path: load without deepcopy then train, so
+        # best still contains old weights but its saved decoder moments drift.
+        optimizer.load_state_dict(best['optimizer'])
     update_estimated_actor(actor, optimizer, estimator_optimizer, 2.)
+    if previous_legacy_restore:
+        saved = best['optimizer']['state'][0]['exp_avg']
+        current_moment = optimizer.state_dict()['state'][0]['exp_avg']
+        assert saved.untyped_storage().data_ptr() == current_moment.untyped_storage().data_ptr()
+        assert all(int(state['step']) == 3 for state in best['optimizer']['state'].values())
+    optimizer.param_groups[0]['betas'] = (.8, .99)
     estimator_optimizer.param_groups[0]['lr'] = 7e-4
+    current_actor = copy.deepcopy(optimizer.state_dict())
     current = copy.deepcopy(estimator_optimizer.state_dict())
     guard = NativeRegressionGuard(.1, 2, 1e-3)
     guard.load_state_dict(copy.deepcopy(legacy.state_dict()))
+    assert_optimizer_state(optimizer, current_actor)
     assert_optimizer_state(estimator_optimizer, current)
     for reward in (None, .95, .5):
         result = guard.observe(reward, guard.snapshot(actor, optimizer, estimator_optimizer=estimator_optimizer),
                                actor, optimizer, estimator_optimizer=estimator_optimizer)
         assert not result['restored'] and not result['estimator_optimizer_legacy_reset']
+        assert not result['actor_optimizer_legacy_reset']
+        assert_optimizer_state(optimizer, current_actor)
         assert_optimizer_state(estimator_optimizer, current)
     result = guard.observe(.4, guard.snapshot(actor, optimizer, estimator_optimizer=estimator_optimizer),
                            actor, optimizer, estimator_optimizer=estimator_optimizer)
     assert result['restored'] and result['estimator_optimizer_legacy_reset']
+    assert result['actor_optimizer_legacy_reset']
     torch.testing.assert_close(actor.state_dict(), best['actor'], rtol=0, atol=0)
-    assert not estimator_optimizer.state
+    assert not optimizer.state and not estimator_optimizer.state
+    current_actor['param_groups'][0]['lr'] *= .5
+    assert optimizer.state_dict()['param_groups'] == current_actor['param_groups']
     assert estimator_optimizer.state_dict()['param_groups'] == current['param_groups']
     update_estimated_actor(actor, optimizer, estimator_optimizer, .2)
+    assert all(int(value['step']) == 1 for value in optimizer.state.values())
     assert all(int(value['step']) == 1 for value in estimator_optimizer.state.values())
