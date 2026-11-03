@@ -26,11 +26,15 @@ class GateTimeout(RuntimeError):
 
 
 def _lookup(record: dict, path: str):
-    value = record
-    for part in path.split("."):
-        if not isinstance(value, dict) or part not in value:
-            return None
-        value = value[part]
+    # Flat metric names may contain decimal points, e.g. rise_0.00-0.10.
+    # Prefer the complete key before treating dots as nested-dictionary paths.
+    value = record.get(path)
+    if path not in record:
+        value = record
+        for part in path.split("."):
+            if not isinstance(value, dict) or part not in value:
+                return None
+            value = value[part]
     return value if isinstance(value, (int, float)) and math.isfinite(value) else None
 
 
@@ -73,14 +77,27 @@ class GateCriterion:
 
 @dataclass(frozen=True)
 class StageGate:
-    """Entering ``stage`` requires every criterion over the last ``window`` updates."""
+    """Entering ``stage`` (or a point inside it) requires every criterion over the last ``window`` updates.
+
+    ``at_fraction`` > 0 places the gate inside ``stage`` at that fraction of
+    its transitions. Holding the coordinate there also holds every schedule
+    derived from it (e.g. the jump height cap and the assist level), so the
+    difficulty inside a stage advances on performance, not on time.
+    """
 
     stage: str
     criteria: tuple[GateCriterion, ...]
     window: int = 20
     timeout_updates: int = 2000
+    at_fraction: float = 0.
+
+    @property
+    def key(self) -> str:
+        return self.stage if not self.at_fraction else f"{self.stage}@{self.at_fraction:g}"
 
     def __post_init__(self):
+        if type(self.at_fraction) not in (int, float) or not 0 <= self.at_fraction < 1:
+            raise ValueError("at_fraction must lie in [0, 1)")
         criteria = tuple(item if isinstance(item, GateCriterion) else GateCriterion(**item) for item in self.criteria)
         object.__setattr__(self, "criteria", criteria)
         if not criteria:
@@ -96,19 +113,31 @@ class CourseGates:
         unknown = [gate.stage for gate in gates if gate.stage not in stage_starts]
         if unknown:
             raise ValueError(f"Gated stages are not in the course: {unknown}")
-        if len({gate.stage for gate in gates}) != len(gates) or any(stage_starts[gate.stage] < 1 for gate in gates):
-            raise ValueError("Gates must name distinct stages that start after coordinate zero")
-        self.gates = tuple(sorted(gates, key=lambda gate: stage_starts[gate.stage]))
+        starts = sorted(stage_starts.values())
+        self._ends = {name: next((value for value in starts if value > start), None)
+                      for name, start in stage_starts.items()}
+        if (len({gate.key for gate in gates}) != len(gates)
+                or any(not gate.at_fraction and stage_starts[gate.stage] < 1 for gate in gates)
+                or any(gate.at_fraction and self._ends[gate.stage] is None for gate in gates)):
+            raise ValueError("Gates must be distinct, start after coordinate zero and lie inside a bounded stage")
         self.stage_starts, self.cap = dict(stage_starts), cap
+        self.gates = tuple(sorted(gates, key=self._position))
+        self._by_key = {gate.key: gate for gate in self.gates}
         self.coordinate, self.opened, self.held_updates = 0, [], 0
         self.history = deque(maxlen=max(gate.window for gate in self.gates) if self.gates else 1)
 
+    def _position(self, gate: StageGate) -> int:
+        start = self.stage_starts[gate.stage]
+        if not gate.at_fraction:
+            return start
+        return start + int(gate.at_fraction * (self._ends[gate.stage] - start))
+
     def _next(self) -> StageGate | None:
-        return next((gate for gate in self.gates if gate.stage not in self.opened), None)
+        return next((gate for gate in self.gates if gate.key not in self.opened), None)
 
     def _limit(self, gate: StageGate) -> int:
         # The native course enters a stage at its first coordinate; wait one before.
-        return self.stage_starts[gate.stage] - 1
+        return self._position(gate) - 1
 
     def advance(self, record: dict, transitions: int) -> dict:
         """Evaluate the waiting gate on records up to this one, then move the coordinate."""
@@ -120,15 +149,15 @@ class CourseGates:
             values = {criterion.name: criterion.value(window) for criterion in gate.criteria}
             passed = (len(window) >= gate.window
                       and all(criterion.holds(values[criterion.name]) for criterion in gate.criteria))
-            status.update(gate=gate.stage, gate_values=values, gate_passed=passed)
+            status.update(gate=gate.key, gate_values=values, gate_passed=passed)
             if passed:
-                self.opened.append(gate.stage)
+                self.opened.append(gate.key)
                 self.held_updates = 0
             else:
                 self.held_updates += 1
                 status["held_updates"] = self.held_updates
                 if self.held_updates > gate.timeout_updates:
-                    raise GateTimeout(f"Gate before {gate.stage} held for {self.held_updates} updates: {values}")
+                    raise GateTimeout(f"Gate before {gate.key} held for {self.held_updates} updates: {values}")
         target = self.coordinate + transitions
         gate = self._next()
         if gate is not None:
@@ -137,8 +166,12 @@ class CourseGates:
             target = min(target, self.cap)
         self.coordinate = target
         status.update(coordinate=self.coordinate, opened=list(self.opened),
-                      waiting_for=None if gate is None else gate.stage)
+                      waiting_for=None if gate is None else gate.key)
         return status
+
+    def stage(self) -> str:
+        """The course stage containing the current coordinate."""
+        return max((start, name) for name, start in self.stage_starts.items() if start <= self.coordinate)[1]
 
     def rewind(self, stage: str) -> dict:
         """Return the coordinate to the first transition of ``stage`` to repeat it.
@@ -154,7 +187,7 @@ class CourseGates:
         receipt = {"stage": stage, "coordinate_before": self.coordinate, "coordinate": start,
                    "opened_before": list(self.opened), "held_updates_before": self.held_updates}
         self.coordinate = start
-        self.opened = [name for name in self.opened if self.stage_starts[name] <= start]
+        self.opened = [key for key in self.opened if self._position(self._by_key[key]) <= start]
         self.held_updates = 0
         self.history.clear()
         return {**receipt, "opened": list(self.opened)}
@@ -169,7 +202,7 @@ class CourseGates:
         Restarting also drops the old window, so the gate is judged only on
         updates collected under the resumed configuration.
         """
-        if not set(state["opened"]) <= {gate.stage for gate in self.gates}:
+        if not set(state["opened"]) <= set(self._by_key):
             raise ValueError("Saved course gates differ from the configured gates")
         self.coordinate, self.opened = int(state["coordinate"]), list(state["opened"])
         self.held_updates = 0 if restart_hold else int(state["held_updates"])

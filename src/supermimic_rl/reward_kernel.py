@@ -44,16 +44,18 @@ class RewardExtensions:
     jump_lift_cap_m_s: float = 2.
     jump_push: float = 0.          # per second at full reference upward speed before flight
     success_event: float | None = None
+    jump_missed: float = 0.        # per second in reference HOLD without physical takeoff
 
     def __post_init__(self):
-        values = (self.jump_flight, self.jump_lift, self.jump_lift_cap_m_s, self.jump_push,
+        values = (self.jump_flight, self.jump_lift, self.jump_lift_cap_m_s, self.jump_push, self.jump_missed,
                   1. if self.success_event is None else self.success_event)
         if any(type(value) not in (int, float) or not math.isfinite(value) or value < 0 for value in values):
             raise ValueError("Reward extensions must be finite and nonnegative")
 
     @property
     def active(self) -> bool:
-        return bool(self.jump_flight or self.jump_lift or self.jump_push or self.success_event is not None)
+        return bool(self.jump_flight or self.jump_lift or self.jump_push or self.jump_missed
+                    or self.success_event is not None)
 
 
 @dataclass(frozen=True)
@@ -142,7 +144,8 @@ def gimbal_tracking_densities(reference, velocity_world):
 
 
 def physical_reward_densities(sample: RewardPhysics, reference: RewardReference,
-                             history: RewardHistory, parameters: RewardParameters) -> RewardDensities:
+                             history: RewardHistory, parameters: RewardParameters, *,
+                             jump_reference_stage: Tensor | None = None) -> RewardDensities:
     """Pure densities; integrate with the physical dt exactly once outside."""
     invalid = torch.zeros_like(reference.mode, dtype=torch.bool)
     failure_scale = torch.ones_like(sample.height_above_ground_m)
@@ -363,6 +366,26 @@ def physical_reward_densities(sample: RewardPhysics, reference: RewardReference,
         cost = {key: value if key in available else torch.zeros_like(value)
                 for key, value in cost.items()}
     extensions = parameters.extensions
+    missed_jump = torch.zeros_like(jump)
+    if extensions.jump_missed:
+        from transformer_rl.formal.tasks.jump import ReferenceStage
+
+        if jump_reference_stage is None:
+            if jump.any():
+                raise ValueError('Missed-jump reward requires the reference clock stage')
+        else:
+            if (jump_reference_stage.shape != reference.mode.shape
+                    or jump_reference_stage.device != reference.mode.device
+                    or jump_reference_stage.dtype != torch.long):
+                raise ValueError('Jump reference stages must be matching int64 rows')
+            # TAKEOFF persists until actual flight has been observed. A zero
+            # velocity target alone also occurs at compression start and apex;
+            # only the explicit end-of-reference HOLD certifies a missed push.
+            missed_jump = (jump & (phase == int(RewardPhase.TAKEOFF))
+                           & (jump_reference_stage == int(ReferenceStage.HOLD)))
+        positive['height'] = torch.where(missed_jump, 0., positive['height'])
+        positive['jump_vertical'] = torch.where(missed_jump, 0., positive['jump_vertical'])
+        cost['jump_missed'] = extensions.jump_missed * missed_jump.to(v_up.dtype)
     if extensions.jump_flight or extensions.jump_lift:
         # Not native terms, so the native availability filter never applies.
         flying = (jump & (phase == int(RewardPhase.FLIGHT))).to(v_up.dtype)
@@ -398,6 +421,8 @@ def physical_reward_densities(sample: RewardPhysics, reference: RewardReference,
              'terrain_landing': terrain_landing,
              'height_reference_weight': height_gate, 'velocity_height_gate': velocity_gate,
              'first_action_difference': history.action_count > 0, 'second_action_difference': history.action_count > 1}
+    if extensions.jump_missed:
+        gates['jump_missed'] = missed_jump
     errors = {'forward_m_s': ev, 'yaw_rad_s': ew, 'support_height_m': support_eh,
               'terrain_body_extension_m': torch.where(terrain_active, terrain_extension, 0.),
               'terrain_height_error_m': torch.where(terrain_active, terrain_eh, 0.),

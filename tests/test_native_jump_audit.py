@@ -34,7 +34,7 @@ def module():
     return loaded
 
 
-def records(steps=110):
+def records(steps=110, *, gated=False):
     n = 2
     _, _, geometry, physical, _, _ = setup('rough_dash')
     physical = replace(physical, position=torch.tensor([[-2., 0., .35]]).repeat(n, 1))
@@ -43,6 +43,9 @@ def records(steps=110):
     native.physics_dt = .005
     course, tasks = native._terrain_course, jumps._terrain_course.tasks
     course.tasks = tasks
+    if gated:
+        from supermimic_rl.course.jump_takeoff import install_jump_takeoff
+        install_jump_takeoff(native, {'min_episode_s': .10, 'cooldown_s': .10})
     course.stair_requests = StairRequestProtocol(n, config=StairRequestConfig(policy_dt_s=.02, timeout_s=6.))
     course.stair_requests.reset(torch.arange(n), native.time)
     course.tof_trigger, course.query = trigger, source.terrain.query
@@ -141,6 +144,17 @@ def test_native_jump_audit_replays_real_producers_and_reports_limits():
     assert report['fields']['jump_ids']['mismatching_intervals'] == 0
     assert 'excluded from independent' in report['randomness']
     assert 'not recorded' in report['reference_scope']
+
+
+def test_native_jump_audit_covers_cold_gated_records_and_deferred_deadlines():
+    replay, schema, arguments = records(steps=15, gated=True)
+    report = module().audit(replay, schema, **arguments)
+    assert report['passed'], report['first_mismatch']
+    assert report['counts']['eligible_intervals'] == 30
+    assert report['counts']['accepted_requests'] == 2
+    assert report['fields']['jump_trigger_clock']['mismatching_intervals'] == 0
+    assert report['fields']['jump_trigger_flags']['mismatching_intervals'] == 0
+    assert report['counts']['trigger_deferred_rows'] > 0
 
 
 def test_native_jump_audit_detects_modified_peak_and_excludes_invalid_boundaries():

@@ -130,6 +130,59 @@ def test_assembled_physics_gradient_remains_finite_at_vertical_pitch():
     assert all(torch.isfinite(gradient).all() for gradient in gradients)
 
 
+def test_missed_jump_imagination_matches_native_ticks_and_retains_motion_gradients():
+    from transformer_rl.formal.control.observation import CommandMode
+    from transformer_rl.formal.tasks.jump import ReferenceStage
+    from supermimic_rl.course.reward import install_shared_reward
+    from supermimic_rl.reward_kernel import RewardExtensions
+
+    native, assembly, geometry, start, legs, memory = setup('legacy')
+    extensions = RewardExtensions(jump_missed=1.)
+    stage = torch.full((2,), int(ReferenceStage.HOLD))
+    install_shared_reward(native, extensions=extensions,
+        jump_tasks=SimpleNamespace(jump_reference=lambda: SimpleNamespace(clock_stage=stage)))
+    assembly.parameters = replace(assembly.parameters, extensions=extensions)
+    ids, owned = torch.zeros(2, dtype=torch.long), torch.ones(2, dtype=torch.bool)
+    mode = torch.full_like(ids, int(CommandMode.JUMP))
+    command = torch.tensor([[.4, 0., 0., .32], [.4, 0., 0., .32]])
+    action = torch.zeros(2, 6)
+    native.begin(action, start.joint_velocity[:, :6], now_s=native._time, episode_id=ids,
+                 control_epoch=ids, policy_owned=owned, admitted_body_command=command, command_mode=mode)
+    samples = []
+    for tick in range(4):
+        phase = torch.tensor([int(RewardPhase.TAKEOFF),
+                              int(RewardPhase.TAKEOFF if tick < 2 else RewardPhase.FLIGHT)])
+        reference = RewardReference(command, mode, phase, torch.full((2,), .32),
+                                    torch.zeros(2), torch.zeros(2, 2))
+        endpoint = replace(start, velocity=torch.full((2, 3), .1, requires_grad=True))
+        samples.append(RewardTick(endpoint, geometry(endpoint), torch.zeros(2), torch.zeros(2, 2),
+            torch.zeros(2, 21), torch.zeros(2, 2), torch.zeros(2, 3), owned, ~owned, reference,
+            native._time + (tick + 1) * .005, ids, ids, owned, jump_reference_stage=stage))
+    queue = torch.zeros(2, 3, 2)
+    result = assembly.integrate(start, tuple(samples), action, memory, queue, legs,
+                                torch.zeros(2, 6), torch.ones(2, 6))
+    target, correction = legs.decode_target(action, start.joint_position[:, :4])
+    previous, support = start, memory.support
+    for tick in samples:
+        speed = previous.joint_velocity[:, 4:6]
+        queue = assembly.wheels.push(queue, assembly.wheels.motor_input(
+            assembly.wheels.target(action), speed, torch.ones(2, 2)))
+        effort = torch.cat((legs.motor_effort(target, previous.joint_position, previous.joint_velocity,
+                                              torch.ones(2, 6)), assembly.wheels.applied(queue, speed)), -1)
+        reference, support = assembly.advance_reference(tick, support)
+        native.observe(assembly.physics(tick, effort, correction), reference)
+        previous = tick.state
+    expected = native.finish(terminated=~owned, truncated=~owned,
+                             physical_success_request_id=torch.full_like(ids, -1), entire_skill_policy_owned=owned)
+    for name, value in expected.component_densities.items():
+        torch.testing.assert_close(result.components[name], value * .02, atol=1e-12, rtol=1e-12)
+    torch.testing.assert_close(result.components['cost.jump_missed'],
+                               torch.tensor([-.02, -.01], dtype=torch.float64))
+    loss = sum(result.components.values()).sum()
+    gradients = torch.autograd.grad(loss, tuple(tick.state.velocity for tick in samples))
+    assert all(torch.isfinite(gradient).all() and gradient.abs().sum() > 0 for gradient in gradients)
+
+
 class TerrainColumns:
     """Explicit surface fixtures; real triangle queries have separate atlas tests."""
     manifest_sha256 = 'fixture'
@@ -304,9 +357,9 @@ def test_tick_batching_retains_targets_masses_static_limits_and_gradients(monkey
     original = module.physical_reward_densities
     calls = []
 
-    def recorded(sample, reference, history, parameters):
+    def recorded(sample, reference, history, parameters, **kwargs):
         calls.append((sample, reference, parameters))
-        return original(sample, reference, history, parameters)
+        return original(sample, reference, history, parameters, **kwargs)
 
     monkeypatch.setattr(module, 'physical_reward_densities', recorded)
     batched = assembly.integrate(*args)
@@ -358,9 +411,9 @@ def test_changing_optional_tick_reference_keeps_serial_kernel_semantics(monkeypa
             tick_reference, torch.full((2,), (index + 1) * .005), ids, ids, owned))
     calls, original = [], module.physical_reward_densities
 
-    def recorded(*args):
+    def recorded(*args, **kwargs):
         calls.append(args[1].gimbal is not None)
-        return original(*args)
+        return original(*args, **kwargs)
 
     monkeypatch.setattr(module, 'physical_reward_densities', recorded)
     result = assembly.integrate(state, tuple(ticks), torch.zeros(2, 6), memory, torch.zeros(2, 3, 2),

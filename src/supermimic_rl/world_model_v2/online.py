@@ -28,8 +28,9 @@ from .replay import CompactReplay
 from .stair_source import StairScenario, StairSourceState
 from .stair_task import StairTaskState
 from .terrain import AtlasTerrain
-from .jump_task import JumpTaskConfig, JumpTaskState, JumpTask, JUMP_RECORD_FIELDS
+from .jump_task import JumpTaskConfig, JumpTaskState, JumpTask, JUMP_RECORD_FIELDS, JUMP_TRIGGER_RECORD_FIELDS
 from .recovery_task import RecoveryTaskConfig, RecoveryTask, RECOVERY_RECORD_FIELDS
+from .guard import NativeRegressionGuard
 from .validation import calibrate_contact_floor, validate
 
 CHECKPOINT_FORMAT = 'supermimic-online-v2'
@@ -79,6 +80,13 @@ class OnlineConfig:
     critic_warmup: bool = False
     # Floor non-wheel contact-load noise in imagination, recalibrated on held-out rows.
     calibrate_contact_floor: bool = False
+    # Native regression guard: when the student's own native reward stays more
+    # than this fraction below its best for guard_patience consecutive cycles,
+    # restore the best actor and its optimizer state and halve the actor
+    # learning rate. Imagined objectives cannot detect model exploitation;
+    # native returns can. 0 disables it.
+    guard_drop_fraction: float = 0.
+    guard_patience: int = 2
 
     @classmethod
     def from_dict(cls, value):
@@ -117,6 +125,10 @@ class OnlineConfig:
             raise ValueError('Recovery collection requires the complete jump and stair arbitration producer')
         if (self.initial_actor is None) != (self.initial_actor_sha256 is None):
             raise ValueError('initial_actor and initial_actor_sha256 must be given together')
+        if not 0 <= self.guard_drop_fraction < 1 or type(self.guard_patience) is not int or self.guard_patience < 1:
+            raise ValueError('Guard needs a drop fraction in [0, 1) and a positive integer patience')
+        if self.learning.anchor_coefficient and self.initial_actor is None:
+            raise ValueError('The teacher anchor needs the PPO initial_actor it is centered on')
         if self.initial_actor is not None and self.actor_frame_dim != 35:
             raise ValueError('A PPO actor initializes only the 5x35 chassis student')
 
@@ -146,7 +158,10 @@ def policy_start_candidates(replay, config, env_ids, policy_dt_s):
                 if any(name not in data for name in (*JUMP_RECORD_FIELDS, 'jump_record_valid')):
                     raise ValueError('Jump imagination requires complete native records; old rows are not inferred')
                 ordinary &= data['jump_record_valid'][slots, env, 0] > .5
-                jump = JumpTaskState.decode({name: data[name][slots, env] for name in JUMP_RECORD_FIELDS})
+                jump = JumpTaskState.decode({name: data[name][slots, env] for name in
+                                            (*JUMP_RECORD_FIELDS, *JUMP_TRIGGER_RECORD_FIELDS) if name in data})
+                if jump.trigger_flags is not None:
+                    ordinary &= jump.trigger_flags[:, 0]
             if config.record_recovery:
                 if any(name not in data for name in (*RECOVERY_RECORD_FIELDS, 'recovery_record_valid')):
                     raise ValueError('Recovery imagination requires native lifecycle records; old rows are not inferred')
@@ -232,7 +247,8 @@ class OnlineTrainer:
             if (dataset['schema_fingerprint'] != environment.schema.fingerprint
                     or StateSchema.from_dict(dataset['schema']).fingerprint != environment.schema.fingerprint):
                 raise ValueError('Seed data and live native environment have different contracts')
-            if config.record_jumps and dataset.get('jump_task_config') != self.jump_scenario:
+            if config.record_jumps and (dataset.get('jump_task_config') is None or
+                    JumpTaskConfig.from_dict(dataset['jump_task_config']) != jump_config):
                 raise ValueError('Seed jump task configuration differs from the native environment')
             if config.record_recovery and dataset.get('recovery_task_config') != self.recovery_scenario:
                 raise ValueError('Seed recovery lifecycle configuration differs from the native environment')
@@ -247,6 +263,9 @@ class OnlineTrainer:
                 from .student_transfer import initialize_student_from_ppo
                 self.actor_initialization = initialize_student_from_ppo(
                     self.learner.actor, Path(config.initial_actor), config.initial_actor_sha256)
+                if config.learning.anchor_coefficient:
+                    self.learner.set_anchor(self.learner.actor,
+                                            torch.tensor(self.actor_initialization['action_std']))
             self.seed_source = {'dataset': str(Path(seed_dataset).resolve()),
                                 'world_checkpoint': str(Path(world_checkpoint).resolve()),
                                 'world_iteration': world['iteration']}
@@ -262,7 +281,8 @@ class OnlineTrainer:
         expected = RecordSpec(environment.schema.goal_dim, 65).fields(record_tasks=config.record_tasks,
             record_terrain=config.record_stair_source, record_stairs=config.record_stair_source,
             record_stair_source=config.record_stair_source, record_jumps=config.record_jumps,
-            record_recovery=config.record_recovery)
+            record_recovery=config.record_recovery,
+            record_jump_trigger=jump_task is not None and jump_task.config.trigger is not None)
         if any(name not in replay.data or tuple(replay.data[name].shape[2:]) != shape for name, shape in expected.items()):
             raise ValueError('Online replay field layout differs from the current compact contract')
         self.mixing = MixedDecision(environment, self.learner.actor, teacher_decision, seed=config.seed + 2,
@@ -282,7 +302,12 @@ class OnlineTrainer:
             raise ValueError('Online learning needs distinct training and validation environment rows')
         self.train_ids = list(range(environment.num_envs - held))
         self.validation_ids = list(range(environment.num_envs - held, environment.num_envs))
+        self.guard = (NativeRegressionGuard(config.guard_drop_fraction, config.guard_patience,
+                                            config.learning.actor_learning_rate)
+                      if config.guard_drop_fraction else None)
         if saved is not None:
+            if self.guard is not None and saved.get('guard') is not None:
+                self.guard.load_state_dict(saved['guard'])
             self.collector.steps = saved['collection_steps']
             self.collector.generator.set_state(saved['collection_rng'])
             if 'mixing' in saved:
@@ -310,7 +335,10 @@ class OnlineTrainer:
             raise ValueError('Resume teacher source differs')
         if json.dumps(saved.get('stair_scenario'), sort_keys=True) != json.dumps(self.stair_scenario, sort_keys=True):
             raise ValueError('Resume stair protocol/source settings differ from the native environment')
-        if saved.get('jump_scenario') != self.jump_scenario:
+        stored_jump = saved.get('jump_scenario')
+        if ((stored_jump is None) != (self.jump_scenario is None)
+                or stored_jump is not None and JumpTaskConfig.from_dict(stored_jump)
+                != JumpTaskConfig.from_dict(self.jump_scenario)):
             raise ValueError('Resume jump protocol/reference settings differ from the native environment')
         if saved.get('recovery_scenario') != self.recovery_scenario:
             raise ValueError('Resume recovery lifecycle settings differ from the native environment')
@@ -413,6 +441,7 @@ class OnlineTrainer:
             'collection_steps': self.collector.steps, 'environment': self.env.training_state_dict(),
             'collection_rng': self.collector.generator.get_state(), 'mixing_rng': self.mixing.generator.get_state(),
             'mixing': self.mixing.state_dict(), 'resume_migrations': self.resume_migrations,
+            'guard': None if self.guard is None else self.guard.state_dict(),
             'task_norm_pending': self.task_norm_pending,
             'critic_norm_from': self.critic_norm_from, 'stair_scenario': self.stair_scenario,
             'jump_scenario': self.jump_scenario, 'recovery_scenario': self.recovery_scenario,
@@ -437,7 +466,13 @@ class OnlineTrainer:
             tick = time.monotonic()
             teacher_before, student_before = self.mixing.teacher_steps, self.mixing.student_steps
             self.mixing.actor_updates = learner.updates['actor']
+            # From the first policy cycle on; its collection still uses the initial
+            # actor and becomes the baseline best.
+            guarded = self.guard is not None and cycle > cfg.policy_start_cycle
+            snapshot = self.guard.snapshot(learner.actor, learner.optimizers['actor']) if guarded else None
             collection = self.collector.collect(cfg.collection_steps, actor_updates=learner.updates['actor'])
+            guard = (self.guard.observe(collection.get('student_reward_mean'), snapshot, learner.actor,
+                                        learner.optimizers['actor']) if guarded else None)
             if getattr(self, 'task_norm_pending', False):
                 self.initialize_task_norm()
             collected_at = time.monotonic()
@@ -454,9 +489,9 @@ class OnlineTrainer:
             fitted_at = time.monotonic()
             policy = []
             policy_learning = cycle > cfg.policy_start_cycle
-            if policy_learning and getattr(self, 'critic_norm_from', None) is not None:
-                self.initialize_added_critic_norm()
             critic_only = not policy_learning and cfg.critic_warmup
+            if (policy_learning or critic_only) and getattr(self, 'critic_norm_from', None) is not None:
+                self.initialize_added_critic_norm()
             for index in range(cfg.actor_updates):
                 start, frames = self.sample_starts(cfg.imagination_batch_size)
                 policy.append(learner.update_policy(start, frames, microbatch_size=cfg.imagination_microbatch_size,
@@ -474,6 +509,7 @@ class OnlineTrainer:
                 'world': {key: sum(row[key] for row in world) / len(world) for key in world[0]},
                 'policy': {key: sum(row[key] for row in policy) / len(policy) for key in policy[0]},
                 'updates': learner.updates.copy(), 'skipped': learner.skipped.copy(),
+                **({} if guard is None else {'guard': guard}),
                 **({} if floor_report is None else {'contact_floor': {
                     name: {key: channel[key] for key in ('floor_n', 'false_positive_raw', 'false_positive_floored',
                                                          'true_positive_raw', 'true_positive_floored')}

@@ -1,0 +1,321 @@
+{
+  "action_transport": {
+    "enabled": false,
+    "delays_steps": [
+      0
+    ],
+    "nominal_fraction": 1.0
+  },
+  "asset_directory": "/root/gpufree-data/supermimic_rl/assets/full_vehicle_v2p0p1_source_audited_v2_knee40_107",
+  "communication": {
+    "enabled": false,
+    "total_delay_range_s": [
+      0.0001,
+      0.002
+    ],
+    "uplink_fraction": 1.0
+  },
+  "dynamics": {
+    "base_com_offset_m": [
+      0.012,
+      0.0064,
+      0.008
+    ],
+    "base_mass_scale": [
+      0.92,
+      1.08
+    ],
+    "link_mass_scale": [
+      0.92,
+      1.08
+    ],
+    "nominal_fraction": 0.25
+  },
+  "environment_spacing_m": 1.0,
+  "episode_randomization": {
+    "enabled": true,
+    "full_at_update": 5000,
+    "spring_force_scale": [
+      1,
+      1
+    ],
+    "leg_strength": [
+      1,
+      1
+    ],
+    "wheel_strength": [
+      1,
+      1
+    ],
+    "leg_encoder_bias_rad": 0.004,
+    "no_load_speed_scale": [
+      1,
+      1
+    ],
+    "leg_time_constant_scale": [
+      1,
+      1
+    ],
+    "push_interval_s": [
+      5.0,
+      10.0
+    ],
+    "push_linear_m_s": 0,
+    "push_yaw_rad_s": 0.0,
+    "wrench_interval_s": [
+      5.0,
+      10.0
+    ],
+    "external_force_n": 0,
+    "external_torque_nm": 0
+  },
+  "format": "managed_lab_runtime_v4",
+  "pair_domain": null,
+  "physics": {
+    "gpu_collision_stack_size": 268435456,
+    "gpu_found_lost_aggregate_pairs_capacity": 4194304,
+    "gpu_found_lost_pairs_capacity": 2097152,
+    "gpu_max_rigid_contact_count": 4194304,
+    "gpu_max_rigid_patch_count": 1048576,
+    "gpu_total_aggregate_pairs_capacity": 2097152,
+    "solver_position_iterations": 64,
+    "solver_velocity_iterations": 16
+  },
+  "profile_collection": false,
+  "sensors": {
+    "extra_delay_probability": 1.0,
+    "gravity_halfwidth": 0.0014,
+    "gyro_halfwidth_rad_s": 0.0035,
+    "leg_position_halfwidth_rad": 0.00035,
+    "leg_velocity_halfwidth_rad_s": 0.0175,
+    "nominal_episode_fraction": 0.25,
+    "observation_delays_s": [
+      0,
+      0.01
+    ],
+    "physics_dt_s": 0.005,
+    "policy_dt_s": 0.02,
+    "wheel_velocity_halfwidth_rad_s": 0.0875,
+    "shared_delay": true
+  },
+  "task": {
+    "action_bounds": [
+      12.566370614359172,
+      12.566370614359172,
+      12.566370614359172,
+      12.566370614359172,
+      9.0,
+      9.0
+    ],
+    "action_rate_cost": 0.01,
+    "base_contact_force_n": 30.0,
+    "effort_cost": 0.0001,
+    "failure_tilt_rad": 1.2,
+    "forward_sigma_m_s": 0.35,
+    "forward_weight": 3.0,
+    "height_sigma_m": 0.025,
+    "height_weight": 2.0,
+    "lateral_cost": 0.5,
+    "minimum_height_m": 0.08,
+    "minimum_recovery_height_m": 0.01,
+    "nominal_height_m": 0.32,
+    "vertical_cost": 0.2,
+    "yaw_sigma_rad_s": 0.5,
+    "yaw_weight": 2.0
+  },
+  "termination_limits": {
+    "failure_tilt_rad": 0.6981317007977318,
+    "forbidden_body_load_n": 1.0,
+    "forbidden_body_names": [
+      "base_link",
+      "M_link1",
+      "M_link2"
+    ],
+    "forbidden_contact_confirm_s": 0.4,
+    "healthy_tilt_rad": 0.5,
+    "knee_pivot_residual_m": 0.01,
+    "minimum_normal_height_m": 0.08,
+    "minimum_recovery_height_m": 0.01,
+    "passive_knee_overrun_rad": 0.02,
+    "preparation_timeout_s": 5.0,
+    "pose_failure_confirm_s": 0.4
+  },
+  "terrain_atlas_pin": {
+    "path": "/root/gpufree-data/supermimic_rl/assets/rmuc2027_course_atlas/manifest.json",
+    "bytes": 97298,
+    "sha256": "883dbed3068671a37f802dcae3e06c0a9ac136b8e9f7d0801712319b3494d6e0"
+  },
+  "wheel_material": null,
+  "action_latch": {
+    "enabled": false,
+    "delay_substeps": [
+      0
+    ],
+    "nominal_fraction": 0.25
+  },
+  "motor_envelope": null,
+  "command_pool": {
+    "enabled": true,
+    "spin_mid_rad_s": [
+      10.210176124166829,
+      18.84955592153876
+    ],
+    "dash_forward_m_s": [
+      2.0,
+      2.7
+    ],
+    "high_step_low_speed_fraction": 0.5
+  },
+  "birth_randomization": {
+    "enabled": true
+  },
+  "gimbal": {
+    "enabled": true,
+    "default_mode": "body_fixed",
+    "joint_names": [
+      "M_joint1",
+      "M_joint2"
+    ],
+    "joint_sign": [
+      1.0,
+      -1.0
+    ],
+    "joint_zero_rad": [
+      0.0,
+      0.0
+    ],
+    "joint_limits_rad": [
+      null,
+      [
+        -0.6108652381980153,
+        0.5235987755982988
+      ]
+    ],
+    "max_torque_nm": [
+      4.5,
+      4.5
+    ],
+    "reference_rate_hz": 1000.0,
+    "reduction_ratio": 10.0,
+    "rotor_torque_constant_nm_per_a": 0.07,
+    "gravity_compensation": false,
+    "yaw_angle": {
+      "kp": 10.0,
+      "ki_per_tick": 0.0,
+      "kd_per_tick": 0.0,
+      "integral_limit_ticks": null
+    },
+    "yaw_rate": {
+      "kp": 4.0,
+      "ki_per_tick": 0.0,
+      "kd_per_tick": 0.0,
+      "integral_limit_ticks": null
+    },
+    "pitch_angle": {
+      "kp": 35.0,
+      "ki_per_tick": 0.0,
+      "kd_per_tick": 0.0,
+      "integral_limit_ticks": null
+    },
+    "pitch_rate": {
+      "kp": 2.0,
+      "ki_per_tick": 0.0,
+      "kd_per_tick": 0.0,
+      "integral_limit_ticks": null
+    }
+  },
+  "gimbal_course": {
+    "enabled": true,
+    "segment_s": [
+      5.0,
+      15.0
+    ],
+    "body_yaw_rad": [
+      -3.141592653589793,
+      3.141592653589793
+    ],
+    "world_heading_offset_rad": [
+      -3.141592653589793,
+      3.141592653589793
+    ],
+    "pitch_target_rad": [
+      -0.6108652381980153,
+      0.5235987755982988
+    ],
+    "yaw_rate_rad_s": [
+      -3.141592653589793,
+      3.141592653589793
+    ],
+    "motion_full_update": 5000,
+    "controller_weights": [
+      0.2,
+      0.5,
+      0.3
+    ],
+    "spin_translate": true,
+    "spin_start_update": 4000,
+    "spin_full_update": 5000,
+    "spin_fraction": 0.35714285714285715,
+    "spin_after_episode_s": 5.0,
+    "translation_speed_m_s": [
+      0.0,
+      0.75
+    ],
+    "chassis_spin_rad_s": [
+      7.5398223686155035,
+      11.309733552923255
+    ],
+    "speed_deadzone_m_s": 0.05
+  },
+  "stair_height_assist": {
+    "enabled": true,
+    "raise_by_m": 0.16,
+    "max_height_m": 0.4,
+    "hold_s": 2.0
+  },
+  "terrain_policy": {
+    "use_mode_labels": true,
+    "allow_base_contact_on_rough": true,
+    "reward_profile": "rough_dash"
+  },
+  "physics_backend": {
+    "name": "physx"
+  },
+  "execution_model": "identified_20261031",
+  "requested_randomization": {
+    "nominal_fraction": 0.25,
+    "mass_fraction": 0.08,
+    "independent_inertia_fraction": 0.06,
+    "base_com_offset_m": [
+      0.012,
+      0.0064,
+      0.008
+    ],
+    "motor_strength_fraction": 0.16,
+    "encoder_bias_rad": 0.004,
+    "gyro_bias_rad_s": 0.00525,
+    "imu_fixed_degrees": [
+      0.8,
+      0.8,
+      0.26666666666666666
+    ],
+    "encoder_noise_rad": 0.00035,
+    "leg_velocity_noise_rad_s": 0.0175,
+    "wheel_velocity_noise_rad_s": 0.0875,
+    "gyro_noise_rad_s": 0.0035,
+    "gravity_noise": 0.0014,
+    "full_at_coordinate": 5000,
+    "external_force_n": 15.0,
+    "external_torque_nm": 1.5,
+    "push_linear_m_s": 0.5,
+    "push_yaw_rad_s": 1.0,
+    "push_interval_s": [
+      5.0,
+      10.0
+    ],
+    "wrench_interval_s": [
+      5.0,
+      10.0
+    ]
+  }
+}

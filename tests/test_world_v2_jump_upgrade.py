@@ -209,3 +209,7 @@ def test_jump_branch_script_keeps_original_pair_and_embeds_source_receipt(tmp_pa
     trainer.stair_scenario, trainer.jump_scenario = result['stair_scenario'], result['jump_scenario']
     trainer.recovery_scenario = None
     trainer._check_saved(result)
+    legacy = {**result, 'jump_scenario': {
+        key: value for key, value in result['jump_scenario'].items()
+        if key not in ('trigger', 'trigger_record_version')}}
+    trainer._check_saved(legacy)

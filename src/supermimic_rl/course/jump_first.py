@@ -58,8 +58,8 @@ class JumpFirstCurriculum(SuperMimicCurriculum):
         jump = list(weights[2])
         # The former jump mixture contains terrain rehearsal. Before the first
         # terrain stage, retain the other relative shares and normalize them.
+        # Recovery births stay as configured, so easy get-up can mix in early.
         jump[int(TaskFamily.TERRAIN)] = 0.
-        jump[int(TaskFamily.RECOVERY)] = 0.
         retained = sum(jump)
         weights[2] = tuple(value / retained for value in jump)
         self.stage_weights = tuple(weights)
@@ -98,7 +98,17 @@ class JumpFirstCurriculum(SuperMimicCurriculum):
         terrain = interpolate_domain(self.initial_domain, self.domain,
                                      self._stage_fraction('terrain_foundation'))
         jump = interpolate_domain(self.initial_domain, self.domain,
-                                  self._stage_fraction('combined_dr'))
+                                  self._stage_fraction(self.config.jump_height_stage))
+        if self.config.jump_height_gates:
+            index = self.stage_names.index(self.config.jump_height_stage)
+            start, budget = sum(self.stage_budgets[:index]), self.stage_budgets[index]
+            upper = self.initial_domain.jump_m[1]
+            for fraction, cap in self.config.jump_height_gates:
+                # Match CourseGates' integer boundary exactly: its held
+                # coordinate is boundary - 1, even for a very large budget.
+                if self.real_transitions >= start + int(fraction * budget):
+                    upper = cap
+            jump = replace(jump, jump_m=(self.initial_domain.jump_m[0], upper))
         return replace(command, height_m=height.height_m,
             slope_rad=terrain.slope_rad, roughness_m=terrain.roughness_m,
             step_up_m=terrain.step_up_m, step_down_m=terrain.step_down_m,

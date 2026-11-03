@@ -10,13 +10,13 @@ HOLD = 3
 
 
 class Native:
-    num_envs, _base_body_index = 3, 0
+    num_envs, _base_body_index, physics_dt = 3, 0, .005
 
     def __init__(self):
         self.tasks = SimpleNamespace(
             physical_id=torch.full((3,), -1), success_id=torch.full((3,), -1),
             flight_seen=torch.zeros(3, dtype=torch.bool), stage=torch.full((3,), EXTENSION),
-            reference_vz=torch.ones(3), launch=torch.ones(3))
+            reference_vz=torch.ones(3), launch=torch.ones(3), active_rise=torch.tensor([.05, .25, .35]))
         self.tasks.jump_reference = lambda: SimpleNamespace(
             clock_stage=self.tasks.stage, velocity_world_z_m_s=self.tasks.reference_vz,
             launch_velocity_m_s=self.tasks.launch)
@@ -43,12 +43,12 @@ def curriculum(transitions):
                            real_transitions=transitions)
 
 
-def test_probability_fades_inside_the_assist_stage_only():
+def test_level_fades_inside_the_assist_stage_only():
     native = Native()
     assist = install_jump_assist(native, curriculum(0), {"probability": .8, "fade_stage_fraction": .5})
     for transitions, expected in ((0, 0.), (100, .8), (150, .4), (200, 0.), (299, 0.), (300, 0.)):
         assist.curriculum.real_transitions = transitions
-        assert assist.probability() == pytest.approx(expected)
+        assert assist.level() == pytest.approx(expected)
     with pytest.raises(ValueError):
         JumpAssistConfig(probability=1.5)
 
@@ -84,12 +84,14 @@ def test_selected_requests_get_capped_shortfall_force_until_flight_and_outcomes_
     native._apply_action()
     counters, gauges = assist.metrics()
     assert counters["course/jump_assist/assisted_requests"] == 3
-    assert counters["course/jump_assist/assisted_ended"] == 3 and counters["course/jump_assist/assisted_success"] == 1
+    # Request 6 was selected but never received force (its push window had passed): unassisted.
+    assert counters["course/jump_assist/assisted_ended"] == 2 and counters["course/jump_assist/assisted_success"] == 1
+    assert counters["course/jump_assist/unassisted_ended"] == 1
     native.tasks.physical_id[2] = -1
     native._apply_action()
     counters, _ = assist.metrics()
-    assert counters["course/jump_assist/unassisted_ended"] == 1 and counters["course/jump_assist/unassisted_success"] == 0
-    assert gauges["course/jump_assist/probability"] == 0.
+    assert counters["course/jump_assist/unassisted_ended"] == 2 and counters["course/jump_assist/unassisted_success"] == 0
+    assert gauges["course/jump_assist/level"] == 0.
 
 
 def test_outside_the_assist_stage_no_wrench_is_added_but_outcomes_are_counted():
@@ -103,3 +105,66 @@ def test_outside_the_assist_stage_no_wrench_is_added_but_outcomes_are_counted():
     counters, _ = assist.metrics()
     assert counters["course/jump_assist/unassisted_success"] == 1
     assert counters["course/jump_assist/unassisted_ended"] == 1 and counters["course/jump_assist/assisted_requests"] == 0
+
+
+def test_force_decay_assists_every_request_with_a_fading_scale_and_bins_unassisted_outcomes():
+    native = Native()
+    assist = install_jump_assist(native, curriculum(150), {"probability": 1., "decay": "force",
+                                                           "fade_stage_fraction": .5, "max_weight_fraction": 10.})
+    native.tasks.physical_id[:] = torch.tensor([4, 5, 6])
+    native._apply_action()
+    # Level 0.5 at the stage midpoint: every request selected, force halved (20 kg * 10/s * 1 m/s * 0.5).
+    torch.testing.assert_close(native.wrenches[-1]["forces"][:, 0, 2], torch.full((3,), 100.))
+    counters, gauges = assist.metrics()
+    assert counters["course/jump_assist/assisted_requests"] == 3 and gauges["course/jump_assist/level"] == .5
+    assist.curriculum.real_transitions = 250   # faded out: new requests are unassisted
+    native.tasks.physical_id[:] = torch.tensor([7, 8, 9])
+    native._apply_action()
+
+    def decide():
+        native.tasks.success_id[:] = torch.tensor([7, -1, 9])
+        native.tasks.physical_id[:] = -1
+
+    native.outcome = decide
+    native.tasks.observe_physics()
+    counters, _ = assist.metrics()
+    assert counters["course/jump_assist/unassisted_ended"] == 3 and counters["course/jump_assist/unassisted_success"] == 2
+    assert counters["course/jump_assist/unassisted_success_rise_0.00-0.10"] == 1
+    assert counters["course/jump_assist/unassisted_ended_rise_0.20-0.30"] == 1
+    assert counters["course/jump_assist/unassisted_success_rise_0.20-0.30"] == 0
+    assert counters["course/jump_assist/unassisted_success_rise_0.30-0.40"] == 1
+    # All-request bins include the earlier assisted requests 4-6 (rises 0.05/0.25/0.35, none succeeded).
+    assert counters["course/jump_assist/ended_rise_0.20-0.30"] == 2
+    assert counters["course/jump_assist/success_rise_0.00-0.10"] == 1
+
+
+def test_force_decay_keeps_a_fixed_unassisted_request_cohort_at_a_held_gate():
+    native = Native()
+    assist = install_jump_assist(native, curriculum(150), {
+        'probability': 1., 'decay': 'force', 'fade_stage_fraction': .5,
+        'max_weight_fraction': 10., 'assist_request_probability': .5, 'seed': 1})
+    native.tasks.physical_id[:] = torch.tensor([4, 5, 6])
+    native._apply_action()
+    # Seed 1 chooses [unassisted, assisted, assisted]. The selected rows still
+    # receive the same fading force amplitude, not a weaker force on all rows.
+    assert assist.selected.tolist() == [False, True, True]
+    torch.testing.assert_close(native.wrenches[-1]['forces'][:, 0, 2], torch.tensor([0., 100., 100.]))
+    for _ in range(3):
+        native._apply_action()
+        assert assist.selected.tolist() == [False, True, True]
+    assert assist.impulse[0] == 0 and (assist.impulse[1:] > 0).all()
+
+    def decide():
+        native.tasks.success_id[:] = torch.tensor([4, 5, 6])
+        native.tasks.physical_id[:] = -1
+
+    native.outcome = decide
+    native.tasks.observe_physics()
+    counters, _ = assist.metrics()
+    assert counters['course/jump_assist/unassisted_success'] == 1
+    assert counters['course/jump_assist/unassisted_ended'] == 1
+    assert counters['course/jump_assist/assisted_success'] == 2
+    assert counters['course/jump_assist/unassisted_success_rise_0.00-0.10'] == 1
+    assert assist.level() == .5
+    with pytest.raises(ValueError):
+        JumpAssistConfig(probability=1., assist_request_probability=1.1)

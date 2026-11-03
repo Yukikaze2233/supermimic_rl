@@ -173,4 +173,109 @@ def test_explicit_factory_selection_and_pinned_configuration():
     path = Path(__file__).resolve().parents[1] / 'configs/gpufree/ppo-course-jump-first.json'
     configured = make_course_curriculum(2, 'cpu', 7, json.loads(path.read_text()))
     original = json.loads(path.with_name('ppo-course.json').read_text())
-    assert configured.config.to_dict() == original
+    assert configured.config.to_dict() == {**original, 'jump_height_stage': 'combined_dr',
+                                           'jump_height_gates': [], 'recovery_posture_stages': {}}
+
+
+def test_jump_height_range_widens_inside_the_configured_stage():
+    import json
+    from supermimic_rl.course.curriculum import CourseCurriculumConfig
+    from supermimic_rl.course.jump_first import JumpFirstCurriculum
+    from support import REPO_ROOT
+
+    base = json.loads((REPO_ROOT / 'configs/gpufree/ppo-course-gated-v4.json').read_text())['base']
+    uppers = {}
+    for stage in ('combined_dr', 'active_jump'):
+        curriculum = JumpFirstCurriculum(4, 'cpu', 7, CourseCurriculumConfig.from_dict({**base, 'jump_height_stage': stage}))
+        start = sum(curriculum.stage_budgets[:curriculum.stage_names.index('active_jump')])
+        values = []
+        for fraction in (0., .5, 1.):
+            curriculum.set_progress(start + int(fraction * curriculum.stage_budgets[2]), 0)
+            values.append(curriculum._effective_domain().jump_m[1])
+        uppers[stage] = values
+    assert uppers['combined_dr'] == [pytest.approx(.1)] * 3
+    low, mid, high = uppers['active_jump']
+    assert low == pytest.approx(.1) and .1 < mid < .4 and high == pytest.approx(.4)
+    with pytest.raises(ValueError, match='jump_height_stage'):
+        CourseCurriculumConfig.from_dict({**base, 'jump_height_stage': 'nope'})
+
+
+def test_v5_height_caps_wait_for_unassisted_bin_gates_at_exact_integer_boundaries():
+    from supermimic_rl.ppo.course_gate import CourseGates
+    from support import REPO_ROOT
+
+    root = REPO_ROOT / 'configs/gpufree'
+    curriculum = make_course_curriculum(4, 'cpu', 7, json.loads((root / 'ppo-course-gated-v5.json').read_text()))
+    starts, total = {}, 0
+    for name, budget in zip(curriculum.stage_names, curriculum.stage_budgets):
+        starts[name] = total
+        total += budget
+    gates = CourseGates(json.loads((root / 'ppo-gated5-fullturn-resume-r6.json').read_text())['course_gates'], starts)
+    gates.coordinate = starts['active_jump']
+    gates.opened.append('active_jump')
+    curriculum.set_progress(gates.coordinate, 0)
+    assert curriculum._effective_domain().jump_m == (.03, .10)
+    for fraction, expected_before, expected_after in ((.25, .10, .20), (.50, .20, .30), (.75, .30, .40)):
+        gate = gates._next()
+        assert gate.at_fraction == fraction
+        # Reach the hold with arbitrarily many transitions. Assisted success
+        # cannot open a gate, and elapsed training cannot widen the height cap.
+        good = {'terminations': 0}
+        for criterion in gate.criteria:
+            for name in criterion.numerator:
+                assert '/unassisted_success_rise_' in name
+                good[name] = 100
+            for name in criterion.denominator:
+                assert '/unassisted_ended_rise_' in name
+                good[name] = 200
+        assisted = {key.replace('/unassisted_', '/'): value for key, value in good.items()}
+        gates.advance(assisted, 10**9)
+        for _ in range(gate.window):
+            status = gates.advance(assisted, 10**9)
+            assert not status['gate_passed']
+        curriculum.set_progress(gates.coordinate, 0)
+        assert gates.coordinate == gates._position(gate) - 1
+        assert curriculum._effective_domain().jump_m[1] == expected_before
+        # Force a full clean evidence window, then cross by one transition.
+        gates.history.clear()
+        for _ in range(gate.window):
+            status = gates.advance(good, 1)
+        assert status['gate_passed'] and gates.coordinate == gates._position(gate)
+        curriculum.set_progress(gates.coordinate, 0)
+        assert curriculum._effective_domain().jump_m[1] == expected_after
+
+
+@pytest.mark.parametrize('height_gates', [[(.25, .20), (.20, .40)], [(.25, .05), (.50, .40)],
+                                         [(.25, .20)], [(1., .40)], [(.25, float('nan'))]])
+def test_invalid_discrete_height_schedule_is_rejected(height_gates):
+    with pytest.raises(ValueError, match='jump_height_gates'):
+        CourseCurriculumConfig(jump_height_gates=height_gates)
+
+
+def test_recovery_postures_enter_by_stage_and_mix_into_the_jump_stage():
+    import json
+    from supermimic_rl.course.curriculum import CourseCurriculumConfig
+    from supermimic_rl.course.jump_first import JumpFirstCurriculum
+    from support import REPO_ROOT
+
+    base = json.loads((REPO_ROOT / 'configs/gpufree/ppo-course-gated-v4.json').read_text())['base']
+    weights = [list(row) for row in base['stage_weights']]
+    weights[5] = [.05, .25, .05, .2, .4, .05]          # original active_jump row: 5% recovery
+    schedule = {name: 'active_jump' for name in ('upright_release', 'crouched_release', 'pitch_forward_45')}
+    schedule.update({'left_side_90': 'dynamic_commands', 'right_side_90': 'dynamic_commands'})
+    config = CourseCurriculumConfig.from_dict({**base, 'stage_weights': weights,
+                                               'recovery_postures': ['upright_release', 'crouched_release',
+                                                                     'pitch_forward_45', 'left_side_90',
+                                                                     'right_side_90', 'prone_belly_legs_above',
+                                                                     'prone_back_legs_above'],
+                                               'recovery_posture_stages': {
+                                                   **schedule, 'prone_belly_legs_above': 'full_recovery',
+                                                   'prone_back_legs_above': 'full_recovery'}})
+    curriculum = JumpFirstCurriculum(4, 'cpu', 7, config)
+    jump = curriculum.stage_names.index('active_jump')
+    assert curriculum.stage_weights[jump][-1] > 0 and curriculum.stage_weights[jump][3] == 0.
+    for stage, expected in (('active_jump', 3), ('dynamic_commands', 5), ('full_recovery', 7)):
+        curriculum.set_progress(sum(curriculum.stage_budgets[:curriculum.stage_names.index(stage)]), 0)
+        assert len(curriculum.recovery_posture_pool()) == expected
+    with pytest.raises(ValueError, match='recovery_posture_stages'):
+        CourseCurriculumConfig.from_dict({**base, 'recovery_posture_stages': {'left_side_90': 'nope'}})

@@ -52,3 +52,24 @@ def test_coverage_reports_contact_phases_and_wide_leg_actions():
     assert recovery["leg_action_beyond_legacy_bound_fraction"] == 1.
     assert flat["leg_action_beyond_legacy_bound_fraction"] == 0.
     assert report(replay)["populations"]["gimbal_special"]["coverage"] == {"transitions": 0}
+
+
+def test_skill_report_passes_saved_floor_and_native_clock_to_each_prediction(monkeypatch):
+    from types import SimpleNamespace
+    from supermimic_rl.world_model_v2 import data_report
+
+    observed = []
+
+    def validate(*args, **kwargs):
+        observed.append(kwargs)
+        return {'sampled': True}
+
+    monkeypatch.setattr(data_report, 'validate', validate)
+    floors = (torch.zeros(len(CONTACT_BODIES)), torch.tensor(3.))
+    termination = SimpleNamespace(limits=SimpleNamespace(forbidden_body_load_n=1.))
+    result = report(replay_fixture(), fit=object(), env_ids=[3], contact_floor=floors, termination=termination)
+    assert len(observed) == 5  # all plus the four nonempty task populations
+    assert all(entry['contact_floor'] is floors and entry['termination'] is termination for entry in observed)
+    assert all(entry['contact_threshold_n'] == 1. for entry in observed)
+    assert result['contact_prediction']['saved_floor_applied']
+    assert result['contact_prediction']['base_resultant_floor_n'] == 3.

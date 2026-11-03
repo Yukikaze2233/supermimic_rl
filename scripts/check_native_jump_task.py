@@ -47,6 +47,10 @@ def audit(replay, schema, *, jump_config, stair_scenario, source_rng, terrain, g
     if schema.policy_dt_s != .02 or schema.substeps_per_step != 4:
         raise ValueError('Jump audit requires actual 200/50 Hz records')
     task = JumpTask(JumpTaskConfig.from_dict(jump_config))
+    if task.config.trigger is not None:
+        from supermimic_rl.world_model_v2.jump_task import JUMP_TRIGGER_RECORD_FIELDS
+        if not set(JUMP_TRIGGER_RECORD_FIELDS).issubset(data):
+            raise ValueError('Gated native audit needs recorded jump trigger history')
     stair_task, source = StairScenario.from_dict(stair_scenario).build(terrain)
     generator = torch.Generator(device=device)
     if (source_rng['state'].dtype != torch.uint8
@@ -56,7 +60,8 @@ def audit(replay, schema, *, jump_config, stair_scenario, source_rng, terrain, g
         'missing_task_record', 'unsupported_task', 'unknown_command_boundary', 'terrain_query_invalid',
         'nonconsecutive_vector_step', 'request_family_intervals', 'active_request_intervals',
         'physical_active_intervals', 'flight_intervals', 'landing_intervals', 'accepted_requests',
-        'finished_requests', 'physical_success_events', 'recovered_auto_deadlines', 'stair_fired_requests'), 0)
+        'finished_requests', 'physical_success_events', 'recovered_auto_deadlines', 'stair_fired_requests',
+        'trigger_deferred_rows'), 0)
     totals, first_mismatch = {}, {}
     atol, rtol = 2e-5, 2e-6
 
@@ -139,14 +144,17 @@ def audit(replay, schema, *, jump_config, stair_scenario, source_rng, terrain, g
         changed = expected_jump.next_request_s != jump.next_request_s
         recovered = (expected_jump.next_request_s - following_motion.timing[:, 0] - 3.) / 5.
         uniform = torch.where(due, recovered, .5).clamp(0, 1)
-        compare('automatic_request_due', due, changed, rows, slot)
-        compare('automatic_interval_in_native_range', (~due | ((recovered >= -2e-5) & (recovered <= 1 + 2e-5))),
-                torch.ones_like(due), rows, slot)
         advanced = task.advance(physical.state, now_s=task.boundary_time(physical.state), estimate=estimate,
             admitted=admitted, base_mode=following_motion.route[:, 3].long(),
             task_family=before['task_family'][:, 0].long(), elapsed_s=following_motion.timing[:, 0],
             ground_z=end.position[:, 2] - before['end_height'][:, 0], blocked_by_stair=stair.ids[:, 1] >= 0,
-            interval_uniform=uniform)
+            interval_uniform=uniform, previous_command_height=motion.current[:, 3],
+            previous_elapsed_s=motion.timing[:, 0])
+        due &= ~advanced.deferred
+        counts['trigger_deferred_rows'] += int(advanced.deferred.sum())
+        compare('automatic_request_due', due, changed & ~advanced.deferred, rows, slot)
+        compare('automatic_interval_in_native_range', (~due | ((recovered >= -2e-5) & (recovered <= 1 + 2e-5))),
+                torch.ones_like(due), rows, slot)
         following_motion = replace(following_motion, current=advanced.command)
         # Give the backend an owning byte tensor, not an offset view into the
         # stacked/mmap record (CPU generator state readers require this).

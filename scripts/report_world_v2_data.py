@@ -8,12 +8,32 @@ held-out environment rows of the original fit. No Isaac, no training.
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 from pathlib import Path
 
 import torch
 
 from supermimic_rl.world_model_v2.data_report import report
+
+
+def checkpoint_contact_floor(learner, device):
+    """Restore the same saved floors the online learner uses in imagination."""
+    floor = learner.get('contact_floor')
+    return None if floor is None else (floor['body'].to(device), floor['base'].to(device))
+
+
+def pinned_termination(schema, runtime_path):
+    """Use recorded runtime limits, never guessed contact confirmation times."""
+    if runtime_path is None:
+        return None
+    from supermimic_rl.world_model_v2.termination import PoseContactLimits, PoseContactTermination
+
+    raw = runtime_path.read_bytes()
+    if hashlib.sha256(raw).hexdigest() != json.loads(schema.source)['runtime_sha256']:
+        raise ValueError('Contact audit runtime differs from the recorded SHA256')
+    return PoseContactTermination(PoseContactLimits.from_runtime(json.loads(raw)),
+                                  schema.policy_dt_s / schema.substeps_per_step)
 
 
 def _model(schema, args, hidden, state, device):
@@ -44,6 +64,8 @@ def main():
     parser.add_argument("--linkage", type=Path, required=True)
     parser.add_argument("--identified-bundle", type=Path, default=Path("configs/identified/20261031"))
     parser.add_argument("--terrain-atlas", type=Path)
+    parser.add_argument("--runtime-json", type=Path,
+                        help="Pinned runtime JSON to audit the native contact confirmation clock")
     parser.add_argument("--validation-fraction", type=float, default=.125)
     parser.add_argument("--horizon", type=int, default=16)
     parser.add_argument("--batch", type=int, default=1024)
@@ -56,7 +78,7 @@ def main():
     from supermimic_rl.contracts import StateSchema
     from supermimic_rl.world_model_v2.replay import CompactReplay
 
-    state, hidden = None, None
+    state, hidden, contact_floor = None, None, None
     if args.online_checkpoint is not None:
         saved = torch.load(args.online_checkpoint, map_location="cpu", weights_only=True, mmap=True)
         schema = StateSchema.from_dict(saved["schema"])
@@ -66,6 +88,7 @@ def main():
             raise ValueError("Online checkpoint and replay generation differ")
         replay = CompactReplay.from_state_dict(dataset["replay"], "cpu")
         state, hidden = saved["learner"]["model"], saved["config"]["model_hidden"]
+        contact_floor = checkpoint_contact_floor(saved['learner'], args.device)
         fraction = saved["config"].get("validation_fraction", args.validation_fraction)
     else:
         from supermimic_rl.world_model_v2.ingest import load_recorded_replay
@@ -81,7 +104,8 @@ def main():
     valid_ids = list(range(replay.num_envs - held, replay.num_envs))
     fit = None if state is None else _model(schema, args, hidden, state, args.device)
     result = report(replay, fit=fit, env_ids=valid_ids, horizon=args.horizon, batch=args.batch,
-                    generator=torch.Generator().manual_seed(args.seed), device=args.device)
+                    generator=torch.Generator().manual_seed(args.seed), device=args.device,
+                    contact_floor=contact_floor, termination=pinned_termination(schema, args.runtime_json))
     result.update(schema_fingerprint=schema.fingerprint, validation_env_ids=[valid_ids[0], valid_ids[-1]],
                   source=str((args.online_checkpoint or args.replay).resolve()))
     args.output.parent.mkdir(parents=True, exist_ok=True)

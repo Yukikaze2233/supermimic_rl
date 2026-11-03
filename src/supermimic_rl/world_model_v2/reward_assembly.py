@@ -54,6 +54,7 @@ class RewardTick:
     episode_id: Tensor
     control_epoch: Tensor
     policy_owned: Tensor
+    jump_reference_stage: Tensor | None = None
 
 
 @dataclass(frozen=True)
@@ -193,8 +194,9 @@ class RewardAssembly:
         if references is None:
             # Preserve support for callers whose optional task producers change
             # within the interval. Native locomotion uses one stable layout.
-            for physics, reference, history in zip(physics_ticks, reference_ticks, histories):
-                densities = physical_reward_densities(physics, reference, history, self.parameters)
+            for physics, reference, history, tick in zip(physics_ticks, reference_ticks, histories, ticks):
+                densities = physical_reward_densities(physics, reference, history, self.parameters,
+                    jump_reference_stage=tick.jump_reference_stage)
                 for name, value in densities.components.items():
                     contribution = value.double() * self.parameters.physics_dt_s
                     components[name] = components.get(name, 0.) + contribution
@@ -205,7 +207,15 @@ class RewardAssembly:
                 'passive_knee_limits_rad', 'available_terms', 'velocity_reference',
                 'effort_reference', 'slip_reference', 'boundary_reference'))
             parameters = replace(self.parameters, mass_kg=self.parameters.mass_kg.repeat(expected))
-            densities = physical_reward_densities(physics, references, self._stack_rows(histories), parameters)
+            stages = tuple(tick.jump_reference_stage for tick in ticks)
+            if all(stage is None for stage in stages):
+                reference_stage = None
+            elif all(stage is not None for stage in stages):
+                reference_stage = torch.cat(stages, dim=0)
+            else:
+                raise ValueError('Jump reference stage coverage changes within a physical interval')
+            densities = physical_reward_densities(physics, references, self._stack_rows(histories), parameters,
+                                                  jump_reference_stage=reference_stage)
             # Keep the exact original double-precision tick accumulation order.
             # Only the stateless elementwise densities share one larger batch.
             for name, values in densities.components.items():

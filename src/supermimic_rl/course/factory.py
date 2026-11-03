@@ -118,13 +118,23 @@ def create_course(configuration):
 
         reward_kernel_receipt = install_shared_reward(
             native._formal_reward.composer, verify_native=configuration.get("audit_reward_kernel", False),
-            extensions=RewardExtensions(**configuration.get("reward_extensions", {})))
+            extensions=RewardExtensions(**configuration.get("reward_extensions", {})),
+            jump_tasks=native._terrain_course.tasks)
         build_scope.close()
         health = strategy.course_health(health, native)
         curriculum = make_course_curriculum(configuration["num_envs"], configuration["device"],
                                             configuration.get("seed", 7), course_configuration)
         native.set_task_sampler(LabTaskDrawSampler(curriculum))
         course_schedule_receipt = install_jump_first_command_pool(native._terrain_course.tasks, curriculum)
+        jump_takeoff_receipt = stair_label_receipt = None
+        if configuration.get("jump_takeoff") is not None:
+            from .jump_takeoff import install_jump_takeoff
+
+            jump_takeoff_receipt = install_jump_takeoff(native, configuration["jump_takeoff"])
+        if configuration.get("tof_stair_label", False):
+            from .stair_label import install_tof_stair_label
+
+            stair_label_receipt = install_tof_stair_label(native)
         jump_assist_receipt = None
         if configuration.get("jump_assist") is not None:
             if configuration.get("evaluation") is not None:
@@ -144,6 +154,8 @@ def create_course(configuration):
             "action_bounds": action_contract["action_bounds"],
             "execution": execution.receipt(), "curriculum": course_configuration,
             "course_schedule": course_schedule_receipt,
+            "jump_takeoff": jump_takeoff_receipt,
+            "stair_label": stair_label_receipt,
             "jump_assist": jump_assist_receipt,
             "reward_kernel": reward_kernel_receipt,
             "reward_config": asdict(native._formal_reward.config),

@@ -31,7 +31,8 @@ def make_learner(schema, runtime, config, *, linkage_path, asset_directory, iden
                            frame_dim=actor_frame_dim, action_bounds=action_bounds_from_source(source)).to(device)
     task_dim = MOTION_TASK_DIM if record_tasks else 0
     routes = {'terrain': terrain is not None, 'stairs': stair_source is not None, 'jumps': jump_task is not None,
-              'recovery': recovery_task is not None}
+              'recovery': recovery_task is not None,
+              'jump_trigger': jump_task is not None and jump_task.config.trigger is not None}
     critic = Critic(Critic.feature_size(schema.goal_dim, SIM_CONTEXT_DIM, task_dim=task_dim, **routes),
                     tuple(critic_hidden), task_dim=task_dim, input_clip=config.critic_input_clip, **routes).to(device)
     reward_type = OrdinaryFlatReward if terrain is None else TerrainLocomotionReward

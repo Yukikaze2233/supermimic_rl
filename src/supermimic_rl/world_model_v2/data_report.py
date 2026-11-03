@@ -70,19 +70,35 @@ def coverage(replay, mask: torch.Tensor, *, chunk: int = 65536) -> dict:
             "thresholds_n": {"support_on": SUPPORT_ON_N, "support_off": SUPPORT_OFF_N, "body_contact": BODY_CONTACT_N}}
 
 
-def prediction(fit, replay, env_ids, mask, *, horizon, batch, generator, device) -> dict:
+def prediction(fit, replay, env_ids, mask, *, horizon, batch, generator, device,
+               contact_floor=None, termination=None) -> dict:
     """Held-out multi-step errors and forbidden-contact confusion starting in the population."""
+    threshold = BODY_CONTACT_N if termination is None else termination.limits.forbidden_body_load_n
     return validate(fit, replay, env_ids, horizon, batch, generator, device,
-                    contact_threshold_n=BODY_CONTACT_N, start_rows=mask)
+                    contact_threshold_n=threshold, start_rows=mask,
+                    contact_floor=contact_floor, termination=termination)
 
 
-def report(replay, *, fit=None, env_ids=None, horizon=16, batch=1024, generator=None, device="cpu") -> dict:
+def report(replay, *, fit=None, env_ids=None, horizon=16, batch=1024, generator=None, device="cpu",
+           contact_floor=None, termination=None) -> dict:
     result = {"scope": "coverage of recorded intervals; prediction on held-out rows when a model is given",
-              "forbidden_bodies": list(FORBIDDEN_BODIES), "populations": {}}
+              "forbidden_bodies": list(FORBIDDEN_BODIES), "populations": {},
+              "contact_prediction": {
+                  "saved_floor_applied": contact_floor is not None,
+                  "calibration": "saved floors are not refitted; fresh sampled windows share the held-out environment population",
+                  "confirmation_clock": "audited with pinned native limits" if termination is not None else
+                      "not audited; provide the pinned runtime JSON",
+                  "contact_threshold_source": "pinned native forbidden-body threshold" if termination is not None else
+                      "3 N body-contact coverage threshold; native failure threshold unavailable",
+                  "missing_positive_labels": "recall is null, never interpreted as perfect recall"}}
+    if contact_floor is not None:
+        result['contact_prediction']['body_floor_n'] = contact_floor[0].tolist()
+        result['contact_prediction']['base_resultant_floor_n'] = float(contact_floor[1])
     for name, mask in populations(replay).items():
         entry = {"coverage": coverage(replay, mask)}
         if fit is not None and entry["coverage"]["transitions"]:
             entry["prediction"] = prediction(fit, replay, env_ids, mask, horizon=horizon, batch=batch,
-                                             generator=generator, device=device)
+                                             generator=generator, device=device,
+                                             contact_floor=contact_floor, termination=termination)
         result["populations"][name] = entry
     return result

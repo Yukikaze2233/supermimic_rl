@@ -125,4 +125,5 @@ def initialize_student_from_ppo(student: EstimatorActor, path: Path, expected_sh
     if difference > EQUIVALENCE_TOLERANCE:
         raise ValueError(f"Initialized student differs from the PPO actor by {difference}")
     return {"path": str(path), "sha256": digest, "max_abs_action_difference": difference,
+            "action_std": actor.log_std.detach().exp().tolist(),
             "scope": "student weights only; world model, critic and optimizers start fresh"}

@@ -1,0 +1,41 @@
+{
+  "requirements_by_gate": {
+    "active_jump": [],
+    "active_jump@0.25": [
+      {"scenario": "jump_standing_low", "counter": "jump_physical_success_events"},
+      {"scenario": "jump_standing_intermediate", "counter": "jump_physical_success_events"}
+    ],
+    "active_jump@0.5": [],
+    "active_jump@0.75": [],
+    "dynamic_commands": [
+      {"scenario": "jump_standing_high", "counter": "jump_physical_success_events"},
+      {"scenario": "jump_moving_low", "counter": "jump_physical_success_events"},
+      {"scenario": "jump_moving_intermediate", "counter": "jump_physical_success_events"},
+      {"scenario": "jump_moving_high", "counter": "jump_physical_success_events"}
+    ],
+    "terrain_foundation": [],
+    "authored_steps": [],
+    "full_recovery": [
+      {"scenario": "authored_single_step", "counter": "authored_whole_course.complete"},
+      {"scenario": "authored_two_platforms", "counter": "authored_whole_course.complete"}
+    ],
+    "combined_dr": [
+      {"scenario": "recovery_left_side_90", "counter": "recovery_physical_success_events"},
+      {"scenario": "recovery_right_side_90", "counter": "recovery_physical_success_events"},
+      {"scenario": "recovery_prone_belly_legs_above", "counter": "recovery_physical_success_events"},
+      {"scenario": "recovery_prone_back_legs_above", "counter": "recovery_physical_success_events"}
+    ]
+  },
+  "coverage_notes": {
+    "active_jump": "Flat tracking admission remains the configured training gate; the audit records all 27 scenarios.",
+    "active_jump@0.25": "Require physical event evidence at the already trained 30 mm and 100 mm standing jumps.",
+    "active_jump@0.5": "The fixed suite has no 200 mm jump case. Retain 30/100 mm standing evidence; 100-200 mm success rate comes from native unassisted training counters.",
+    "active_jump@0.75": "The fixed suite has no 300 mm jump case. Retain 30/100 mm standing evidence; 200-300 mm success rate comes from native unassisted training counters.",
+    "dynamic_commands": "The completed jump stage must show physical events at 30/100/400 mm standing and moving; positive counts do not replace success-rate gates.",
+    "terrain_foundation": "Speed and yaw tracking thresholds remain the configured training gate; inspect the full audit for 2.7 m/s and spin regressions.",
+    "authored_steps": "Foundation terrain admission remains the configured training gate; authored step completion is required after its own training stage.",
+    "full_recovery": "Both authored course geometries require complete physical traversal events.",
+    "combined_dr": "All four fixed fallen postures require physical recovery events.",
+    "complete": "A finished PPO update budget and positive skill events do not alone prove full tracking performance or SuperMimic completion. Review all 27 scenario metrics."
+  }
+}

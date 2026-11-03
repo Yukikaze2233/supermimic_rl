@@ -17,6 +17,7 @@ from torch import Tensor
 from .physical import PhysicalState
 
 if TYPE_CHECKING:
+    from supermimic_rl.course.jump_takeoff import JumpTakeoffConfig
     from transformer_rl.formal.lab_env.course_tasks import RequestCommand
     from transformer_rl.formal.tasks.jump import JumpReferenceConfig
     from transformer_rl.formal.tasks.protocol import CompletedEstimate, RequestProtocolConfig
@@ -40,6 +41,10 @@ JUMP_VALUE_NAMES = (
 JUMP_RECORD_FIELDS = {'jump_ids': (9,), 'jump_clock': (5,), 'jump_values': (17,)}
 JUMP_RECORD_DTYPES = {'jump_ids': torch.int64, 'jump_clock': torch.float64}
 JUMP_FEATURE_DIM = 32
+JUMP_TRIGGER_RECORD_VERSION = 1
+JUMP_TRIGGER_RECORD_FIELDS = {'jump_trigger_clock': (1,), 'jump_trigger_flags': (2,)}
+JUMP_TRIGGER_RECORD_DTYPES = {'jump_trigger_clock': torch.float64, 'jump_trigger_flags': torch.bool}
+JUMP_TRIGGER_FEATURE_DIM = 3
 _BOOL_NAMES = {
     'protocol.cancelled', 'protocol.flight_seen', '_physical_cancelled',
     'flight_seen', 'ascent_seen', 'supported_start', '_last_supported',
@@ -51,23 +56,32 @@ class JumpTaskConfig:
     request: RequestProtocolConfig
     reference: JumpReferenceConfig
     physics_dt_s: float = .005
+    trigger: JumpTakeoffConfig | None = None
+    trigger_record_version: int = JUMP_TRIGGER_RECORD_VERSION
 
     @classmethod
     def capture(cls, native):
         tasks = native._terrain_course.tasks
-        return cls(tasks.protocol.config, tasks.reference.config, float(native.physics_dt))
+        gate = getattr(native, 'supermimic_jump_trigger', None)
+        return cls(tasks.protocol.config, tasks.reference.config, float(native.physics_dt),
+                   None if gate is None else gate.config)
 
     @classmethod
     def from_dict(cls, value):
         from transformer_rl.formal.tasks.jump import JumpReferenceConfig
         from transformer_rl.formal.tasks.protocol import RequestProtocolConfig
+        from supermimic_rl.course.jump_takeoff import JumpTakeoffConfig
 
         return cls(RequestProtocolConfig(**value['request']), JumpReferenceConfig(**value['reference']),
-                   value['physics_dt_s'])
+                   value['physics_dt_s'],
+                   None if value.get('trigger') is None else JumpTakeoffConfig(**value['trigger']),
+                   value.get('trigger_record_version', JUMP_TRIGGER_RECORD_VERSION))
 
     def __post_init__(self):
         if self.request.policy_dt_s != .02 or self.physics_dt_s != .005:
             raise ValueError('Jump imagination uses the recorded 200/50 Hz four-tick contract')
+        if self.trigger_record_version != JUMP_TRIGGER_RECORD_VERSION:
+            raise ValueError('Unknown jump trigger record version')
 
 
 @dataclass(frozen=True)
@@ -75,6 +89,8 @@ class JumpTaskState:
     ids: Tensor
     clock: Tensor
     values: Tensor
+    trigger_clock: Tensor | None = None  # last_end_s, absolute float64 clock
+    trigger_flags: Tensor | None = None  # known state, was_active
 
     @classmethod
     @torch.no_grad()
@@ -82,11 +98,14 @@ class JumpTaskState:
         course = native._terrain_course
         if getattr(course, '_pending_requests', {}).get('jump') is not None:
             raise ValueError('Jump capture cannot discard a pending external request packet')
+        gate = getattr(native, 'supermimic_jump_trigger', None)
+        trigger = None if gate is None else (
+            gate.last_end_s[:, None], torch.stack((torch.ones_like(gate.was_active), gate.was_active), -1))
         return cls._pack(native._clock(), course.tasks.protocol, course.tasks,
-                         origin_z=course.router.origins[:, 2])
+                         origin_z=course.router.origins[:, 2], trigger=trigger)
 
     @classmethod
-    def _pack(cls, now, protocol, owner, *, origin_z=None):
+    def _pack(cls, now, protocol, owner, *, origin_z=None, trigger=None):
         def get(name):
             if name == 'now_s':
                 return now
@@ -96,16 +115,45 @@ class JumpTaskState:
                 value = value - origin_z
             return value
 
+        captured_trigger = (None, None) if trigger is None else tuple(value.clone() for value in trigger)
         return cls(torch.stack([get(name) for name in JUMP_ID_NAMES], -1).clone(),
                    torch.stack([get(name) for name in JUMP_CLOCK_NAMES], -1).clone(),
-                   torch.stack([get(name).float() for name in JUMP_VALUE_NAMES], -1).clone())
+                   torch.stack([get(name).float() for name in JUMP_VALUE_NAMES], -1).clone(),
+                   *captured_trigger)
 
     @classmethod
     def decode(cls, record):
-        return cls(*(record[name] for name in JUMP_RECORD_FIELDS))
+        if ('jump_trigger_clock' in record) != ('jump_trigger_flags' in record):
+            raise ValueError('Incomplete jump trigger record')
+        return cls(*(record[name] for name in JUMP_RECORD_FIELDS),
+                   record.get('jump_trigger_clock'), record.get('jump_trigger_flags'))
 
     def record(self):
-        return dict(zip(JUMP_RECORD_FIELDS, (self.ids, self.clock, self.values)))
+        result = dict(zip(JUMP_RECORD_FIELDS, (self.ids, self.clock, self.values)))
+        if self.trigger_clock is not None:
+            result.update(jump_trigger_clock=self.trigger_clock, jump_trigger_flags=self.trigger_flags)
+        return result
+
+    def _trigger_state(self):
+        n, device = len(self.ids), self.ids.device
+        if (self.trigger_clock is None or self.trigger_flags is None
+                or self.trigger_clock.shape != (n, 1) or self.trigger_clock.dtype != torch.float64
+                or self.trigger_flags.shape != (n, 2) or self.trigger_flags.dtype != torch.bool
+                or self.trigger_clock.device != device or self.trigger_flags.device != device
+                or not self.trigger_flags[:, 0].all()
+                or not (torch.isfinite(self.trigger_clock) | torch.isneginf(self.trigger_clock)).all()):
+            raise ValueError('Jump trigger needs known native clock/state; migrate legacy replay explicitly')
+        return self.trigger_clock[:, 0], self.trigger_flags[:, 1]
+
+    def trigger_critic_features(self, motion, config):
+        last_end, was_active = self._trigger_state()
+        gate = config.trigger
+        if gate is None:
+            raise ValueError('Trigger critic features require an enabled gate')
+        cooldown = (gate.cooldown_s - (self.now_s - last_end)).clamp_min(0.)
+        episode = (gate.min_episode_s - motion.timing[:, 0]).clamp_min(0.)
+        return torch.stack((cooldown / max(gate.cooldown_s, .02),
+                            episode / max(gate.min_episode_s, .02), was_active), -1).to(self.values)
 
     @property
     def active_id(self):
@@ -190,6 +238,7 @@ class JumpAdvance:
     response: Tensor
     finished_id: Tensor
     end_reason: Tensor
+    deferred: Tensor
 
 
 @dataclass(frozen=True)
@@ -200,6 +249,7 @@ class JumpInterval:
     velocity_world_z_m_s: Tensor
     success_request_id: Tensor
     success_credited: Tensor
+    reference_stage: Tensor
 
 
 class JumpTask:
@@ -220,7 +270,8 @@ class JumpTask:
     def advance(self, state: JumpTaskState, *, now_s: Tensor, estimate: CompletedEstimate | None,
                 admitted: Tensor, base_mode: Tensor, task_family: Tensor, elapsed_s: Tensor,
                 ground_z: Tensor, blocked_by_stair: Tensor, interval_uniform: Tensor | None = None,
-                packet: RequestCommand | None = None) -> JumpAdvance:
+                packet: RequestCommand | None = None, previous_command_height: Tensor | None = None,
+                previous_elapsed_s: Tensor | None = None) -> JumpAdvance:
         """Advance after old-interval reward, and after motion command admission.
 
         ``elapsed_s`` is MotionTask's already advanced episode clock. Random
@@ -233,6 +284,26 @@ class JumpTask:
 
         protocol, owner = state._restore(self.config)
         n, device = len(state.ids), state.ids.device
+        postponed = torch.zeros(n, dtype=torch.bool, device=device)
+        trigger = None
+        if self.config.trigger is not None:
+            last_end, was_active = state._trigger_state()
+            trigger = (last_end[:, None], state.trigger_flags)
+            if packet is None:
+                if (previous_command_height is None or previous_elapsed_s is None
+                        or previous_command_height.shape != (n,) or previous_elapsed_s.shape != (n,)):
+                    raise ValueError('Gated jumps need the command height and episode clock before admission')
+                gate, dt = self.config.trigger, self.config.request.policy_dt_s
+                ready = (owner._last_supported
+                         & (owner._last_world_height - ground_z - previous_command_height).abs().le(
+                             gate.height_tolerance_m)
+                         & (previous_elapsed_s + dt >= gate.min_episode_s)
+                         & (now_s - last_end >= gate.cooldown_s))
+                due = ((task_family == int(TaskFamily.REQUEST))
+                       & (previous_elapsed_s + dt >= owner.next_request_s) & (protocol.active_id < 0))
+                postponed = due & ~ready
+                owner.next_request_s = torch.where(postponed, previous_elapsed_s + 2 * dt,
+                                                   owner.next_request_s)
         owner.success_id.fill_(-1)
         if estimate is None:
             estimate = CompletedEstimate(admitted.new_zeros(n), admitted.new_zeros(n, 2),
@@ -291,8 +362,13 @@ class JumpTask:
         mode = torch.where(condition.jump_mode, int(CommandMode.JUMP), base_mode)
         height = torch.where(condition.jump_mode, owner.latched_height, admitted[:, 3])
         command = torch.cat((admitted[:, :3], height[:, None]), -1)
-        return JumpAdvance(JumpTaskState._pack(now_s, protocol, owner), command, mode,
-            condition.height_m, condition.clock_s, condition.response, condition.finished_id, condition.end_reason)
+        if trigger is not None:
+            active = protocol.active_id >= 0
+            last_end = torch.where(was_active & ~active, now_s, last_end)
+            trigger = (last_end[:, None], torch.stack((state.trigger_flags[:, 0], active), -1))
+        return JumpAdvance(JumpTaskState._pack(now_s, protocol, owner, trigger=trigger), command, mode,
+            condition.height_m, condition.clock_s, condition.response, condition.finished_id, condition.end_reason,
+            postponed)
 
     @staticmethod
     def com_velocity(physical: PhysicalState, base_com_offset: Tensor) -> Tensor:
@@ -335,11 +411,13 @@ class JumpTask:
                     tilt[:, tick], physical.position[:, tick, 2], angular_speed_rad_s=speed[:, tick],
                     dt=self.config.physics_dt_s)
                 phases.append(owner.phase.clone())
-            following = JumpTaskState._pack(state.now_s, protocol, owner)
+            trigger = (None if state.trigger_clock is None else (state.trigger_clock, state.trigger_flags))
+            following = JumpTaskState._pack(state.now_s, protocol, owner, trigger=trigger)
             phase = torch.stack(phases, -1)
             success = (owner.success_id >= 0) & (owner.success_id > state.ids[:, 6])
         curve = self.reference(state)
         landing = (phase == int(RewardPhase.LANDING)) | (phase == int(RewardPhase.SETTLING))
         height = torch.where(landing, ground_z + command_height[:, None], curve.height_world_z_m[:, None])
         velocity = torch.where(landing, 0., curve.velocity_world_z_m_s[:, None])
-        return JumpInterval(following, phase, height, velocity, owner.success_id.clone(), success)
+        return JumpInterval(following, phase, height, velocity, owner.success_id.clone(), success,
+                            curve.clock_stage[:, None].expand(-1, 4))
