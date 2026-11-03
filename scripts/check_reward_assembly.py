@@ -5,6 +5,8 @@ Run both ideal-LUT and measured-knee geometry to separate physics closure error
 from reward/control implementation error. With --terrain-atlas, query the real
 root/wheel terrain at every recorded tick and audit the native termination height.
 This evaluates recorded intervals, not future skill-request propagation.
+With --recorded-jumps, include recorded jump requests and reconstruct their
+references from task memory; this is not an independent four-reference audit.
 """
 from __future__ import annotations
 
@@ -36,6 +38,10 @@ from supermimic_rl.world_model_v2.ingest import load_recorded_replay
 from supermimic_rl.world_model_v2.model import Ticks
 from supermimic_rl.world_model_v2.records import decode_memory, decode_physical
 from supermimic_rl.formal_observation import known_horizon
+from supermimic_rl.world_model_v2.jump_task import (
+    JUMP_RECORD_FIELDS, JUMP_TRIGGER_RECORD_FIELDS, JumpTask, JumpTaskConfig, JumpTaskState,
+)
+from supermimic_rl.world_model_v2.motion_task import MotionTask
 
 
 def stats(value):
@@ -45,10 +51,24 @@ def stats(value):
 
 
 @torch.no_grad()
-def check_compact(path, table, asset, bundle, *, terrain_path=None, device='cpu'):
+def check_compact(path, table, asset, bundle, *, terrain_path=None, device='cpu', recorded_jumps=False):
     """The exact producer called by BPTT, with native labels replacing network outputs."""
     replay, schema = load_recorded_replay(path, device, record_terrain=terrain_path is not None)
     data = replay.data
+    jump_task = None
+    if recorded_jumps:
+        if terrain_path is None:
+            raise ValueError('Recorded-jump reward audit requires the pinned terrain atlas')
+        payload = torch.load(path, map_location='cpu', weights_only=True, mmap=True)
+        if payload.get('jump_task_config') is None:
+            raise ValueError('Recorded-jump reward audit requires the captured native jump task configuration')
+        jump_task = JumpTask(JumpTaskConfig.from_dict(payload['jump_task_config']))
+        required = {*JUMP_RECORD_FIELDS, 'jump_record_valid', 'motion_task', 'task_record_valid',
+                    'failure_conditions_valid'}
+        if jump_task.config.trigger is not None:
+            required.update(JUMP_TRIGGER_RECORD_FIELDS)
+        if not required.issubset(data):
+            raise ValueError('Recorded-jump reward audit lacks native fields: ' + repr(sorted(required - data.keys())))
     rows = (data['valid'] & data['policy_owned'] & data['end_policy_owned']
             & (data['reward_context_valid'][..., 0] > .5))
     if terrain_path is None:
@@ -57,8 +77,18 @@ def check_compact(path, table, asset, bundle, *, terrain_path=None, device='cpu'
     else:
         if 'task_family' not in data:
             raise ValueError('Terrain reward audit needs recorded task families; re-encode packed data or recollect')
-        rows &= ((data['reward_route'][..., 0] <= 2) & (data['task_family'][..., 0] < 4)
-                 & (data['goal'][..., 7:9] <= .5).all(-1))
+        if recorded_jumps:
+            mode = data['reward_route'][..., 0]
+            rows &= (((mode <= 2) | (mode == 4)) & (data['task_family'][..., 0] < 5)
+                     & (data['goal'][..., 7] <= .5)
+                     & (MotionTask.decode(data['motion_task']).route[..., 3] <= 2))
+            for name in ('jump_record_valid', 'task_record_valid', 'failure_conditions_valid'):
+                rows &= data[name][..., 0] > .5
+            if jump_task.config.trigger is not None:
+                rows &= data['jump_trigger_flags'][..., 0]
+        else:
+            rows &= ((data['reward_route'][..., 0] <= 2) & (data['task_family'][..., 0] < 4)
+                     & (data['goal'][..., 7:9] <= .5).all(-1))
     if not rows.any():
         raise ValueError('No complete eligible locomotion intervals for compact reward audit')
     start = {name: value[rows] for name, value in data.items()}
@@ -70,13 +100,18 @@ def check_compact(path, table, asset, bundle, *, terrain_path=None, device='cpu'
     terrain = (None if terrain_path is None else AtlasTerrain.load(
         terrain_path, expected_sha256=source['terrain_sha256'], device=device))
     producer = (OrdinaryFlatReward(source, geometry, wheels, schema.policy_dt_s) if terrain is None else
-                TerrainLocomotionReward(source, geometry, wheels, schema.policy_dt_s, terrain=terrain))
+                TerrainLocomotionReward(source, geometry, wheels, schema.policy_dt_s, terrain=terrain,
+                                        jump_task=jump_task))
     context = producer.bind(start, state, known_interval=terrain is not None)
     memory = RewardMemory.decode(torch.cat((start['reward_memory'], start['support_memory']), -1))
     tick_valid = (None if terrain is None else terrain.observe(ticks.state, start['terrain_tile'][:, 0]).valid)
+    jump = None if jump_task is None else JumpTaskState.decode(start)
+    jump_arguments = ({} if jump is None else {'jump_state': jump,
+        'base_mode': MotionTask.decode(start['motion_task']).route[:, 3].long()})
     result = context.integrate(state, SimpleNamespace(ticks=ticks, tick_terrain_valid=tick_valid), start['action'], memory,
-                               decode_memory(start['memory']), start['goal'], 0)
-    reward = result.finish(start['terminated'], torch.zeros_like(start['terminated']), context.assembly.parameters)
+                               decode_memory(start['memory']), start['goal'], 0, **jump_arguments)
+    success = (torch.zeros_like(start['terminated']) if result.success_credited is None else result.success_credited)
+    reward = result.finish(start['terminated'], success, context.assembly.parameters)
     report = {'intervals': len(reward), 'reward_error': stats(reward - start['reward'][:, 0]),
             'invalid_intervals': int(result.invalid.sum()),
             'scope': 'actual BPTT reward producer, actual compact tick labels, no learned motion'}
@@ -90,6 +125,24 @@ def check_compact(path, table, asset, bundle, *, terrain_path=None, device='cpu'
             view = SubstepView.from_replay_payload(payload, dtype=torch.float32)
             actual = view.get('termination_height_m')[rows.cpu()].to(device)
             report['termination_height_error_m'] = stats(result.termination_height - actual)
+    if jump is not None:
+        from transformer_rl.formal.tasks.jump import ReferenceStage
+
+        active = start['reward_route'][:, 0] == 4
+        jump_rows = active | (start['task_family'][:, 0] == 4) | (jump.active_id >= 0) | (jump.physical_id >= 0)
+        hold_missed = (active & (jump_task.reference(jump).clock_stage == int(ReferenceStage.HOLD))
+                       & (result.jump_state.ids[:, 8] == int(RewardPhase.TAKEOFF)))
+        report['subsets'] = {}
+        for name, mask in (('ordinary', ~jump_rows), ('jump', jump_rows), ('active_jump', active),
+                           ('hold_without_takeoff', hold_missed)):
+            report['subsets'][name] = {'intervals': int(mask.sum()),
+                'reward_error': stats((reward - start['reward'][:, 0])[mask]) if mask.any() else None,
+                'invalid_intervals': int((result.invalid & mask).sum()),
+                'success_events': int((success & ~start['terminated'] & mask).sum())}
+        report.update(recorded_jumps=True,
+            scope='recorded ordinary/jump intervals through the actual four-tick reward producer; true physical ticks and wheel normal support loads, no learned motion or policy qualification',
+            reference_scope='jump references reconstructed from recorded task memory; per-tick native references are not recorded, so this is not an independent four-reference comparison',
+            subset_scope='jump includes request-family waiting and active/physical attempts; HOLD without takeoff means active JUMP mode, reference HOLD and physical TAKEOFF still present after the recorded interval')
     return report
 
 
@@ -189,12 +242,16 @@ def main():
     parser.add_argument('--asset', type=Path, default=Path('assets/full_vehicle_v2p0p1_source_audited_v2'))
     parser.add_argument('--bundle', type=Path, default=Path('configs/identified/20261031'))
     parser.add_argument('--terrain-atlas', type=Path)
+    parser.add_argument('--recorded-jumps', action='store_true',
+                        help='Audit recorded jump tasks including HOLD misses; requires --terrain-atlas')
     parser.add_argument('--device', default='cpu', help='Device for the compact/atlas audit')
     parser.add_argument('--output', type=Path, required=True)
     args = parser.parse_args()
+    if args.recorded_jumps and args.terrain_atlas is None:
+        parser.error('--recorded-jumps requires --terrain-atlas')
     report = ({} if args.terrain_atlas is not None else check(args.replay, args.table, args.asset, args.bundle))
     report['compact_imagination_producer'] = check_compact(args.replay, args.table, args.asset, args.bundle,
-        terrain_path=args.terrain_atlas, device=args.device)
+        terrain_path=args.terrain_atlas, device=args.device, recorded_jumps=args.recorded_jumps)
     args.output.parent.mkdir(parents=True, exist_ok=True)
     args.output.write_text(json.dumps(report, indent=2) + '\n')
     print(json.dumps(report, indent=2))
