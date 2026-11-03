@@ -99,6 +99,8 @@ def upgrade_jump_tasks(saved, dataset, reference, *, source_course_raw, target_c
     if json.dumps(saved['stair_scenario'], sort_keys=True) != json.dumps(reference['stair_source_config'], sort_keys=True):
         raise ValueError('Jump migration cannot replace the native stair protocol/source')
     jump_config = JumpTaskConfig.from_dict(reference['jump_task_config'])
+    if jump_config.trigger is not None:
+        raise ValueError('First migrate native jump/recovery tasks, then explicitly expand the jump trigger')
     reference_data = reference['replay']['storage']
     if (any(name not in reference_data or reference_data[name].shape[2:] != shape
             or reference_data[name].dtype != JUMP_RECORD_DTYPES.get(name, torch.float32)

@@ -24,7 +24,7 @@ from .sensing import encoder_imu_sample, gimbal_sample, heading_sample
 from .termination import PoseContactTermination
 from .stair_task import StairTaskState, STAIR_FEATURE_DIM
 from .stair_source import StairSourceState, TOF_FEATURE_DIM
-from .jump_task import JumpTaskState, JUMP_FEATURE_DIM
+from .jump_task import JumpTaskState, JUMP_FEATURE_DIM, JUMP_TRIGGER_FEATURE_DIM
 from .recovery_task import RecoveryTaskState, RECOVERY_FEATURE_DIM
 
 POLICY_DT_S = .02
@@ -66,14 +66,15 @@ class Imagined:
 class Critic(nn.Module):
     @staticmethod
     def feature_size(goal_dim: int, sim_context_dim: int, *, task_dim: int = 0,
-                     terrain: bool = False, stairs: bool = False, jumps: bool = False, recovery: bool = False) -> int:
+                     terrain: bool = False, stairs: bool = False, jumps: bool = False, recovery: bool = False,
+                     jump_trigger: bool = False) -> int:
         return (30 + 12 + 19 + goal_dim + sim_context_dim + 77 + 3 + 2 + 23 + task_dim
                 + 14 * terrain + (STAIR_FEATURE_DIM + TOF_FEATURE_DIM) * stairs + JUMP_FEATURE_DIM * jumps
-                + RECOVERY_FEATURE_DIM * recovery)
+                + RECOVERY_FEATURE_DIM * recovery + JUMP_TRIGGER_FEATURE_DIM * jump_trigger)
 
     def __init__(self, input_dim: int, hidden: tuple[int, ...] = (256, 128), *, task_dim: int = 0,
                  terrain: bool = False, stairs: bool = False, jumps: bool = False, recovery: bool = False,
-                 input_clip: float | None = None):
+                 input_clip: float | None = None, jump_trigger: bool = False):
         super().__init__()
         if input_clip is not None and not input_clip > 0:
             raise ValueError('Critic input clip must be positive or None')
@@ -84,6 +85,9 @@ class Critic(nn.Module):
         if jumps and not stairs:
             raise ValueError('Jump critic requires the complete terrain, command and stair arbitration state')
         self.jumps = jumps
+        if jump_trigger and not jumps:
+            raise ValueError('Jump trigger critic requires the jump task')
+        self.jump_trigger = jump_trigger
         if recovery and not jumps:
             raise ValueError('Recovery critic requires complete jump and stair arbitration state')
         self.recovery = recovery
@@ -147,6 +151,8 @@ class Imagination:
         if critic.jumps != (jump_task is not None) or jump_task is not None and stair_source is None:
             raise ValueError('Jump imagination needs its physical task, source arbitration and critic state together')
         self.jump_task = jump_task
+        if critic.jump_trigger != (jump_task is not None and jump_task.config.trigger is not None):
+            raise ValueError('Jump gate rollout and critic causal features must be enabled together')
         if critic.recovery != (recovery_task is not None) or recovery_task is not None and jump_task is None:
             raise ValueError('Recovery imagination needs its lifecycle and complete skill arbitration state')
         self.recovery_task = recovery_task
@@ -212,6 +218,9 @@ class Imagination:
             if recovery_state is None:
                 raise ValueError('Recovery critic needs the recorded native lifecycle')
             features += (recovery_state.critic_features(self.recovery_task.config),)
+        if self.critic.jump_trigger:
+            features += (jump_state.trigger_critic_features(
+                MotionTask.decode(motion_task), self.jump_task.config),)
         return torch.cat(features, -1)
 
     @staticmethod
@@ -488,7 +497,8 @@ class Imagination:
                         estimate=_take_rows(estimate, rows), admitted=admitted, base_mode=following.route[:, 3].long(),
                         task_family=start['task_family'][rows, 0].long(), elapsed_s=following.timing[:, 0],
                         ground_z=ground, blocked_by_stair=stair.ids[rows, 1] >= 0,
-                        interval_uniform=start['jump_uniform'][rows, step])
+                        interval_uniform=start['jump_uniform'][rows, step],
+                        previous_command_height=task.current[rows, 3], previous_elapsed_s=task.timing[rows, 0])
                     # Native tasks latch the accepted baseline into the command
                     # stream before stair assistance and gimbal eligibility.
                     following = replace(following, current=jumped.command)

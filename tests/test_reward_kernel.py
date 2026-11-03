@@ -1,6 +1,7 @@
 """Shared reward parity against the frozen native composer and real gradient checks."""
 from copy import deepcopy
 from dataclasses import fields, replace
+from types import SimpleNamespace
 
 import pytest
 import torch
@@ -197,3 +198,60 @@ def test_jump_push_pays_reference_upward_speed_only_before_flight_in_the_push_wi
     assert flight.positive['jump_push'].abs().sum() == 0
     _, ordinary = _jump_densities('ordinary', extensions)
     assert ordinary.positive['jump_push'].abs().sum() == 0
+
+
+@pytest.mark.parametrize('case', ['jump_takeoff', 'jump_flight', 'jump_landing', 'ordinary'])
+def test_missed_jump_removes_standing_tracking_only_after_reference_has_finished(case):
+    from transformer_rl.formal.tasks.jump import ReferenceStage
+    from supermimic_rl.reward_kernel import RewardExtensions
+
+    composer, reference = setup(case)
+    begin(composer, reference, torch.zeros(2, 6))
+    physics = sample(composer, 1)
+    reference = replace(reference, jump_height_world_z_m=physics.root_world_z_m,
+                        jump_velocity_world_z_m_s=torch.zeros(2))
+    physics = replace(physics, velocity_origin_world_m_s=torch.zeros(2, 3))
+    history = RewardHistory(composer._window['dq'], torch.zeros(2), torch.zeros(2), torch.zeros(2))
+    base = RewardParameters.from_composer(composer)
+    parameters = replace(base, extensions=RewardExtensions(jump_missed=1.))
+    # Both rows have zero vertical target; only the first is beyond the trajectory.
+    stages = torch.tensor([int(ReferenceStage.HOLD), int(ReferenceStage.COMPRESSION)])
+    original = physical_reward_densities(physics, reference, history, base)
+    result = physical_reward_densities(physics, reference, history, parameters, jump_reference_stage=stages)
+    missed = torch.tensor([case == 'jump_takeoff', False])
+    torch.testing.assert_close(result.gates['jump_missed'], missed)
+    torch.testing.assert_close(result.cost['jump_missed'], missed.float())
+    for name in ('height', 'jump_vertical'):
+        torch.testing.assert_close(result.positive[name], torch.where(missed, 0., original.positive[name]))
+        torch.testing.assert_close(result.cost[name], original.cost[name])
+    if case == 'jump_takeoff':
+        assert original.positive['jump_vertical'][0] == 1.
+        with pytest.raises(ValueError, match='reference clock stage'):
+            physical_reward_densities(physics, reference, history, parameters)
+    assert not result.invalid.any()
+
+
+def test_missed_jump_native_clock_is_sampled_once_per_interval_and_physical_phase_per_tick():
+    from transformer_rl.formal.tasks.jump import ReferenceStage
+    from supermimic_rl.reward_kernel import RewardExtensions
+
+    composer, reference = setup('jump_takeoff')
+    reads = []
+
+    def jump_reference():
+        reads.append(1)
+        return SimpleNamespace(clock_stage=torch.full((2,), int(ReferenceStage.HOLD)))
+
+    install_shared_reward(composer, extensions=RewardExtensions(jump_missed=1.),
+                          jump_tasks=SimpleNamespace(jump_reference=jump_reference))
+    for interval in range(2):
+        begin(composer, reference, torch.zeros(2, 6))
+        for tick in range(1, 5):
+            phase = reference.phase.clone()
+            if tick >= 3:
+                phase[1] = int(RewardPhase.FLIGHT)
+            composer.observe(sample(composer, tick), replace(reference, phase=phase))
+        result = finish(composer)
+        torch.testing.assert_close(result.component_densities['cost.jump_missed'],
+                                   torch.tensor([-1., -.5], dtype=torch.float64))
+        assert len(reads) == interval + 1

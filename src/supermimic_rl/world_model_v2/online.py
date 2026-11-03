@@ -28,7 +28,7 @@ from .replay import CompactReplay
 from .stair_source import StairScenario, StairSourceState
 from .stair_task import StairTaskState
 from .terrain import AtlasTerrain
-from .jump_task import JumpTaskConfig, JumpTaskState, JumpTask, JUMP_RECORD_FIELDS
+from .jump_task import JumpTaskConfig, JumpTaskState, JumpTask, JUMP_RECORD_FIELDS, JUMP_TRIGGER_RECORD_FIELDS
 from .recovery_task import RecoveryTaskConfig, RecoveryTask, RECOVERY_RECORD_FIELDS
 from .guard import NativeRegressionGuard
 from .validation import calibrate_contact_floor, validate
@@ -158,7 +158,10 @@ def policy_start_candidates(replay, config, env_ids, policy_dt_s):
                 if any(name not in data for name in (*JUMP_RECORD_FIELDS, 'jump_record_valid')):
                     raise ValueError('Jump imagination requires complete native records; old rows are not inferred')
                 ordinary &= data['jump_record_valid'][slots, env, 0] > .5
-                jump = JumpTaskState.decode({name: data[name][slots, env] for name in JUMP_RECORD_FIELDS})
+                jump = JumpTaskState.decode({name: data[name][slots, env] for name in
+                                            (*JUMP_RECORD_FIELDS, *JUMP_TRIGGER_RECORD_FIELDS) if name in data})
+                if jump.trigger_flags is not None:
+                    ordinary &= jump.trigger_flags[:, 0]
             if config.record_recovery:
                 if any(name not in data for name in (*RECOVERY_RECORD_FIELDS, 'recovery_record_valid')):
                     raise ValueError('Recovery imagination requires native lifecycle records; old rows are not inferred')
@@ -244,7 +247,8 @@ class OnlineTrainer:
             if (dataset['schema_fingerprint'] != environment.schema.fingerprint
                     or StateSchema.from_dict(dataset['schema']).fingerprint != environment.schema.fingerprint):
                 raise ValueError('Seed data and live native environment have different contracts')
-            if config.record_jumps and dataset.get('jump_task_config') != self.jump_scenario:
+            if config.record_jumps and (dataset.get('jump_task_config') is None or
+                    JumpTaskConfig.from_dict(dataset['jump_task_config']) != jump_config):
                 raise ValueError('Seed jump task configuration differs from the native environment')
             if config.record_recovery and dataset.get('recovery_task_config') != self.recovery_scenario:
                 raise ValueError('Seed recovery lifecycle configuration differs from the native environment')
@@ -277,7 +281,8 @@ class OnlineTrainer:
         expected = RecordSpec(environment.schema.goal_dim, 65).fields(record_tasks=config.record_tasks,
             record_terrain=config.record_stair_source, record_stairs=config.record_stair_source,
             record_stair_source=config.record_stair_source, record_jumps=config.record_jumps,
-            record_recovery=config.record_recovery)
+            record_recovery=config.record_recovery,
+            record_jump_trigger=jump_task is not None and jump_task.config.trigger is not None)
         if any(name not in replay.data or tuple(replay.data[name].shape[2:]) != shape for name, shape in expected.items()):
             raise ValueError('Online replay field layout differs from the current compact contract')
         self.mixing = MixedDecision(environment, self.learner.actor, teacher_decision, seed=config.seed + 2,
@@ -330,7 +335,10 @@ class OnlineTrainer:
             raise ValueError('Resume teacher source differs')
         if json.dumps(saved.get('stair_scenario'), sort_keys=True) != json.dumps(self.stair_scenario, sort_keys=True):
             raise ValueError('Resume stair protocol/source settings differ from the native environment')
-        if saved.get('jump_scenario') != self.jump_scenario:
+        stored_jump = saved.get('jump_scenario')
+        if ((stored_jump is None) != (self.jump_scenario is None)
+                or stored_jump is not None and JumpTaskConfig.from_dict(stored_jump)
+                != JumpTaskConfig.from_dict(self.jump_scenario)):
             raise ValueError('Resume jump protocol/reference settings differ from the native environment')
         if saved.get('recovery_scenario') != self.recovery_scenario:
             raise ValueError('Resume recovery lifecycle settings differ from the native environment')
@@ -481,9 +489,9 @@ class OnlineTrainer:
             fitted_at = time.monotonic()
             policy = []
             policy_learning = cycle > cfg.policy_start_cycle
-            if policy_learning and getattr(self, 'critic_norm_from', None) is not None:
-                self.initialize_added_critic_norm()
             critic_only = not policy_learning and cfg.critic_warmup
+            if (policy_learning or critic_only) and getattr(self, 'critic_norm_from', None) is not None:
+                self.initialize_added_critic_norm()
             for index in range(cfg.actor_updates):
                 start, frames = self.sample_starts(cfg.imagination_batch_size)
                 policy.append(learner.update_policy(start, frames, microbatch_size=cfg.imagination_microbatch_size,

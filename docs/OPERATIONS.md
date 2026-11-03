@@ -48,6 +48,25 @@ python scripts/train_ppo.py export --checkpoint <checkpoint.pt> --output teacher
 
 输出：`training/metrics.jsonl`（每更新一行，含门槛状态与原生技能计数增量）、`training/checkpoint.pt`（完整可恢复）、`training/checkpoints/update-*.pt`（轻量）。门槛超时会保存后以 `gate_timeout` 结束，必须先诊断再续训。
 
+v5 的 `jump_height_gates` 把请求高度上限固定在 0.10 / 0.20 / 0.30 / 0.40 m；只有对应阶段内门槛通过，坐标跨过整数边界后才提升上限。各高度档只读取实际未施加助力冲量的成功/结束计数，不能用全部请求的成功率替代。力幅衰减与请求抽样分开：`assist_request_probability=0.8` 是候选训练比例，保留 20% 请求不施加助力，避免课程等待时助力也被冻结、永远收集不到无助力证据；它不是电机或机械参数。剩余 80% 请求仍按课程坐标衰减力幅，最终同样归零。门槛窗口、成功率和该比例需依据分高度档样本量与原生表现调整。
+
+R7 启动前分别运行 `short`、`long` 探针，使用相同完整 checkpoint 和各自的新输出目录。400 更新对应每环境 192 s 仿真曝光；这是诊断预算，不是技能完成判据。未到达的高度档报告为未知。
+
+```bash
+SUPERMIMIC_SCRIPT=scripts/probe_jump_reference.py bash scripts/run_gpufree.sh \
+  --factory-config <r7-training-factory.json> --config <r7-ppo.json> \
+  --checkpoint <r6-full.pt> --checkpoint-sha256 <sha256> \
+  --profile short --updates 400 --stage-budget-updates 400 --output <new-probe-output>
+
+# 选定参考参数后，训练与评价 factory 的 jump_takeoff 必须一致。
+python scripts/run_ppo_gated_course.py \
+  --factory-config <r7-training-factory.json> --evaluation-factory-config <r7-skills64-factory.json> \
+  --config <r7-ppo.json> --evaluation-contract configs/gpufree/ppo-gated5-evaluation.json \
+  --resume <full-checkpoint.pt> --output <new-course-output>
+```
+
+正式编排要求 `stop_after_gate=true`：通过门槛立即保存不可变 checkpoint，退出该 Isaac 进程，完成 64×1000 无助力的 27 场景评价后才续训。已要求技能缺少物理成功时返回 `diagnostic_required`，进程失败时保留待评价 checkpoint；`--continue-run` 只恢复中断的编排，不跳过技能失败。固定评价没有 200/300 mm 跳跃案例，这两档仍看训练中的无助力计数。`budget_complete` 仅表示预算结束，完整能力仍须审阅各场景结果。
+
 ## SuperMimic（世界模型 V2）
 
 ```bash
@@ -68,7 +87,13 @@ SUPERMIMIC_SCRIPT=scripts/train_world_v2.py bash scripts/run_gpufree.sh train \
   --linkage configs/linkage/leg_linkage_08bf7e00.json --output <online>
 # 5. 数据覆盖与预测报告（无 Isaac）
 python scripts/report_world_v2_data.py --online-checkpoint <online>/training/resume-a.pt \
-  --linkage configs/linkage/leg_linkage_08bf7e00.json --output <report.json>
+  --linkage configs/linkage/leg_linkage_08bf7e00.json --runtime-json <runtime.json> --output <report.json>
 ```
 
 在线运行每 `replay_checkpoint_interval` 轮写入一对轮换的完整 checkpoint（回放约 15 GB/份，需预留两份空间）。推扰只放在 PPO runtime 中；世界模型采集使用无推扰 runtime，因为模型输入看不到推扰。
+
+数据报告读取 checkpoint 中已有的接触滤波阈值，在同一批重新采样的留出窗口上同时报告原始预测和滤波后的接触事件 precision/recall；没有正样本时 recall 为 null。各预测时距的瞬时事件统计覆盖末尾区间四个物理子步；提供 SHA256 匹配的 `--runtime-json` 后，另按原生确认时间统计整个预测窗口中的接触终止误报/漏报。报告不会重拟合滤波阈值，也不会把滤波后的载荷误差冒充原始模型误差；报告样本与标定共享留出环境总体，不能据此声称使用了独立测试集。
+
+启用跳跃触发门控时，采集器额外记录上次请求结束时间与门控状态，想象按原生顺序检查上一时刻的指令高度、回合时间和冷却。Actor 与运动网络维度不变，Critic 追加三个任务特征。旧的无门控配对 checkpoint 可通过 `scripts/upgrade_online_jump_trigger.py --checkpoint <resume.pt> --reference-dataset <gated-native-replay.pt> --output <new-directory>` 显式扩展：保留运动监督，旧任务起点全部标为未知，重新采集后才用于想象；新增 Critic 列及 Adam 历史补零，再用新数据标定归一化。
+
+这项迁移只允许新增门控及其声明的参考轨迹，不允许同时更换奖励、课程、物理或传感器合同。跨奖励/课程版本的旧运行还需要单独验证这些合同的迁移，不能直接替换来源标识后续训。

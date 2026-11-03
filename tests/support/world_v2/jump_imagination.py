@@ -13,9 +13,12 @@ from support.world_v2.jump_task import native_jumps
 from support.world_v2.stair_imagination import fixture as stair_fixture
 
 
-def fixture():
+def fixture(*, gated=False):
     old, start, _ = stair_fixture()
     native = native_jumps(2)
+    if gated:
+        from supermimic_rl.course.jump_takeoff import install_jump_takeoff
+        install_jump_takeoff(native, {'min_episode_s': .10, 'cooldown_s': .10})
     native._terrain_course.tasks.rise.fill_(.25)
     jump_task = JumpTask(JumpTaskConfig.capture(native))
     start.update(JumpTaskState.capture(native).record(), jump_record_valid=torch.ones(2, 1))
@@ -42,8 +45,9 @@ def fixture():
         actor.estimator[-1].weight.zero_()
         actor.estimator[-1].bias.zero_()
         actor.estimator[-1].bias[-2:] = 2.
-    critic = Critic(Critic.feature_size(16, 65, task_dim=MOTION_TASK_DIM, terrain=True, stairs=True, jumps=True),
-                    (16,), task_dim=MOTION_TASK_DIM, terrain=True, stairs=True, jumps=True)
+    critic = Critic(Critic.feature_size(16, 65, task_dim=MOTION_TASK_DIM, terrain=True, stairs=True,
+                                      jumps=True, jump_trigger=gated),
+                    (16,), task_dim=MOTION_TASK_DIM, terrain=True, stairs=True, jumps=True, jump_trigger=gated)
     old.imagination.reward.jump_task = jump_task
     learner = Learner(old.model, actor, critic, old.imagination.termination, old.config,
         reward=old.imagination.reward, stair_task=old.imagination.stair_task,

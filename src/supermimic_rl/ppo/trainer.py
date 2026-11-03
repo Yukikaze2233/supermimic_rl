@@ -80,6 +80,8 @@ class PPOConfig:
     # "restart_hold" restarts the waiting gate's timeout on resume, e.g. after a
     # course change; coordinate and opened gates are kept. "continue" keeps it.
     course_gate_resume: str = "continue"
+    # Hand control to the native evaluation orchestrator at each newly opened gate.
+    stop_after_gate: bool = False
     # Repeat a stage after a fix: on resume from a checkpoint written without
     # this rewind, the coordinate returns to the named stage's first transition.
     course_rewind_stage: str | None = None
@@ -119,6 +121,8 @@ class PPOConfig:
             StageGate(**gate)
         if self.course_gate_resume not in ("continue", "restart_hold"):
             raise ValueError("course_gate_resume must be continue or restart_hold")
+        if type(self.stop_after_gate) is not bool or self.stop_after_gate and not self.course_gates:
+            raise ValueError("stop_after_gate requires a boolean and a gated course")
         if self.course_rewind_stage is not None and not self.course_gates:
             raise ValueError("course_rewind_stage requires a gated course")
         if self.stage_action_std and not self.course_gates:
@@ -298,6 +302,13 @@ class PPOTrainer:
         self.statistics = EpisodeStatistics(environment.num_envs, self.device)
         if resume is not None:
             self.load(resume)
+            # The first reset above only discovers observation dimensions.
+            # Resume starts fresh episodes at the restored/rewound course,
+            # otherwise every gate audit would silently restart flat births.
+            environment.set_progress(self.curriculum_transitions, self.updates)
+            self.observation = environment.reset()
+            self._course_counters = (environment.course_progress()[0]
+                                     if hasattr(environment, "course_progress") else None)
         self.output.mkdir(parents=True, exist_ok=True)
 
     def _read_actor_artifact(self, path: Path, expected_sha256: str) -> tuple[TeacherActor, dict]:
@@ -548,10 +559,21 @@ class PPOTrainer:
                         record["course"] = {"timeout": timeout}
                 log.write(json.dumps(record) + "\n")
                 log.flush()
-                if (timeout is not None or self.updates % config.checkpoint_interval == 0
+                gate_passed = config.stop_after_gate and record.get("course", {}).get("gate_passed", False)
+                if (timeout is not None or gate_passed or self.updates % config.checkpoint_interval == 0
                         or self.updates == config.updates):
                     self.save(self.output / "checkpoint.pt")
                     self.save(self.output / "checkpoints" / f"update-{self.updates:06d}.pt", light=True)
+                if gate_passed:
+                    # The resumable boundary must remain immutable while its
+                    # actor is evaluated in a separate native simulator process.
+                    gate_checkpoint = self.output / "gate-checkpoints" / f"update-{self.updates:06d}.pt"
+                    self.save(gate_checkpoint)
+                    return {"status": "gate_passed", "gate": record["course"]["gate"],
+                            "updates": self.updates, "transitions": self.transitions,
+                            "checkpoint": str(gate_checkpoint.resolve()),
+                            "actor_checkpoint": str((self.output / "checkpoints"
+                                                      / f"update-{self.updates:06d}.pt").resolve())}
                 if timeout is not None:
                     # A closed gate is a diagnosis point, not a reason to keep consuming data.
                     return {"status": "gate_timeout", "message": timeout,
@@ -651,6 +673,8 @@ class PPOTrainer:
             if stage is not None and (saved.get("course_rewind_stage"), saved.get("course_rewind_tag")) != (stage, tag):
                 receipt = {**self.course.rewind(stage), "resumed_update": payload["updates"],
                            "checkpoint": str(path)}
+                self.stage_action_std_applied = [name for name in self.stage_action_std_applied
+                    if self.course.stage_starts.get(name, -1) < self.course.coordinate]
                 self.output.mkdir(parents=True, exist_ok=True)
                 (self.output / "course-rewind.json").write_text(json.dumps(receipt, indent=2) + "\n")
         torch.set_rng_state(payload["torch_rng"].cpu())

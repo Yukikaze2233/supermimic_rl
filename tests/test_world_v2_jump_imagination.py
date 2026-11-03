@@ -125,9 +125,45 @@ def test_integrated_reward_credits_physical_landing_once_and_failure_suppresses_
     assert not second.success_credited.any()
 
 
-def test_jump_realization_preserves_microbatch_gradients_and_invalid_records_are_rejected():
-    learner, start, frames = fixture()
-    other, _, _ = fixture()
+def test_recorded_hold_without_flight_reaches_shared_missed_jump_reward():
+    from supermimic_rl.reward_kernel import RewardExtensions
+    from supermimic_rl.world_model_v2.records import decode_memory
+    from supermimic_rl.world_model_v2.reward_assembly import RewardMemory
+
+    learner, start, _ = fixture()
+    state, memory = decode_physical(start['physical']), decode_memory(start['memory'])
+    jump = JumpTaskState.decode(start)
+    jump.ids[:, 1] = jump.ids[:, 4] = 7
+    jump.values[:, [1, 2, 9, 10, 11]] = 0.
+    jump.values[:, 5] = .10
+    jump.values[:, 6] = .35
+    jump.values[:, 8] = 3.  # Reference completed; request is still within its 6 s window.
+    start['goal'][:, 4] = 0.
+    start['goal'][:, 8] = 1.
+    start['reward_route'][:, 0] = 4.
+    with torch.no_grad():
+        learner.model.motion.net[-1].weight.zero_()
+        learner.model.motion.net[-1].bias.view(4, -1)[:, :3] = 0.
+    learner.imagination.reward.extensions = RewardExtensions(jump_missed=1.)
+    action = torch.zeros(2, 6)
+    prediction = learner.model.step(state, start['height'], start['scan'], memory,
+        start['sim_context'], start['motor_strength'][:, 4:6], action,
+        terrain_tile=start['terrain_tile'][:, 0])
+    context = learner.imagination.reward.bind(start, state)
+    reward_memory = RewardMemory.decode(torch.cat((start['reward_memory'], start['support_memory']), -1))
+    result = context.integrate(state, prediction, action, reward_memory, memory, start['goal'], 0,
+                               jump_state=jump, base_mode=torch.zeros(2, dtype=torch.long))
+    assert result.components['positive.height'].count_nonzero() == 0
+    assert result.components['positive.jump_vertical'].count_nonzero() == 0
+    torch.testing.assert_close(result.components['cost.jump_missed'],
+                               torch.full((2,), -.02, dtype=torch.float64))
+    assert not result.success_credited.any()
+
+
+@pytest.mark.parametrize('gated', [False, True])
+def test_jump_realization_preserves_microbatch_gradients_and_invalid_records_are_rejected(gated):
+    learner, start, frames = fixture(gated=gated)
+    other, _, _ = fixture(gated=gated)
     other.load_state_dict(deepcopy(learner.state_dict()))
     torch.manual_seed(41)
     first = learner.update_policy(start, frames, microbatch_size=2)
@@ -178,9 +214,13 @@ def test_policy_start_gate_requires_complete_jump_records_and_pauses_segment_res
     assert restored.data['jump_clock'].dtype == torch.float64
 
 
-def test_collector_records_pre_step_jump_state_without_changing_physical_contract(monkeypatch):
+@pytest.mark.parametrize('gated', [False, True])
+def test_collector_records_pre_step_jump_state_without_changing_physical_contract(monkeypatch, gated):
     _, start, _ = fixture()
     native = native_jumps(2)
+    if gated:
+        from supermimic_rl.course.jump_takeoff import install_jump_takeoff
+        install_jump_takeoff(native, {})
     env = Environment()
     env.adapter = SimpleNamespace(env=native)
     monkeypatch.setattr('supermimic_rl.world_model_v2.collection.SnapshotLayout',
@@ -203,6 +243,12 @@ def test_collector_records_pre_step_jump_state_without_changing_physical_contrac
     assert (collector.replay.data['jump_record_valid'][:2] == 1).all()
     assert collector.replay.data['frame'].shape[-1] == 45
     assert env.estimates[0].shape == (2, 8)
+    assert ('jump_trigger_clock' in collector.replay.data) == gated
+    if gated:
+        restored = CompactReplay.from_state_dict(collector.replay.state_dict())
+        assert restored.data['jump_trigger_clock'].dtype == torch.float64
+        assert restored.data['jump_trigger_flags'].dtype == torch.bool
+        assert restored.data['jump_trigger_flags'][:2, :, 0].all()
 
 
 def test_terrain_isolation_retains_jump_history_and_microbatch_gradient():

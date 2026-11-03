@@ -36,6 +36,15 @@ def test_ratio_criteria_use_summed_counters_and_a_minimum_count():
     assert nested.value([{"tracking_diagnostics": {"velocity_height_gate": {"mean": .95}}}]) == .95
 
 
+def test_height_bin_decimal_points_are_literal_metric_keys():
+    criterion = GateCriterion(
+        numerator=("course/jump_assist/unassisted_success_rise_0.00-0.10",),
+        denominator=("course/jump_assist/unassisted_ended_rise_0.00-0.10",), min=.4, min_count=200)
+    record = {criterion.numerator[0]: 100, criterion.denominator[0]: 200}
+    assert criterion.value([record]) == .5
+    assert criterion.holds(criterion.value([record]))
+
+
 def test_closed_gate_times_out_and_state_round_trips():
     course = CourseGates(gates(timeout_updates=2), STARTS, cap=250)
     course.advance({"rms/height_error_m": .1}, 200)

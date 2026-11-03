@@ -136,3 +136,35 @@ def test_force_decay_assists_every_request_with_a_fading_scale_and_bins_unassist
     # All-request bins include the earlier assisted requests 4-6 (rises 0.05/0.25/0.35, none succeeded).
     assert counters["course/jump_assist/ended_rise_0.20-0.30"] == 2
     assert counters["course/jump_assist/success_rise_0.00-0.10"] == 1
+
+
+def test_force_decay_keeps_a_fixed_unassisted_request_cohort_at_a_held_gate():
+    native = Native()
+    assist = install_jump_assist(native, curriculum(150), {
+        'probability': 1., 'decay': 'force', 'fade_stage_fraction': .5,
+        'max_weight_fraction': 10., 'assist_request_probability': .5, 'seed': 1})
+    native.tasks.physical_id[:] = torch.tensor([4, 5, 6])
+    native._apply_action()
+    # Seed 1 chooses [unassisted, assisted, assisted]. The selected rows still
+    # receive the same fading force amplitude, not a weaker force on all rows.
+    assert assist.selected.tolist() == [False, True, True]
+    torch.testing.assert_close(native.wrenches[-1]['forces'][:, 0, 2], torch.tensor([0., 100., 100.]))
+    for _ in range(3):
+        native._apply_action()
+        assert assist.selected.tolist() == [False, True, True]
+    assert assist.impulse[0] == 0 and (assist.impulse[1:] > 0).all()
+
+    def decide():
+        native.tasks.success_id[:] = torch.tensor([4, 5, 6])
+        native.tasks.physical_id[:] = -1
+
+    native.outcome = decide
+    native.tasks.observe_physics()
+    counters, _ = assist.metrics()
+    assert counters['course/jump_assist/unassisted_success'] == 1
+    assert counters['course/jump_assist/unassisted_ended'] == 1
+    assert counters['course/jump_assist/assisted_success'] == 2
+    assert counters['course/jump_assist/unassisted_success_rise_0.00-0.10'] == 1
+    assert assist.level() == .5
+    with pytest.raises(ValueError):
+        JumpAssistConfig(probability=1., assist_request_probability=1.1)

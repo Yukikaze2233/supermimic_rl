@@ -118,7 +118,8 @@ def create_course(configuration):
 
         reward_kernel_receipt = install_shared_reward(
             native._formal_reward.composer, verify_native=configuration.get("audit_reward_kernel", False),
-            extensions=RewardExtensions(**configuration.get("reward_extensions", {})))
+            extensions=RewardExtensions(**configuration.get("reward_extensions", {})),
+            jump_tasks=native._terrain_course.tasks)
         build_scope.close()
         health = strategy.course_health(health, native)
         curriculum = make_course_curriculum(configuration["num_envs"], configuration["device"],

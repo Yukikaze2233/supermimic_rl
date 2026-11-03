@@ -126,6 +126,23 @@ def test_critic_warmup_cycles_fit_the_critic_before_any_actor_step(tmp_path, mon
     assert cycles == ['critic', 'critic', 'critic', 'critic', 'actor', 'actor']
 
 
+@pytest.mark.parametrize('critic_warmup', [False, True])
+def test_added_critic_columns_are_calibrated_before_the_first_value_update(tmp_path, monkeypatch, critic_warmup):
+    calls = []
+    trainer = _stub_trainer(tmp_path, monkeypatch, calls, critic_warmup=critic_warmup)
+    trainer.critic_norm_from = 401
+
+    def initialize():
+        calls.append('calibrate')
+        trainer.critic_norm_from = None
+
+    trainer.initialize_added_critic_norm = initialize
+    trainer.train()
+    first_update = 'critic' if critic_warmup else 'actor'
+    assert calls.count('calibrate') == 1
+    assert calls.index('calibrate') + 1 == calls.index(first_update)
+
+
 def test_contact_floor_is_refit_after_each_world_fit_before_imagination(tmp_path, monkeypatch):
     calls = []
     floor = torch.full((21,), 2.), torch.tensor(3.)

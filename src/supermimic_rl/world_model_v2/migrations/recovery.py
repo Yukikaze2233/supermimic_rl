@@ -9,6 +9,7 @@ from ...contracts import StateSchema
 from ...course.jump_first import SCHEDULE, make_course_curriculum
 from .critic import append_critic_features
 from ..imagination import Critic
+from ..jump_task import JumpTaskConfig
 from ..motion_task import MOTION_TASK_DIM
 from ..online import OnlineConfig
 from ..records import MODEL_CONTRACT
@@ -52,6 +53,8 @@ def upgrade_recovery_tasks(saved, dataset, reference, *, course_raw, course_coor
     and cannot seed the newly enabled task producer.
     """
     config = OnlineConfig.from_dict(saved['config'])
+    if saved.get('jump_scenario') is not None and JumpTaskConfig.from_dict(saved['jump_scenario']).trigger is not None:
+        raise ValueError('Expand recovery before the optional jump trigger critic columns')
     if (saved.get('format') != 'supermimic-online-v2' or saved.get('model_contract') != MODEL_CONTRACT
             or not config.record_stair_source or not config.record_jumps or config.record_recovery
             or config.actor_frame_dim != 35 or saved.get('task_norm_pending', False)

@@ -218,6 +218,20 @@
       "back_down_left_back_right_forward_90": "authored_steps",
       "prone_belly_legs_above": "authored_steps",
       "prone_back_legs_above": "authored_steps"
-    }
+    },
+    "jump_height_gates": [
+      [
+        0.25,
+        0.2
+      ],
+      [
+        0.5,
+        0.3
+      ],
+      [
+        0.75,
+        0.4
+      ]
+    ]
   }
 }

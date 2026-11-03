@@ -5,11 +5,13 @@ import pytest
 import torch
 
 from supermimic_rl.formal_observation import SensorReadout
+from supermimic_rl.course.stair_label import install_tof_stair_label
 from supermimic_rl.world_model_v2.motion_task import MotionTask
 from supermimic_rl.world_model_v2.stair_source import StairSourceState
 from supermimic_rl.world_model_v2.stair_task import StairPacket, StairTask, StairTaskConfig, StairTaskState
 from supermimic_rl.world_model_v2.sensing import SensorQueues
 from transformer_rl.formal.lab_env.course_tasks import LabCourseTasks, RequestCommand, StairRequestConfig, StairRequestProtocol
+from transformer_rl.formal.control.observation import CommandMode
 from transformer_rl.formal.tasks.gimbal_course import GimbalCourse, GimbalCourseConfig
 from transformer_rl.formal.tasks.trajectory import CommandTrajectory, DriveEnvelope
 
@@ -72,6 +74,8 @@ def test_two_riser_source_completion_and_command_chain_match_native_course(label
     del course._tof_command, course._tof_rear_clearance
     tasks = LabCourseTasks(n, DriveEnvelope(.08, .38, 90.), policy_dt_s=.02)
     course.tasks = tasks
+    if labels:
+        install_tof_stair_label(native)
     tasks.stream.current[:] = torch.tensor([.8, 0., 0., .30])
     tasks.trajectory = CommandTrajectory(tasks.stream.current.clone(), tasks.stream.current.clone(),
                                          torch.full((n,), 5.), torch.zeros(n, dtype=torch.int64))
@@ -118,6 +122,9 @@ def test_two_riser_source_completion_and_command_chain_match_native_course(label
         course._pending_requests['stair'] = RequestCommand(external.request_id, external.height_m,
             external.cancel_id, external.safety_abort, completed_id=external.completed_id)
         course.advance_skill()
+        if labels:
+            torch.testing.assert_close(
+                native._command_mode == int(CommandMode.STAIR), native._skill_fsm.stair.active)
         boundary = result.boundary
         for key, value in StairTaskState.capture(native).record().items():
             torch.testing.assert_close(boundary.stair.state.record()[key], value, rtol=0, atol=1e-6)

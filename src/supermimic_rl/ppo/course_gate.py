@@ -26,11 +26,15 @@ class GateTimeout(RuntimeError):
 
 
 def _lookup(record: dict, path: str):
-    value = record
-    for part in path.split("."):
-        if not isinstance(value, dict) or part not in value:
-            return None
-        value = value[part]
+    # Flat metric names may contain decimal points, e.g. rise_0.00-0.10.
+    # Prefer the complete key before treating dots as nested-dictionary paths.
+    value = record.get(path)
+    if path not in record:
+        value = record
+        for part in path.split("."):
+            if not isinstance(value, dict) or part not in value:
+                return None
+            value = value[part]
     return value if isinstance(value, (int, float)) and math.isfinite(value) else None
 
 

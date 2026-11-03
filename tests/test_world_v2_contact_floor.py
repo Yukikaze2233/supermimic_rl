@@ -8,7 +8,7 @@ from supermimic_rl.world_model_v2.model import Ticks
 from supermimic_rl.world_model_v2.physical import INCREMENT_DIM
 from supermimic_rl.world_model_v2.records import CONTACT_BODIES, RecordSpec, TICK_LABEL_DIM, WHEEL_BODIES, decode_physical
 from supermimic_rl.world_model_v2.replay import CompactReplay
-from supermimic_rl.world_model_v2.validation import calibrate_contact_floor
+from supermimic_rl.world_model_v2.validation import calibrate_contact_floor, validate
 
 BODY = INCREMENT_DIM + 2
 BASE = BODY + CONTACT_BODIES.index("base_link")
@@ -71,6 +71,24 @@ def test_calibration_floors_false_contact_and_keeps_true_contact():
     assert base["true_positive_floored"] == base["true_positive_raw"] == base["positives"] > 0
     assert "L_link3" not in result["report"]["channels"]
     assert result["body_floor"][CONTACT_BODIES.index("L_link3")] == 0.
+
+    # Audit a newly sampled set using the saved floors, without fitting them
+    # again. Report both lost true contacts and removed false contacts.
+    quality = validate(SimpleNamespace(model=NoisyContactModel()), replay, [0], 2, 256,
+        torch.Generator().manual_seed(19), 'cpu', contact_threshold_n=1.,
+        contact_floor=(result['body_floor'], result['base_floor']))
+    raw = quality['2_step']['contact_events']['raw']['base_normal_contact']
+    floored = quality['2_step']['contact_events']['floored']['base_normal_contact']
+    assert raw['false_positive'] > 0 and floored['false_positive'] == 0
+    assert floored['true_positive'] == raw['true_positive'] > 0
+    assert floored['recall'] == 1. and floored['precision'] == 1.
+    excessive = result['body_floor'].clone()
+    excessive[CONTACT_BODIES.index('base_link')] = 100.
+    hidden = validate(SimpleNamespace(model=NoisyContactModel()), replay, [0], 2, 256,
+        torch.Generator().manual_seed(19), 'cpu', contact_threshold_n=1.,
+        contact_floor=(excessive, result['base_floor']))
+    missed = hidden['2_step']['contact_events']['floored']['base_normal_contact']
+    assert missed['recall'] == 0. and missed['false_negative'] == raw['positive_labels']
 
     empty = calibrate_contact_floor(SimpleNamespace(model=NoisyContactModel()), replay, [0], 8,
                                     torch.Generator().manual_seed(5), "cpu", threshold_n=1., horizon=7)

@@ -53,6 +53,24 @@ def test_h1_includes_short_failure_excluded_from_h2_and_reports_false_contacts()
     assert result['2_step']['forbidden_contact_latch']['false_positive'] == 512
     assert result['2_step']['forbidden_contact_latch']['clock_absolute_error_mean_s'] > .039
     assert (replay.data['failure_memory'] == 0.).all()
+    floor = torch.zeros(21)
+    floor[0] = 3.
+    calibrated = validate(SimpleNamespace(model=StaticModel()), replay, [0], 2, 512,
+        torch.Generator().manual_seed(3), 'cpu', contact_threshold_n=1., termination=termination,
+        contact_floor=(floor, torch.tensor(3.)))
+    assert calibrated['2_step']['forbidden_contact_latch']['false_positive'] == 512
+    assert calibrated['2_step']['forbidden_contact_latch_floored']['false_positive'] == 0
+    entry = calibrated['1_step']
+    assert entry['body_normal_load_n'] == result['1_step']['body_normal_load_n']  # Raw errors stay raw.
+    assert entry['forbidden_contact_floored']['bodies']['base_link']['false_positive'] == 0
+    assert entry['contact_events']['raw']['base_normal_contact']['false_positive'] == 2048
+    no_positive = entry['contact_events']['floored']['base_normal_contact']
+    assert no_positive['positive_labels'] == 0 and no_positive['recall'] is None
+    assert no_positive['precision'] is None and no_positive['status'] == 'no_positive_labels'
+    # Normal support decides native airborne labels. Neither floors nor base
+    # collision filtering can change the wheel channel or invent support.
+    assert entry['contact_events']['raw']['both_wheels_airborne']['recall'] == 1.
+    assert entry['contact_events']['floored']['both_wheels_airborne'] == entry['contact_events']['raw']['both_wheels_airborne']
 
 
 def test_population_filters_wrapped_windows_and_keeps_held_out_rows():

@@ -111,7 +111,8 @@ class LocomotionRewardContext:
                 ticks.body_normal_load[:, tick].clamp_min(0), ticks.wheel_load[:, tick].clamp_min(0),
                 ticks.resultant_contact_force[:, tick].clamp_min(0), ground_valid[:, tick], terrain_rows, tick_reference,
                 action.new_full((n,), (step * 4 + tick + 1) * self.assembly.parameters.physics_dt_s),
-                ids, ids, valid))
+                ids, ids, valid,
+                jump_reference_stage=None if jump_interval is None else jump_interval.reference_stage[:, tick]))
         result = self.assembly.integrate(start, tuple(samples), action, reward_memory,
             controller_memory.wheel_torque_history, self.legs, self.encoder_bias, self.motor_strength)
         return replace(result, termination_height=torch.stack(heights, -1)[..., None],

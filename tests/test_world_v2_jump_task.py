@@ -48,11 +48,13 @@ def advance(native, task, state, estimate, *, packet=None, blocked=None):
     # Hold commands in these task tests; command trajectory fidelity has its
     # own native MotionTask tests. This is the admission before jump latching.
     admitted = owner.trajectory.end.clone()
+    previous_height, previous_elapsed = owner.stream.current[:, 3].clone(), owner.elapsed.clone()
     native_result = owner.step(native.time, estimate, native._terrain_course.router.origins[:, 2],
                                command=packet, blocked_by_stair=blocked)
     result = task.advance(state, now_s=native.time, estimate=estimate, admitted=admitted,
         base_mode=owner.base_mode, task_family=owner.family, elapsed_s=owner.elapsed,
-        ground_z=torch.zeros(n), blocked_by_stair=blocked, interval_uniform=draw, packet=packet)
+        ground_z=torch.zeros(n), blocked_by_stair=blocked, interval_uniform=draw, packet=packet,
+        previous_command_height=previous_height, previous_elapsed_s=previous_elapsed)
     torch.testing.assert_close(result.command, native_result[0].admitted, rtol=0, atol=0)
     torch.testing.assert_close(result.mode, native_result[1], rtol=0, atol=0)
     torch.testing.assert_close(result.request_height, native_result[2], rtol=0, atol=0)
@@ -106,7 +108,7 @@ def test_automatic_requests_and_four_tick_flight_landing_success_match_native():
             force[0] = 0.
             physical.position[0, :, 2] = .38
             physical.velocity[0, :, 2] = .4
-        expected_phase, expected_height, expected_velocity = [], [], []
+        expected_phase, expected_height, expected_velocity, expected_stage = [], [], [], []
         for tick in range(4):
             owner.observe_physics(force[:, tick], physical.velocity[:, tick, 2], torch.zeros(n),
                 physical.position[:, tick, 2], angular_speed_rad_s=torch.zeros(n), dt=.005)
@@ -116,6 +118,7 @@ def test_automatic_requests_and_four_tick_flight_landing_success_match_native():
             expected_phase.append(owner.phase.clone())
             expected_height.append(torch.where(landing, owner.stream.current[:, 3], curve.height_world_z_m))
             expected_velocity.append(torch.where(landing, 0., curve.velocity_world_z_m_s))
+            expected_stage.append(curve.clock_stage.clone())
         result = task.observe_interval(state, physical=physical, wheel_support_load=force,
             base_com_offset=torch.zeros(n, 3), base_mode=owner.base_mode,
             command_height=owner.stream.current[:, 3], ground_z=torch.zeros(n, 4))
@@ -123,6 +126,7 @@ def test_automatic_requests_and_four_tick_flight_landing_success_match_native():
         torch.testing.assert_close(result.phase, torch.stack(expected_phase, -1), rtol=0, atol=0)
         torch.testing.assert_close(result.height_world_z_m, torch.stack(expected_height, -1), rtol=0, atol=0)
         torch.testing.assert_close(result.velocity_world_z_m_s, torch.stack(expected_velocity, -1), rtol=0, atol=0)
+        torch.testing.assert_close(result.reference_stage, torch.stack(expected_stage, -1), rtol=0, atol=0)
         success_count += result.success_credited.long()
         saw_flight |= bool((result.phase == int(RewardPhase.FLIGHT)).any())
         state = advance(native, task, result.state, completed, blocked=blocked).state
@@ -286,3 +290,84 @@ def test_critic_features_keep_causal_latches_without_absolute_ids_time_or_height
     changed[:, 15:17] = torch.tensor([[.05, .8]])
     assert not torch.equal(JumpTaskState(ids, clock, changed).critic_features(
         shifted_physical, shifted_motion, config), features)
+
+
+def test_gated_automatic_requests_match_native_pre_admission_order():
+    from supermimic_rl.course.jump_takeoff import install_jump_takeoff
+
+    n, native = 7, native_jumps(7)
+    install_jump_takeoff(native, dict(min_episode_s=.06, cooldown_s=.04))
+    owner, gate = native._terrain_course.tasks, native.supermimic_jump_trigger
+    native.time.fill_(.04)
+    owner.protocol.last_time_s.fill_(.04)
+    owner.elapsed.fill_(.04)
+    owner._last_supported[1] = False
+    owner._last_world_height[2] += .10
+    gate.last_end_s[3] = .03
+    owner.family[4] = int(TaskFamily.HEIGHT)
+    blocked = torch.zeros(n, dtype=torch.bool)
+    blocked[5] = True
+    # Gate sees the prior .32 m stream; the next admitted target becomes .40 m.
+    owner.trajectory.start[6, 3] = owner.trajectory.end[6, 3] = .40
+    config, state = JumpTaskConfig.capture(native), JumpTaskState.capture(native)
+    assert config.trigger is not None and JumpTaskConfig.from_dict(asdict(config)) == config
+    result = advance(native, JumpTask(config), state, estimate_at(native.time, n), blocked=blocked)
+    assert result.deferred.tolist() == [False, True, True, True, False, False, False]
+    assert gate.deferred == result.deferred.sum()
+    assert result.state.active_id.ge(0).tolist() == [True, False, False, False, False, False, True]
+    assert result.command[6, 3] == pytest.approx(.40)
+    assert result.state.trigger_flags[:, 0].all()
+    torch.testing.assert_close(result.state.trigger_flags[:, 1], result.state.active_id >= 0)
+
+
+def test_gate_manual_bypass_active_request_and_cooldown_match_native():
+    from supermimic_rl.course.jump_takeoff import install_jump_takeoff
+
+    native = native_jumps()
+    install_jump_takeoff(native, dict(min_episode_s=.06, cooldown_s=.06))
+    owner, gate = native._terrain_course.tasks, native.supermimic_jump_trigger
+    owner._last_supported.zero_()
+    task, state = JumpTask(JumpTaskConfig.capture(native)), JumpTaskState.capture(native)
+    packet = RequestCommand(torch.tensor([8]), torch.tensor([.06]))
+    state = advance(native, task, state, estimate_at(native.time, 1), packet=packet).state
+    assert state.active_id.item() == 8 and gate.deferred.item() == 0
+    result = advance(native, task, state, estimate_at(native.time, 1))
+    assert not result.deferred.any() and not owner._physical_cancelled.any()
+    cancel = RequestCommand(torch.tensor([-1]), torch.zeros(1), cancel_id=torch.tensor([8]))
+    state = advance(native, task, result.state, estimate_at(native.time, 1), packet=cancel).state
+    assert state.trigger_clock.item() == pytest.approx(.06)
+    owner._last_supported.fill_(True)
+    owner._last_world_height.fill_(.32)
+    state = JumpTaskState.capture(native)
+    result = advance(native, task, state, estimate_at(native.time, 1))
+    assert result.deferred.item() and result.state.active_id.item() == -1
+    result = advance(native, task, result.state, estimate_at(native.time, 1))
+    assert result.deferred.item()
+    result = advance(native, task, result.state, estimate_at(native.time, 1))
+    assert not result.deferred.item()
+    result = advance(native, task, result.state, estimate_at(native.time, 1))
+    assert result.state.active_id.item() == 9 and not result.deferred.item()
+    assert gate.deferred.item() == 2
+
+
+def test_gate_critic_carries_relative_cooldown_and_episode_readiness():
+    from supermimic_rl.course.jump_takeoff import install_jump_takeoff
+
+    native = native_jumps()
+    install_jump_takeoff(native, {})
+    native.time.fill_(2.)
+    native.supermimic_jump_trigger.last_end_s.fill_(1.8)
+    config, state = JumpTaskConfig.capture(native), JumpTaskState.capture(native)
+    motion = SimpleNamespace(timing=torch.tensor([[.4, 0., 0., 0., 0.]]))
+    features = state.trigger_critic_features(motion, config)
+    torch.testing.assert_close(features, torch.tensor([[.8, .6, 0.]]))
+    shifted = replace(state, clock=state.clock + 100., trigger_clock=state.trigger_clock + 100.)
+    torch.testing.assert_close(shifted.trigger_critic_features(motion, config), features)
+    with pytest.raises(ValueError, match='known native clock/state'):
+        replace(state, trigger_flags=torch.zeros_like(state.trigger_flags)).trigger_critic_features(motion, config)
+    legacy = JumpTaskState(state.ids, state.clock, state.values)
+    with pytest.raises(ValueError, match='known native clock/state'):
+        JumpTask(config).advance(legacy, now_s=native.time + .02, estimate=None,
+            admitted=torch.zeros(1, 4), base_mode=torch.zeros(1, dtype=torch.long),
+            task_family=torch.full((1,), 4), elapsed_s=torch.ones(1), ground_z=torch.zeros(1),
+            blocked_by_stair=torch.zeros(1, dtype=torch.bool), interval_uniform=torch.zeros(1))

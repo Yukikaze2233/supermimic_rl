@@ -3,7 +3,9 @@
 The native ``use_mode_labels`` switch shows both the ToF state-machine label
 and labels derived from the routed terrain tile; the latter is ground truth the
 robot does not have. This keeps the former and drops the latter, so the flag
-is reproducible on the robot from its ToF sensor.
+comes from the request FSM instead of a terrain ID. The simulation source is
+still an idealized forward terrain profile; its position-assisted completion
+needs a separate deployment sensor contract.
 """
 from __future__ import annotations
 

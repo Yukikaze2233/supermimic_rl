@@ -27,10 +27,18 @@ class SharedRewardComposer(PhysicalRewardComposer):
                     | (sample.episode_id != window['episode']) | (sample.control_epoch != window['control'])
                     | (reference.admitted_body_command != window['command']).any(-1)
                     | (reference.mode != window['mode']))
+        reference_stage = None
+        if self.supermimic_reward_extensions.jump_missed:
+            # The request clock is held across the policy interval. Read its
+            # stage once, while physical flight/landing phases still update at
+            # every substep. The task owner may replace its reference program.
+            if window['steps'] == 0:
+                window['jump_reference_stage'] = self.supermimic_jump_tasks.jump_reference().clock_stage
+            reference_stage = window['jump_reference_stage']
         densities = physical_reward_densities(
             sample, reference,
             RewardHistory(window['dq'], window['action_cost'], window['action2_cost'], self._action_count),
-            RewardParameters.from_composer(self))
+            RewardParameters.from_composer(self), jump_reference_stage=reference_stage)
         if (invalid | densities.invalid).any():
             raise ValueError('reward input, PRE-reset identity, timing, phase or finite density bound differs')
         positive, cost = densities.positive, densities.cost
@@ -76,7 +84,8 @@ class SharedRewardComposer(PhysicalRewardComposer):
         window['last_timestamp'] = sample.timestamp_s.detach().clone()
 
 
-def install_shared_reward(composer, *, verify_native=False, extensions: RewardExtensions = RewardExtensions()):
+def install_shared_reward(composer, *, verify_native=False, extensions: RewardExtensions = RewardExtensions(),
+                          jump_tasks=None):
     """Instance-local installation; the frozen native source stays untouched.
 
     Extensions add opt-in terms (and may replace the success event); they are
@@ -91,7 +100,10 @@ def install_shared_reward(composer, *, verify_native=False, extensions: RewardEx
         raise TypeError("Shared reward installation requires the native composer")
     if verify_native and extensions.active:
         raise ValueError("The native reward audit compares the unextended reward")
+    if extensions.jump_missed and jump_tasks is None:
+        raise ValueError('Missed-jump reward requires the native jump task owner')
     composer.supermimic_reward_extensions = extensions
+    composer.supermimic_jump_tasks = jump_tasks
     if extensions.success_event is not None:
         composer.tuning = replace(composer.tuning, success_event=float(extensions.success_event))
     if verify_native:

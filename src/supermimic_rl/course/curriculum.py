@@ -77,6 +77,10 @@ class CourseCurriculumConfig:
     # initial to the full domain (jump-first course). "active_jump" grows the
     # upper height inside the jump stage so every later stage samples all heights.
     jump_height_stage: str = "combined_dr"
+    # Optional (stage fraction, new upper height) pairs. The gated coordinate
+    # stops one integer transition before each pair until the skill passes.
+    # Empty retains the older continuously interpolated height curriculum.
+    jump_height_gates: tuple[tuple[float, float], ...] = ()
     # Optional difficulty order for recovery births: {posture: first stage that
     # may draw it}. Postures absent from the map use the first stage. Empty keeps
     # every configured posture from the first recovery birth on.
@@ -130,6 +134,19 @@ class CourseCurriculumConfig:
                 raise ValueError(name + " must lie in (0, 1]")
         if self.jump_height_stage not in STAGE_NAMES:
             raise ValueError("jump_height_stage must name a course stage")
+        height_gates = tuple(tuple(pair) for pair in self.jump_height_gates)
+        previous_fraction, previous_height = 0., self.initial_domain.jump_m[1]
+        for pair in height_gates:
+            if (len(pair) != 2 or any(type(value) not in (float, int) or not math.isfinite(value)
+                                      for value in pair)):
+                raise ValueError("jump_height_gates requires finite (fraction, upper height) pairs")
+            fraction, upper = pair
+            if not (previous_fraction < fraction < 1 and previous_height < upper <= self.domain.jump_m[1]):
+                raise ValueError("jump_height_gates must increase inside the stage and jump domain")
+            previous_fraction, previous_height = fraction, upper
+        if height_gates and height_gates[-1][1] != self.domain.jump_m[1]:
+            raise ValueError("jump_height_gates must reach the full jump domain")
+        object.__setattr__(self, "jump_height_gates", height_gates)
         stages = dict(self.recovery_posture_stages)
         if (any(name not in self.recovery_postures for name in stages)
                 or any(stage not in STAGE_NAMES for stage in stages.values())):

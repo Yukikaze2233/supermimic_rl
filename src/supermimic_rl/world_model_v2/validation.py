@@ -11,6 +11,41 @@ REPORT_SLICES = {"position_m": slice(0, 3), "rotation_rad": slice(3, 6), "veloci
                  "gimbal_q_rad": slice(16, 18), "leg_qd_rad_s": slice(18, 22), "wheel_qd_rad_s": slice(22, 24)}
 
 
+def _confusion(predicted, actual):
+    """Absent positive labels cannot establish recall, even with zero errors."""
+    tp, fp = int((predicted & actual).sum()), int((predicted & ~actual).sum())
+    tn, fn = int((~predicted & ~actual).sum()), int((~predicted & actual).sum())
+    return {'true_positive': tp, 'false_positive': fp, 'true_negative': tn, 'false_negative': fn,
+            'positive_labels': tp + fn, 'negative_labels': tn + fp,
+            'precision': tp / (tp + fp) if tp + fp else None,
+            'recall': tp / (tp + fn) if tp + fn else None,
+            'false_positive_rate': fp / (fp + tn) if fp + tn else None,
+            'status': 'observed_positives' if tp + fn else 'no_positive_labels'}
+
+
+def _contact_events(predicted, actual, keep, threshold):
+    """Native instantaneous contact decisions, separate from confirmed failure."""
+    nonwheel = [index for index, name in enumerate(CONTACT_BODIES) if name not in WHEEL_BODIES]
+
+    def events(ticks):
+        # terrain.py passes wheel_ground_force_n (normal support), not the
+        # wheel resultant force, to both jump and recovery physical observers.
+        on, off = ticks.wheel_load >= 5., ticks.wheel_load.clamp_min(0.) <= 2.
+        return {
+            'left_wheel_supported': on[..., 0], 'right_wheel_supported': on[..., 1],
+            'both_wheels_supported': on.all(-1), 'both_wheels_airborne': off.all(-1),
+            'one_wheel_supported': on.any(-1) & off.any(-1),
+            'forbidden_body_contact': (ticks.forbidden_load > threshold).any(-1),
+            'nonwheel_body_contact': (ticks.body_normal_load[..., nonwheel] > threshold).any(-1),
+            'base_normal_contact': ticks.body_normal_load[..., CONTACT_BODIES.index('base_link')] > threshold,
+            'base_resultant_contact': ticks.base_contact_force > threshold,
+        }
+
+    predicted_events, actual_events = events(predicted), events(actual)
+    return {name: _confusion(value[keep], actual_events[name][keep])
+            for name, value in predicted_events.items()}
+
+
 class _ContactClockAudit:
     """Isolate contact prediction's effect using the actual native failure clock.
 
@@ -47,8 +82,7 @@ class _ContactClockAudit:
             'incomplete_prediction_windows': int((~complete).sum()),
             'confirm_s': self.termination.limits.forbidden_contact_confirm_s,
             'physics_dt_s': self.termination.dt,
-            'true_positive': int((p & a).sum()), 'false_positive': int((p & ~a).sum()),
-            'true_negative': int((~p & ~a).sum()), 'false_negative': int((~p & a).sum()),
+            **_confusion(p, a),
             'clock_absolute_error_mean_s': float(error.mean()) if len(error) else None,
         }
 
@@ -56,7 +90,7 @@ class _ContactClockAudit:
 @torch.no_grad()
 def validate(fit, replay, env_ids, horizon, batch, generator, device, *,
              contact_threshold_n=None, new_episode_namespace=None, termination=None,
-             required_rows=None, start_rows=None):
+             required_rows=None, start_rows=None, contact_floor=None):
     """Sample each horizon independently, including short/failing episodes at H1.
 
     Reusing H32 windows for H1 excludes every episode shorter than 32 steps and
@@ -94,6 +128,8 @@ def validate(fit, replay, env_ids, horizon, batch, generator, device, *,
                                         candidates=candidates)
         windows = {name: value.to(device) for name, value in windows.items()}
         contact_audit = None if termination is None else _ContactClockAudit(termination, windows)
+        floored_audit = (None if termination is None or contact_floor is None
+                         else _ContactClockAudit(termination, windows))
         truncated = torch.zeros(batch, dtype=torch.bool, device=device)
         nonfinite_motion = torch.zeros_like(truncated)
         complete = torch.zeros_like(truncated)
@@ -111,6 +147,9 @@ def validate(fit, replay, env_ids, horizon, batch, generator, device, *,
             if contact_audit is not None:
                 true_ticks = Ticks.decode(windows['ticks'][rows, step], decode_physical(windows['physical'][rows, step]))
                 contact_audit.advance(prediction.ticks, true_ticks, windows['failure_conditions'][rows, step], rows)
+                if floored_audit is not None:
+                    floored_audit.advance(prediction.ticks.with_contact_floor(*contact_floor), true_ticks,
+                                          windows['failure_conditions'][rows, step], rows)
             if step == length - 1:
                 keep = supported & ~nonfinite_motion[rows]
                 complete[rows[keep]] = True
@@ -127,6 +166,8 @@ def validate(fit, replay, env_ids, horizon, batch, generator, device, *,
                 (windows['start_episode_id'][:, 0] >= new_episode_namespace).float().mean())
         if contact_audit is not None:
             values['forbidden_contact_latch'] = contact_audit.report(complete)
+        if floored_audit is not None:
+            values['forbidden_contact_latch_floored'] = floored_audit.report(complete)
         if final is None or not complete.any():
             values['status'] = 'no_complete_predictions'
             report[f'{length}_step'] = values
@@ -150,9 +191,17 @@ def validate(fit, replay, env_ids, horizon, batch, generator, device, *,
             values['forbidden_contact'] = {'threshold_n': contact_threshold_n, 'bodies': {}}
             for index, name in enumerate(FORBIDDEN_BODIES):
                 p, a = predicted[keep, ..., index], actual[keep, ..., index]
-                values['forbidden_contact']['bodies'][name] = {
-                    'true_positive': int((p & a).sum()), 'false_positive': int((p & ~a).sum()),
-                    'true_negative': int((~p & ~a).sum()), 'false_negative': int((~p & a).sum())}
+                values['forbidden_contact']['bodies'][name] = _confusion(p, a)
+            events = {'scope': 'four physical ticks in the final interval of complete finite predictions',
+                      'support_on_n': 5., 'support_off_n': 2., 'body_contact_n': contact_threshold_n,
+                      'raw': _contact_events(prediction.ticks, truth, keep, contact_threshold_n)}
+            if contact_floor is not None:
+                floored = prediction.ticks.with_contact_floor(*contact_floor)
+                events['floored'] = _contact_events(floored, truth, keep, contact_threshold_n)
+                values['forbidden_contact_floored'] = {'threshold_n': contact_threshold_n, 'bodies': {
+                    name: _confusion((floored.forbidden_load > contact_threshold_n)[keep, ..., index],
+                                     actual[keep, ..., index]) for index, name in enumerate(FORBIDDEN_BODIES)}}
+            values['contact_events'] = events
         report[f'{length}_step'] = values
     return report
 

@@ -7,8 +7,9 @@ reference push window, until verified flight. The force closes the shortfall
 to the reference launch speed and is capped by weight. Two decays:
 
 * ``probability``: a fading share of requests is fully assisted;
-* ``force`` (SCUT ``decay_mode: force``): every request is selected and the
-  force scale fades, so the policy's own push keeps a marginal effect.
+* ``force`` (SCUT ``decay_mode: force``): the force scale fades, so the
+  policy's own push keeps a marginal effect. An optional fixed unassisted
+  request cohort measures capability while the course coordinate is held.
 
 A request counts as assisted only if assist impulse was actually delivered to
 it (selection alone is not assistance).
@@ -46,12 +47,14 @@ class JumpAssistConfig:
     stage: str = 'active_jump'
     gravity_m_s2: float = 9.81
     seed: int = 0
+    assist_request_probability: float = 1.  # independent fixed request cohort; force amplitude still fades
 
     def __post_init__(self):
         values = (self.probability, self.fade_stage_fraction, self.velocity_gain_per_s,
-                  self.max_weight_fraction, self.gravity_m_s2)
+                  self.max_weight_fraction, self.gravity_m_s2, self.assist_request_probability)
         if (any(type(v) not in (int, float) or not math.isfinite(v) for v in values)
                 or not 0 <= self.probability <= 1 or not 0 < self.fade_stage_fraction <= 1
+                or not 0 <= self.assist_request_probability <= 1
                 or self.velocity_gain_per_s < 0 or self.max_weight_fraction < 0 or self.gravity_m_s2 <= 0
                 or type(self.seed) is not int or self.decay not in DECAYS):
             raise ValueError('Jump assist needs a probability in [0, 1], a fade fraction in (0, 1] '
@@ -110,10 +113,12 @@ class JumpAssist:
         self._count_by_rise('ended', ended, helped)
         accepted = changed & (current >= 0)
         level = self.level()
-        if self.config.decay == 'force':
-            draw = torch.full(current.shape, level > 0, dtype=torch.bool, device=current.device)
+        chance = self.config.assist_request_probability * (float(level > 0) if self.config.decay == 'force' else level)
+        if self.config.decay == 'force' and chance in (0., 1.):
+            # Preserve the default force-decay RNG contract.
+            draw = torch.full(current.shape, chance == 1., dtype=torch.bool, device=current.device)
         else:
-            draw = torch.rand(current.shape, device=current.device, generator=self.generator) < level
+            draw = torch.rand(current.shape, device=current.device, generator=self.generator) < chance
         self.selected = torch.where(accepted, draw, self.selected & (current >= 0))
         self.impulse = torch.where(changed, 0., self.impulse)
         self.rise = torch.where(accepted, tasks.active_rise, self.rise)

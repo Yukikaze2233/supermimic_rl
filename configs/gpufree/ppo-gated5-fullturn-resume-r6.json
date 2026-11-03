@@ -64,10 +64,10 @@
         },
         {
           "numerator": [
-            "course/jump_assist/success_rise_0.00-0.10"
+            "course/jump_assist/unassisted_success_rise_0.00-0.10"
           ],
           "denominator": [
-            "course/jump_assist/ended_rise_0.00-0.10"
+            "course/jump_assist/unassisted_ended_rise_0.00-0.10"
           ],
           "min": 0.4,
           "min_count": 200
@@ -86,10 +86,10 @@
         },
         {
           "numerator": [
-            "course/jump_assist/success_rise_0.10-0.20"
+            "course/jump_assist/unassisted_success_rise_0.10-0.20"
           ],
           "denominator": [
-            "course/jump_assist/ended_rise_0.10-0.20"
+            "course/jump_assist/unassisted_ended_rise_0.10-0.20"
           ],
           "min": 0.3,
           "min_count": 200
@@ -108,10 +108,10 @@
         },
         {
           "numerator": [
-            "course/jump_assist/success_rise_0.20-0.30"
+            "course/jump_assist/unassisted_success_rise_0.20-0.30"
           ],
           "denominator": [
-            "course/jump_assist/ended_rise_0.20-0.30"
+            "course/jump_assist/unassisted_ended_rise_0.20-0.30"
           ],
           "min": 0.2,
           "min_count": 200
@@ -228,6 +228,7 @@
   ],
   "seed": 7,
   "course_gate_resume": "continue",
+  "stop_after_gate": true,
   "course_rewind_stage": "active_jump",
   "course_rewind_tag": "r7",
   "stage_action_std": {

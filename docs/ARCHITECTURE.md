@@ -35,13 +35,15 @@ tests/               无 Isaac 的单元/合同测试；共享构造器在 tests
 | 执行链 | `identified_execution`、`execution` | 辨识轮模型（左右聚合延迟 5.5/3.5 ms、高速包络、摩擦节点）、腿摩擦、气簧 16 节点；作用在原生力矩边界 |
 | 域随机化 | `randomization`、`materials` | requested-v2：质量/惯量/质心、电机强度、编码器与 IMU 偏置、传感器噪声；可选持续机身外力与速度冲击（原生 EpisodeRandomization 语义） |
 | 动作合同 | `action_contract` | 以 runtime `task.action_bounds` 对齐原生控制器与 ownership 校验（腿 ±4π 即公共转角 ±π，支持整圈回转） |
-| 奖励 | `reward` | 把 `reward_kernel` 装入原生 composer；扩展项（`jump_flight`、`jump_lift`、`jump_push`、`success_event`）写入回执 |
+| 奖励 | `reward` | 把 `reward_kernel` 装入原生 composer；扩展项（`jump_flight`、`jump_lift`、`jump_push`、`jump_missed`、`success_event`）写入回执 |
 | 课程 | `curriculum`、`jump_first` | 按真实转移坐标推进的八阶段课程；jump-first 顺序：平地 → 小跳 → 动态指令 → 地形 → 台阶 → 翻正 → 混合 DR |
 | 路由与评价 | `routing`、`evaluation`、`adapter` | 台阶终点路由到实际地图块；固定场景评价套件；`CourseAdapter` 采集原生传感器与任务所有权 |
 | 技能任务 | `jump_takeoff`、`stair_label` | 跳跃：到期的自动请求等待原生支撑站姿、最短回合时间与冷却后才发出（进行中的请求与外部请求不受影响），参考改为 10 cm/0.3 s 下蹲 + 0.2 s 伸展的长蹬伸；台阶：STAIR 模式只由 ToF 台阶状态机置位。属于任务定义，训练、评价、采集都安装 |
 | 训练专用 | `jump_assist` | 跳跃请求推送窗口内的竖直助力（概率衰减或力幅衰减）；按实际是否施加冲量区分有/无助力，并按请求高度分档计数；评价与世界模型 factory 不安装 |
 
 段内指令（站立调高、普通行驶、两档自旋、冲刺）由原生指令池产生；出生族（HEIGHT/MOTION/ROTATION/TERRAIN/REQUEST/RECOVERY）决定出生方式和请求，不直接决定段内指令。普通出生中有一半是地面坐姿起身（原生 birth randomization）。
+
+`jump_missed` 使用参考程序的显式 HOLD 阶段与原生物理 TAKEOFF 阶段共同判定“参考已结束、仍未起跳”。此时关闭高度和竖直速度的正跟踪项，并累计错过跳跃的代价；正常下蹲、腾空、落地以及普通站立不受影响。参考阶段在 50 Hz 边界采样并保持四个子步，物理阶段逐个 5 ms 子步更新。原生 composer 与想象奖励直接调用同一个核，密度只按实际子步时长积分一次。R7 初始候选代价为 1/s，与原生竖直速度跟踪的最大正密度同量级；其有效性仍需短、长蹬伸物理探针判断，不作为已验证的最优权重。
 
 ## PPO 教师 `supermimic_rl.ppo`
 
@@ -95,6 +97,8 @@ tests/               无 Isaac 的单元/合同测试；共享构造器在 tests
 | 跳跃 | 操作员请求（模式 JUMP + 高度 ≤ 0.40 m） | 原生协议对新 ID 一律消费（被拒的 ID 不会再执行），所以部署端须保存待执行请求，在准入成立时才发出：双轮着地且安静（竖直速度 ≤ 0.15 m/s、倾角 ≤ 0.25 rad、角速度 ≤ 0.5 rad/s）、高度与指令差 ≤ 1.5 cm、启动 ≥ 1 s、上次跳跃结束 ≥ 1 s |
 | 翻正 | 倒地检测 → 模式 RECOVERY | 先执行准备轨迹（腿以 1 rad/s 插值到动作框内的指定姿态）再交给 Actor，与原生准备段一致 |
 | 台阶 | 前向 ToF 检测台阶 | 运行同一 ToF 台阶状态机：STAIR 模式 + 高度指令 +0.16 m（上限 0.40 m）保持 2 s；速度指令仍由操作员给出 |
+
+同一边界的新跳跃优先于新台阶请求；已进行中的台阶任务会阻止新跳跃，部署端须保留待执行请求，退出后使用新 ID 发出。仿真台阶完成条件还使用后轮越过立面的几何信息，不能声称单个前向 ToF 已能提供实车完成判据；RMCS 实施时需补齐这一估计与退出合同。本工程当前不实施 RMCS 控制。
 
 ## 测试
 
