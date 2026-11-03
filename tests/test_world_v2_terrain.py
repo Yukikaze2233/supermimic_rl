@@ -106,7 +106,8 @@ def test_world_model_queries_all_four_predicted_ticks_and_fitting_uses_tile_rout
         fit.terms(windows)
 
 
-def test_scan_domain_exit_keeps_boundary_gradient_and_reports_incomplete_predictions():
+@pytest.mark.parametrize('wheel_contact_weight', [0., 1.])
+def test_scan_domain_exit_keeps_boundary_gradient_and_reports_incomplete_predictions(wheel_contact_weight):
     from pathlib import Path
     from supermimic_rl.world_model_v2.execution import WheelExecution
     from supermimic_rl.world_model_v2.features import MotionInputs
@@ -128,6 +129,7 @@ def test_scan_domain_exit_keeps_boundary_gradient_and_reports_incomplete_predict
                     torch.zeros(2), torch.zeros(2), torch.zeros(2))
     with torch.no_grad():
         model.motion.net[-1].bias.view(4, -1)[:, 0] = torch.tensor([.04, .08, .12, .16])
+        model.motion.net[-1].bias.view(4, -1)[:, 26:28] = 10.
     before = model.terrain.observe(physical, torch.zeros(2))
     assert before.valid.all()
     shapes = RecordSpec(16, 65).fields(record_terrain=True)
@@ -144,7 +146,7 @@ def test_scan_domain_exit_keeps_boundary_gradient_and_reports_incomplete_predict
     for _ in range(4):
         replay.add(record, boundary)
     windows = {name: value.transpose(0, 1) for name, value in replay.data.items()}
-    fit = WorldModelFit(model)
+    fit = WorldModelFit(model, wheel_contact_weight=wheel_contact_weight)
     trace = list(recorded_rollout(model, windows))
     assert [rows.tolist() for _, rows, _, _ in trace] == [[0, 1], [1], [1], [1]]
     assert torch.isnan(trace[0][2].terrain_scan[0]).any()
@@ -155,6 +157,11 @@ def test_scan_domain_exit_keeps_boundary_gradient_and_reports_incomplete_predict
     complete = fit.terms({name: value[1:] for name, value in windows.items()})
     expected = (single.state + single.ticks) / 8 + (complete.state + complete.ticks) / 2
     loss = terms.state + terms.ticks
+    if wheel_contact_weight:
+        expected_wheel = single.wheel_contact / 8 + complete.wheel_contact / 2
+        torch.testing.assert_close(terms.wheel_contact, expected_wheel)
+        loss = loss + wheel_contact_weight * terms.wheel_contact
+        expected = expected + wheel_contact_weight * expected_wheel
     torch.testing.assert_close(loss, expected)
     parameter = model.motion.net[-1].bias
     gradient = torch.autograd.grad(loss, parameter)[0]

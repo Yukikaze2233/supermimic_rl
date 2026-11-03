@@ -104,6 +104,8 @@ python scripts/report_world_v2_data.py --online-checkpoint <online>/training/res
 
 离线续拟合可用 `fit_world_v2.py --online-checkpoint <resume.pt> --contact-event-fraction <fraction>` 增加接触事件窗口的采样比例，默认值为 0。事件定义沿用原生两轮支撑载荷 ≤2 N、连续两个 5 ms 子步，包含跨控制步的连续事件；合法窗口和训练/留出环境划分保持不变。其余窗口均匀采样，只有均匀部分更新归一化统计，整个 batch 使用原损失；采样比例需要根据留出集运动与接触指标验证。
 
+`--wheel-contact-weight <weight>` 可额外单独归约双轮连续载荷的归一化 MSE，默认 0 保持原损失。该项沿用每个子步的输出尺度与误差下限，按两轮、四个子步及拟合时域取均值；总损失为 `state + ticks + weight * wheel_contact`。候选值 1 表示额外组的系数为 1，叠加原有 56 维 ticks 损失后，双轮通道相对原项的权重为 29 倍；它是待验证的训练系数，不是物理参数。使用相同留出集同时检查运动与接触事件，离线配置和日志会保存权重及分项损失。续训继承已存权重，旧 checkpoint 缺省为 0；改变权重需从明确的在线源另建离线实验。在线训练默认不启用该项。
+
 检查离线续拟合的模型时，在配对报告命令中增加 `--world-checkpoint <fit>.checkpoint.pt`。报告校验原始配对身份和训练/留出环境列表，记录新权重 SHA256，并报告原始接触预测；旧在线模型标定的滤波阈值不会沿用到新权重。
 
 启用跳跃触发门控时，采集器额外记录上次请求结束时间与门控状态，想象按原生顺序检查上一时刻的指令高度、回合时间和冷却。Actor 与运动网络维度不变，Critic 追加三个任务特征。旧的无门控配对 checkpoint 可通过 `scripts/upgrade_online_jump_trigger.py --checkpoint <resume.pt> --reference-dataset <gated-native-replay.pt> --output <new-directory>` 显式扩展：保留运动监督，旧任务起点全部标为未知，重新采集后才用于想象；新增 Critic 列及 Adam 历史补零，再用新数据标定归一化。
