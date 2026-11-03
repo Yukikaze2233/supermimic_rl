@@ -152,3 +152,60 @@ def test_resume_rewinds_once_and_not_again_from_its_own_checkpoint(tmp_path):
     second.save(tmp_path / "second" / "checkpoint.pt")
     third = PPOTrainer(GatedEnvironment(), settings, tmp_path / "third", resume=tmp_path / "second" / "checkpoint.pt")
     assert third.curriculum_transitions == 100 and not (tmp_path / "third" / "course-rewind.json").exists()
+
+
+def test_stage_action_std_floor_is_raised_once_on_entering_the_stage(tmp_path):
+    import torch
+
+    course = [{"stage": "jump", "window": 1, "timeout_updates": 100,
+               "criteria": [{"metric": "rms/forward_error_m_s", "max": 1e9}]}]
+    settings = config(updates=8, steps_per_update=10, initial_std=.1, course_gates=course,
+                      stage_action_std={"jump": [.3, .3, .3, .3, .05, .05]})
+    trainer = PPOTrainer(GatedEnvironment(), settings, tmp_path)
+    trainer.train()
+    records = [json.loads(line) for line in (tmp_path / "metrics.jsonl").read_text().splitlines()]
+    raised = [record.get("action_std_floor_stage") for record in records]
+    assert raised.count("jump") == 1 and raised[0] is None      # flat first, then jump once
+    assert trainer.stage_action_std_applied == ["jump"]
+    std = trainer.actor.log_std.detach().exp()
+    assert (std[:4] >= .29).all()                                # legs raised to the floor (then trained)
+    restored = PPOTrainer(GatedEnvironment(), settings, tmp_path / "again", resume=tmp_path / "checkpoint.pt")
+    assert restored.stage_action_std_applied == ["jump"]
+    with pytest.raises(ValueError, match="six positive"):
+        config(course_gates=course, stage_action_std={"jump": [.3]})
+
+
+def test_a_new_rewind_tag_repeats_the_rewind_once(tmp_path):
+    course = [{"stage": "jump", "window": 1, "timeout_updates": 100,
+               "criteria": [{"metric": "rms/forward_error_m_s", "max": 1e9}]},
+              {"stage": "terrain", "window": 1, "timeout_updates": 1,
+               "criteria": [{"metric": "rms/forward_error_m_s", "max": -1.}]}]
+    first = PPOTrainer(GatedEnvironment(), config(updates=40, steps_per_update=10, course_gates=course,
+                                                   course_rewind_stage="jump"), tmp_path / "first")
+    first.train()
+    tagged = config(updates=80, steps_per_update=10, course_gates=course, course_rewind_stage="jump",
+                    course_rewind_tag="r7")
+    second = PPOTrainer(GatedEnvironment(), tagged, tmp_path / "second", resume=tmp_path / "first" / "checkpoint.pt")
+    assert second.curriculum_transitions == 100
+    second.course.coordinate = 250
+    second.save(tmp_path / "second" / "checkpoint.pt")
+    third = PPOTrainer(GatedEnvironment(), tagged, tmp_path / "third", resume=tmp_path / "second" / "checkpoint.pt")
+    assert third.curriculum_transitions == 250
+
+
+def test_gates_inside_a_stage_hold_the_coordinate_at_their_fraction():
+    course = CourseGates(gates(window=1) + [
+        {"stage": "jump", "at_fraction": .5, "window": 1, "timeout_updates": 9,
+         "criteria": [{"metric": "rms/height_error_m", "max": .01}]}], STARTS)
+    course.advance({"rms/height_error_m": .02}, 120)       # flat: jump gate waits at 99
+    course.advance({"rms/height_error_m": .02}, 120)       # passes the jump gate, moves to 199 (jump@0.5 at 200)
+    assert course.coordinate == 199 and course.opened == ["jump"]
+    held = course.advance({"rms/height_error_m": .02}, 120)
+    assert held["gate"] == "jump@0.5" and not held["gate_passed"] and course.coordinate == 199
+    passed = course.advance({"rms/height_error_m": .005}, 120)
+    assert passed["gate_passed"] and course.opened == ["jump", "jump@0.5"] and course.coordinate == 319
+    course.rewind("jump")
+    assert course.opened == ["jump"] and course.coordinate == 100
+    with pytest.raises(ValueError, match="bounded stage"):
+        CourseGates([{"stage": "terrain", "at_fraction": .5, "window": 1, "criteria": [
+            {"metric": "rms/height_error_m", "max": .01}]}], STARTS)

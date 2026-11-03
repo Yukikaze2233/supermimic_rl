@@ -13,7 +13,7 @@ then decays linearly to zero over ``imitation_anneal_updates`` under PPO.
 """
 from __future__ import annotations
 
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, field
 import hashlib
 import io
 import json
@@ -83,6 +83,11 @@ class PPOConfig:
     # Repeat a stage after a fix: on resume from a checkpoint written without
     # this rewind, the coordinate returns to the named stage's first transition.
     course_rewind_stage: str | None = None
+    # A new tag repeats the rewind once even if the checkpoint already rewound to the same stage.
+    course_rewind_tag: str | None = None
+    # Exploration on entering a new skill stage: {stage: six action-std floors},
+    # applied once (log_std = max(log_std, log(floor))) when the course enters the stage.
+    stage_action_std: dict = field(default_factory=dict)
 
     def __post_init__(self):
         if (type(self.curriculum_transition_offset) is not int
@@ -116,6 +121,14 @@ class PPOConfig:
             raise ValueError("course_gate_resume must be continue or restart_hold")
         if self.course_rewind_stage is not None and not self.course_gates:
             raise ValueError("course_rewind_stage requires a gated course")
+        if self.stage_action_std and not self.course_gates:
+            raise ValueError("stage_action_std requires a gated course")
+        for stage, floors in self.stage_action_std.items():
+            if (type(stage) is not str or len(floors) != 6
+                    or not all(type(v) in (int, float) and math.isfinite(v) and v > 0 for v in floors)):
+                raise ValueError("stage_action_std maps stage names to six positive action stds")
+        object.__setattr__(self, "stage_action_std", {k: tuple(float(v) for v in f)
+                                                      for k, f in self.stage_action_std.items()})
         if self.course_gates and self.curriculum_transition_offset:
             raise ValueError("A gated course starts at coordinate zero; offsets apply to exposure-only courses")
 
@@ -275,6 +288,7 @@ class PPOTrainer:
                                                     lr=config.estimator_learning_rate)
         self.learning_rate = config.learning_rate
         self.updates = self.transitions = 0
+        self.stage_action_std_applied: list[str] = []
         self.course = (CourseGates(config.course_gates, environment.course_stage_starts(),
                                    config.curriculum_transition_cap) if config.course_gates else None)
         # Native skill counters are cumulative since the cold physical setup.
@@ -504,6 +518,7 @@ class PPOTrainer:
             if self.updates:
                 completed_state = self._checkpoint_snapshot()
             while self.updates < config.updates:
+                std_raised = self._raise_stage_action_std()
                 self.statistics.reset_window()
                 started = time.perf_counter()
                 rollout = self.collect()
@@ -521,7 +536,8 @@ class PPOTrainer:
                           "timing/collect_s": collected - started,
                           "timing/update_s": updated - collected,
                           "timing/checkpoint_snapshot_s": time.perf_counter() - updated,
-                          **metrics, **self.statistics.summary(), **self._course_progress()}
+                          **metrics, **self.statistics.summary(), **self._course_progress(),
+                          **({} if std_raised is None else {"action_std_floor_stage": std_raised})}
                 timeout = None
                 if self.course is not None:
                     try:
@@ -560,6 +576,20 @@ class PPOTrainer:
             log.close()
         return {"status": "complete", "updates": self.updates, "transitions": self.transitions}
 
+    def _raise_stage_action_std(self) -> str | None:
+        """Raise action-std floors once when the course coordinate is inside a configured stage."""
+        if self.course is None or not self.config.stage_action_std:
+            return None
+        stage = self.course.stage()
+        floors = self.config.stage_action_std.get(stage)
+        if floors is None or stage in self.stage_action_std_applied:
+            return None
+        with torch.no_grad():
+            floor = torch.log(torch.tensor(floors, device=self.actor.log_std.device))
+            self.actor.log_std.copy_(torch.maximum(self.actor.log_std, floor))
+        self.stage_action_std_applied.append(stage)
+        return stage
+
     def _course_progress(self) -> dict:
         """Per-update native skill counter increments and current course gauges."""
         if self._course_counters is None:
@@ -578,7 +608,8 @@ class PPOTrainer:
         payload = {"format": CHECKPOINT_FORMAT, "config": asdict(self.config), "actor": self.actor.state_dict(),
                    "critic": self.critic.state_dict(), "updates": self.updates, "transitions": self.transitions,
                    "initialization": self.initialization,
-                   "course_gates": None if self.course is None else self.course.state_dict()}
+                   "course_gates": None if self.course is None else self.course.state_dict(),
+                   "stage_action_std_applied": list(self.stage_action_std_applied)}
         if not light:
             payload.update(optimizer=self.optimizer.state_dict(),
                            estimator_optimizer=self.estimator_optimizer.state_dict(),
@@ -611,11 +642,13 @@ class PPOTrainer:
         self.learning_rate, self.updates, self.transitions = (payload["learning_rate"], payload["updates"],
                                                               payload["transitions"])
         self.initialization = payload.get("initialization")
+        self.stage_action_std_applied = list(payload.get("stage_action_std_applied", []))
         if self.course is not None and payload.get("course_gates") is not None:
             self.course.load_state_dict(payload["course_gates"],
                                         restart_hold=self.config.course_gate_resume == "restart_hold")
-            stage = self.config.course_rewind_stage
-            if stage is not None and payload["config"].get("course_rewind_stage") != stage:
+            stage, tag = self.config.course_rewind_stage, self.config.course_rewind_tag
+            saved = payload["config"]
+            if stage is not None and (saved.get("course_rewind_stage"), saved.get("course_rewind_tag")) != (stage, tag):
                 receipt = {**self.course.rewind(stage), "resumed_update": payload["updates"],
                            "checkpoint": str(path)}
                 self.output.mkdir(parents=True, exist_ok=True)

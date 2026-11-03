@@ -54,6 +54,10 @@ class JumpTaskConfig:
 
     @classmethod
     def capture(cls, native):
+        if getattr(native, 'supermimic_jump_trigger', None) is not None:
+            # Imagination replays automatic request scheduling; it must not
+            # silently ignore the stability gate that defers native requests.
+            raise ValueError('The world-model jump task does not mirror the jump trigger gate yet')
         tasks = native._terrain_course.tasks
         return cls(tasks.protocol.config, tasks.reference.config, float(native.physics_dt))
 

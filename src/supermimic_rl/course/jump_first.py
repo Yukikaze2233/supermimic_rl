@@ -58,8 +58,8 @@ class JumpFirstCurriculum(SuperMimicCurriculum):
         jump = list(weights[2])
         # The former jump mixture contains terrain rehearsal. Before the first
         # terrain stage, retain the other relative shares and normalize them.
+        # Recovery births stay as configured, so easy get-up can mix in early.
         jump[int(TaskFamily.TERRAIN)] = 0.
-        jump[int(TaskFamily.RECOVERY)] = 0.
         retained = sum(jump)
         weights[2] = tuple(value / retained for value in jump)
         self.stage_weights = tuple(weights)

@@ -77,6 +77,10 @@ class CourseCurriculumConfig:
     # initial to the full domain (jump-first course). "active_jump" grows the
     # upper height inside the jump stage so every later stage samples all heights.
     jump_height_stage: str = "combined_dr"
+    # Optional difficulty order for recovery births: {posture: first stage that
+    # may draw it}. Postures absent from the map use the first stage. Empty keeps
+    # every configured posture from the first recovery birth on.
+    recovery_posture_stages: dict = field(default_factory=dict)
 
     def __post_init__(self):
         budgets = tuple(self.stage_transition_budgets)
@@ -126,6 +130,11 @@ class CourseCurriculumConfig:
                 raise ValueError(name + " must lie in (0, 1]")
         if self.jump_height_stage not in STAGE_NAMES:
             raise ValueError("jump_height_stage must name a course stage")
+        stages = dict(self.recovery_posture_stages)
+        if (any(name not in self.recovery_postures for name in stages)
+                or any(stage not in STAGE_NAMES for stage in stages.values())):
+            raise ValueError("recovery_posture_stages maps configured postures to course stages")
+        object.__setattr__(self, "recovery_posture_stages", stages)
         if self.jump_standing_fraction_of_stage >= self.jump_full_motion_fraction_of_stage:
             raise ValueError("Jump moving exposure must follow standing exposure")
         object.__setattr__(self, "stage_transition_budgets", budgets)
@@ -270,6 +279,15 @@ class SuperMimicCurriculum(FormalTaskCurriculum):
         return CommandContext(self._effective_domain(), self.budget.total_updates,
                               self._request_motion_scale())
 
+    def recovery_posture_pool(self) -> tuple[str, ...]:
+        """Configured postures whose first stage has been reached (all postures if unscheduled)."""
+        first = self.config.recovery_posture_stages
+        names = tuple(name for name in self.config.recovery_postures
+                      if self.stage_names.index(first.get(name, self.stage_names[0])) <= self.stage)
+        if not names:
+            raise ValueError("Recovery births need at least one posture available at this stage")
+        return names
+
     def _condition_task_difficulty(self, draw):
         posture, terrain = draw.recovery_posture.clone(), draw.terrain_kind.clone()
         command, nominal = draw.requested_command.clone(), draw.nominal.clone()
@@ -281,7 +299,7 @@ class SuperMimicCurriculum(FormalTaskCurriculum):
             offset = self.sample_counts["family"][int(family)]
             ordinal = torch.arange(len(rows), device=self.device) + offset
             if family == TaskFamily.RECOVERY:
-                names = self.config.recovery_postures
+                names = self.recovery_posture_pool()
                 pool = posture.new_tensor([RECOVERY_NAMES.index(name) for name in names])
                 posture[rows] = pool[ordinal % len(pool)]
                 nominal[rows], trajectory[rows] = False, 0

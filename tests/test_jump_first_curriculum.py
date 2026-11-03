@@ -173,7 +173,7 @@ def test_explicit_factory_selection_and_pinned_configuration():
     path = Path(__file__).resolve().parents[1] / 'configs/gpufree/ppo-course-jump-first.json'
     configured = make_course_curriculum(2, 'cpu', 7, json.loads(path.read_text()))
     original = json.loads(path.with_name('ppo-course.json').read_text())
-    assert configured.config.to_dict() == {**original, 'jump_height_stage': 'combined_dr'}
+    assert configured.config.to_dict() == {**original, 'jump_height_stage': 'combined_dr', 'recovery_posture_stages': {}}
 
 
 def test_jump_height_range_widens_inside_the_configured_stage():
@@ -197,3 +197,32 @@ def test_jump_height_range_widens_inside_the_configured_stage():
     assert low == pytest.approx(.1) and .1 < mid < .4 and high == pytest.approx(.4)
     with pytest.raises(ValueError, match='jump_height_stage'):
         CourseCurriculumConfig.from_dict({**base, 'jump_height_stage': 'nope'})
+
+
+def test_recovery_postures_enter_by_stage_and_mix_into_the_jump_stage():
+    import json
+    from supermimic_rl.course.curriculum import CourseCurriculumConfig
+    from supermimic_rl.course.jump_first import JumpFirstCurriculum
+    from support import REPO_ROOT
+
+    base = json.loads((REPO_ROOT / 'configs/gpufree/ppo-course-gated-v4.json').read_text())['base']
+    weights = [list(row) for row in base['stage_weights']]
+    weights[5] = [.05, .25, .05, .2, .4, .05]          # original active_jump row: 5% recovery
+    schedule = {name: 'active_jump' for name in ('upright_release', 'crouched_release', 'pitch_forward_45')}
+    schedule.update({'left_side_90': 'dynamic_commands', 'right_side_90': 'dynamic_commands'})
+    config = CourseCurriculumConfig.from_dict({**base, 'stage_weights': weights,
+                                               'recovery_postures': ['upright_release', 'crouched_release',
+                                                                     'pitch_forward_45', 'left_side_90',
+                                                                     'right_side_90', 'prone_belly_legs_above',
+                                                                     'prone_back_legs_above'],
+                                               'recovery_posture_stages': {
+                                                   **schedule, 'prone_belly_legs_above': 'full_recovery',
+                                                   'prone_back_legs_above': 'full_recovery'}})
+    curriculum = JumpFirstCurriculum(4, 'cpu', 7, config)
+    jump = curriculum.stage_names.index('active_jump')
+    assert curriculum.stage_weights[jump][-1] > 0 and curriculum.stage_weights[jump][3] == 0.
+    for stage, expected in (('active_jump', 3), ('dynamic_commands', 5), ('full_recovery', 7)):
+        curriculum.set_progress(sum(curriculum.stage_budgets[:curriculum.stage_names.index(stage)]), 0)
+        assert len(curriculum.recovery_posture_pool()) == expected
+    with pytest.raises(ValueError, match='recovery_posture_stages'):
+        CourseCurriculumConfig.from_dict({**base, 'recovery_posture_stages': {'left_side_90': 'nope'}})
