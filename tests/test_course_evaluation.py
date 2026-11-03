@@ -1,5 +1,6 @@
 """Fixed requests reuse real source task mapping and command admission on CPU."""
 from types import SimpleNamespace
+from dataclasses import replace
 import math
 import os
 from pathlib import Path
@@ -147,6 +148,9 @@ def test_command_source_preserves_native_handoff_rng_and_restores_hooks(adapter)
     original_curriculum, original_tracking = adapter.curriculum, tasks.begin_tracking
     plan = FixedCourseScenarios(adapter, CourseEvaluationConfig(scenarios=('stand',)))
     plan.install()
+    assert 'step' not in tasks.stream.__dict__
+    assert 'recovery_qualification' not in plan.description()['selection']
+    assert 'recovery_qualification' not in plan.description()
     ids = torch.arange(adapter.num_envs)
     sampled = adapter.env._task_sampler(ids)
     tasks.reset(ids, sampled, torch.zeros(adapter.num_envs, dtype=torch.float64),
@@ -166,6 +170,73 @@ def test_command_source_preserves_native_handoff_rng_and_restores_hooks(adapter)
     assert adapter.curriculum is original_curriculum
     assert tasks.begin_tracking == original_tracking
     assert not {'_draw_segments', 'begin_tracking'} & tasks.__dict__.keys()
+
+
+def test_recovery_qualification_overrides_request_before_native_admission_and_preserves_handoff(adapter):
+    from transformer_rl.formal.control.observation import CommandMode
+    from transformer_rl.formal.lab_env.recovery_lifecycle import RecoveryLifecycle
+    from transformer_rl.formal.tasks.trajectory import CommandRates, CommandStream
+
+    # A nondefault height must still pass through native initialization and slew.
+    config = adapter.curriculum.config
+    adapter.curriculum = type(adapter.curriculum)(adapter.num_envs, config=replace(
+        config, domain=replace(config.domain, nominal_height_m=.36)))
+    native = RecoveryLifecycle(adapter.num_envs)
+    adapter.env._terrain_course.recovery = native
+    tasks = adapter.env._terrain_course.tasks
+    tasks.stream = CommandStream(tasks.stream.current, tasks.stream.envelope,
+        CommandRates(1., 2., .1), policy_dt_s=tasks.policy_dt_s)
+    original_step = tasks.stream.step
+    name = 'recovery_' + config.recovery_postures[0]
+    plan = FixedCourseScenarios(adapter, CourseEvaluationConfig(
+        scenarios=(name, 'forward_speed'), recovery_qualification=True))
+    plan.install()
+    try:
+        ids = torch.arange(adapter.num_envs)
+        sample = adapter.env._task_sampler(ids)
+        tasks.reset(ids, sample, torch.zeros(adapter.num_envs, dtype=torch.float64),
+                    terrain_kind=sample.terrain_kind, terrain_step_height_m=sample.draw.step_up_m)
+        hold = plan.qualification_rows
+        torch.testing.assert_close(tasks.stream.current[:, 3], torch.full((adapter.num_envs,), .32))
+        assert plan.qualification_commands[hold, 3].tolist() == pytest.approx([.36] * int(hold.sum()))
+        expected_rng = torch.Generator().set_state(tasks.generator.get_state())
+        vx, wz = tasks.command_pool.handoff(int(hold.sum()), expected_rng, 'cpu')
+        # Native changes mode before begin_tracking, so scenario identity is
+        # essential: a mode==RECOVERY hook would miss this exact transition.
+        tasks.base_mode[hold] = int(CommandMode.NORMAL)
+        tasks.begin_tracking(hold)
+        trajectory = tasks.trajectory.end.clone()
+        torch.testing.assert_close(trajectory[hold, 0], vx)
+        torch.testing.assert_close(trajectory[hold, 2], wz)
+        assert torch.equal(tasks.generator.get_state(), expected_rng.get_state())
+        assert (trajectory[hold, :3] != 0).any()
+        modes = tasks.base_mode.clone()
+        reference = CommandStream(tasks.stream.current, tasks.stream.envelope,
+                                  tasks.stream.rates, policy_dt_s=tasks.policy_dt_s)
+        for clock in (0., native.config.timeout_s - native.config.physics_dt_s,
+                      native.config.timeout_s):
+            plan.qualification_clock.fill_(clock)
+            wanted = trajectory.clone()
+            if clock < native.config.timeout_s:
+                wanted[hold] = plan.qualification_commands[hold]
+            expected = reference.step(wanted)
+            admitted, _, _, _ = tasks.step(torch.full((adapter.num_envs,), .02, dtype=torch.float64),
+                                            None, torch.zeros(adapter.num_envs))
+            # Native automatic-request timing draws once even when no row is due.
+            torch.rand(adapter.num_envs, generator=expected_rng)
+            for field in ('requested', 'wheel_projected', 'admitted', 'slew_fraction'):
+                torch.testing.assert_close(getattr(admitted, field), getattr(expected, field))
+            torch.testing.assert_close(admitted.requested[~hold], trajectory[~hold])
+            torch.testing.assert_close(tasks.trajectory.end, trajectory)
+            torch.testing.assert_close(tasks.base_mode, modes)
+            assert torch.equal(tasks.generator.get_state(), expected_rng.get_state())
+            if clock == 0.:
+                assert admitted.admitted[hold, 3].tolist() == pytest.approx([.322] * int(hold.sum()))
+                assert plan.command_source[hold].eq(1).all()
+        assert plan.description()['selection']['recovery_qualification'] is True
+    finally:
+        plan.close()
+    assert tasks.stream.step == original_step and 'step' not in tasks.stream.__dict__
 
 
 def test_fixed_physical_tiles_ignore_training_proficiency_and_ceiling_exploration(adapter):
