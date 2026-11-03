@@ -12,6 +12,8 @@ import math
 import torch
 
 from ..compact_state import named_field
+from .jump_evaluation import JumpEvaluation
+from .recovery_evaluation import RecoveryEvaluation
 
 # Radiant 0bf3456 clips before MAE. Keep these secondary summaries separate
 # from raw error and document our native coordinates/sample-weighted reduction.
@@ -312,6 +314,9 @@ class CourseEvaluation:
                        else CourseEvaluationConfig(**(configuration or {})))
         self.plan, self.schema, self.buckets = None, None, {}
         self.phase_buckets = {}
+        self.recovery_phase_buckets = {}
+        self.recovery_evidence = None
+        self.jump_evidence = None
         self._hook_restore = []
         self._authored_pending = None
         self._active = False
@@ -319,12 +324,24 @@ class CourseEvaluation:
     def begin(self, schema):
         self.schema = schema
         self.plan = FixedCourseScenarios(self.adapter, self.config)
-        self.plan.install()
-        self.adapter.reset()
-        self.before = self.adapter.env._terrain_course.metrics()
-        self.buckets = {}
-        self.phase_buckets = {}
-        self._install_authored_evidence()
+        try:
+            self.plan.install()
+            self.adapter.reset()
+            self.before = self.adapter.env._terrain_course.metrics()
+            self.buckets = {}
+            self.phase_buckets = {}
+            self.recovery_phase_buckets = {}
+            self._install_authored_evidence()
+            if getattr(self.adapter.env._terrain_course, 'recovery', None) is not None:
+                self.recovery_evidence = RecoveryEvaluation(self.adapter.env, self.plan.row_names)
+                self.recovery_evidence.install()
+            tasks = getattr(self.adapter.env._terrain_course, 'tasks', None)
+            if getattr(tasks, 'protocol', None) is not None:
+                self.jump_evidence = JumpEvaluation(self.adapter.env, self.plan.row_names)
+                self.jump_evidence.install()
+        except Exception:
+            self.close()
+            raise
         self._active = True
         self.adapter.evaluation_end = self.close
 
@@ -334,10 +351,13 @@ class CourseEvaluation:
             return None
         router = self.adapter.env._terrain_course.router
         tile = router.tile
-        return {'command_source': self.plan.command_source.detach().clone(),
+        result = {'command_source': self.plan.command_source.detach().clone(),
                 'routed_step_height_m': router.step_table[tile].detach().clone(),
                 'routed_slope_rad': router.slope_table[tile].detach().clone(),
                 'routed_roughness_m': router.roughness_table[tile].detach().clone()}
+        if self.recovery_evidence is not None:
+            result.update(self.recovery_evidence.sample())
+        return result
 
     def _install_authored_evidence(self):
         """Read actual per-row events before reset, without changing the schema."""
@@ -376,6 +396,10 @@ class CourseEvaluation:
 
     def close(self):
         """Restore only evaluation wrappers, also when a rollout raises."""
+        if self.jump_evidence is not None:
+            self.jump_evidence.close()
+        if self.recovery_evidence is not None:
+            self.recovery_evidence.close()
         for owner, name, previous, existed in reversed(self._hook_restore):
             if existed:
                 setattr(owner, name, previous)
@@ -468,6 +492,10 @@ class CourseEvaluation:
             for value in context.values():
                 finite &= torch.isfinite(value).reshape(len(reward), -1).all(-1)
         valid = transition.valid.detach().cpu() & finite
+        if self.recovery_evidence is not None:
+            self.recovery_evidence.observe_transition(transition, valid)
+        if self.jump_evidence is not None:
+            self.jump_evidence.observe_transition(transition, valid)
         for row, name in enumerate(self.plan.row_names):
             total_bucket = self.buckets.setdefault(name, self._empty_bucket())
             if not owned[row]:
@@ -478,7 +506,13 @@ class CourseEvaluation:
                 phase = ('unclassified', 'scheduled_segment', 'native_handoff')[int(context['command_source'][row])]
             phases = self.phase_buckets.setdefault(name, {})
             phase_bucket = phases.setdefault(phase, self._empty_bucket())
-            for bucket in (total_bucket, phase_bucket):
+            row_buckets = [total_bucket, phase_bucket]
+            if context is not None and 'recovery_active' in context:
+                recovery_phase = ('recovery' if context['recovery_active'][row] else
+                    'post_handoff_tracking' if context['recovery_after_handoff'][row] else 'other')
+                recovery_phases = self.recovery_phase_buckets.setdefault(name, {})
+                row_buckets.append(recovery_phases.setdefault(recovery_phase, self._empty_bucket()))
+            for bucket in row_buckets:
                 # Preserve the original observed-sample count. Every capability
                 # numerator and error denominator below uses only trusted rows.
                 bucket['samples'] += 1
@@ -490,7 +524,7 @@ class CourseEvaluation:
                 if context is not None:
                     terrain = bucket.setdefault('routed_terrain_ranges', {})
                     for key, value in context.items():
-                        if key != 'command_source':
+                        if key not in ('command_source', 'recovery_active', 'recovery_after_handoff'):
                             self._record_range(terrain, key, value[row])
                 bucket["reward_sum"] += float(reward[row])
                 bucket["terminated"] += int(terminated[row])
@@ -568,6 +602,9 @@ class CourseEvaluation:
             bucket = self._summarize_bucket(self.buckets[name])
             bucket['command_phases'] = {phase: self._summarize_bucket(values)
                 for phase, values in self.phase_buckets.get(name, {}).items()}
+            if name in self.recovery_phase_buckets:
+                bucket['recovery_phases'] = {phase: self._summarize_bucket(values)
+                    for phase, values in self.recovery_phase_buckets[name].items()}
             result[name] = bucket
         after = self.adapter.env._terrain_course.metrics()
         delta = {}
@@ -592,7 +629,7 @@ class CourseEvaluation:
             catalog[str(index)] = {key: tile.get(key) for key in ('name', 'kind', 'level', 'source_roi_m')}
             catalog[str(index)].update(parameters=parameters,
                 profile_peak_above_first_m=None if not profile else max(profile) - profile[0])
-        return {"format": "supermimic-fixed-course-evaluation-v3", "plan": self.plan.description(),
+        report = {"format": "supermimic-fixed-course-evaluation-v3", "plan": self.plan.description(),
                 "buckets": result, "physical_counter_deltas_after_initial_reset": delta,
                 "routed_terrain_catalog": catalog,
                 "terrain_semantics": "declared parameters/profiles of observed pinned atlas tiles; first routing rise is not total traversal height; no inferred crossing success",
@@ -603,3 +640,12 @@ class CourseEvaluation:
                 "clipped_mae_reference": "Radiant 0bf3456 clip bounds only; native coordinates and sample weighting differ from its first-episode trajectory-weighted evaluation",
                 "success_semantics": "per-case native jump pulse/recovery rising edge/authored observe-finish-reset events; global counters are separate and never apportioned to cases",
                 "scope": "observed intervals only; empty buckets and incomplete events are not demonstrated capabilities"}
+        if self.recovery_evidence is not None:
+            report['recovery_diagnostics'] = self.recovery_evidence.summary()
+            report['recovery_phase_semantics'] = (
+                'Pre-action native recovery.active: the handoff interval belongs to recovery; '
+                'post_handoff_tracking persists through later command draws until episode reset. '
+                'Phase totals partition observed samples, not certified skill successes.')
+        if self.jump_evidence is not None:
+            report['jump_diagnostics'] = self.jump_evidence.summary()
+        return report

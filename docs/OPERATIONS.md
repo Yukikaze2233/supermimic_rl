@@ -48,6 +48,8 @@ python scripts/train_ppo.py export --checkpoint <checkpoint.pt> --output teacher
 
 输出：`training/metrics.jsonl`（每更新一行，含门槛状态与原生技能计数增量）、`training/checkpoint.pt`（完整可恢复）、`training/checkpoints/update-*.pt`（轻量）。门槛超时会保存后以 `gate_timeout` 结束，必须先诊断再续训。
 
+固定场景评价默认使用 Actor 均值；`--action-sampling ppo-gaussian --sampling-seed <seed>` 可单独检查 checkpoint 的训练探索噪声，动作 RNG 与环境 RNG 分开。`recovery_diagnostics` 按回合记录交接/超时、各物理和估计判据及最长稳定时间；`recovery_phases` 将实际恢复与交接后的跟踪分开。`jump_diagnostics` 按请求记录峰高、上升/离地证据、实际助力冲量和最长落地静稳，并分开协议结束与物理认证。不完整或无效区间保留诊断标记，不计作成功。
+
 v5 的 `jump_height_gates` 把请求高度上限固定在 0.10 / 0.20 / 0.30 / 0.40 m；只有对应阶段内门槛通过，坐标跨过整数边界后才提升上限。各高度档只读取实际未施加助力冲量的成功/结束计数，不能用全部请求的成功率替代。力幅衰减与请求抽样分开：`assist_request_probability=0.8` 是候选训练比例，保留 20% 请求不施加助力，避免课程等待时助力也被冻结、永远收集不到无助力证据；它不是电机或机械参数。剩余 80% 请求仍按课程坐标衰减力幅，最终同样归零。门槛窗口、成功率和该比例需依据分高度档样本量与原生表现调整。
 
 R7 启动前分别运行 `short`、`long` 探针，使用相同完整 checkpoint 和各自的新输出目录。400 更新对应每环境 192 s 仿真曝光；这是诊断预算，不是技能完成判据。未到达的高度档报告为未知。
