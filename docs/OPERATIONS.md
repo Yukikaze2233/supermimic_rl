@@ -98,6 +98,8 @@ python scripts/report_world_v2_data.py --online-checkpoint <online>/training/res
 
 在线运行每 `replay_checkpoint_interval` 轮写入一对轮换的完整 checkpoint（回放约 15 GB/份，需预留两份空间）。推扰只放在 PPO runtime 中；世界模型采集使用无推扰 runtime，因为模型输入看不到推扰。
 
+在线恢复会重新初始化整批物理出生状态。启用原生回报 guard 时，每次 cold resume 复用 `policy_start_cycle` 预算，前相应数量的新周期暂缓回退判定及最佳快照替换，训练更新照常进行。已有 best 和回退次数保留，重置前的连续坏周期计数被记录并清零，避免跨出生等待期拼成连续退化；`guard.deferred_reason`、`remaining_cycles`（该周期结束后的剩余数）和 `cold_resume_previous_bad_cycles` 标明过程。预算为 0 时保持原行为，新运行仍按原有绝对 `policy_start_cycle` 启动。
+
 数据报告读取 checkpoint 中已有的接触滤波阈值，在同一批重新采样的留出窗口上同时报告原始预测和滤波后的接触事件 precision/recall；没有正样本时 recall 为 null。各预测时距的瞬时事件统计覆盖末尾区间四个物理子步；提供 SHA256 匹配的 `--runtime-json` 后，另按原生确认时间统计整个预测窗口中的接触终止误报/漏报。报告不会重拟合滤波阈值，也不会把滤波后的载荷误差冒充原始模型误差；报告样本与标定共享留出环境总体，不能据此声称使用了独立测试集。
 
 完整在线配对报告通过只读 mmap 视图读取 replay，避免再分配一份完整训练回放；采样窗口仍拥有独立存储。训练恢复默认复制数据，不受此选项影响。读取活跃运行时，应依据最后写入的 `resume.json` 固定同一代 checkpoint/replay，避免两槽轮换期间混用不同循环；报告记录对应循环和 replay 文件名。

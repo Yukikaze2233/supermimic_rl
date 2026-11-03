@@ -1,4 +1,5 @@
 """A process handoff must finish the current cycle and save complete recovery state."""
+import copy
 import json
 from types import SimpleNamespace
 
@@ -40,6 +41,7 @@ def test_checkpoint_request_during_model_fit_finishes_policy_updates_before_full
 
     trainer = object.__new__(OnlineTrainer)
     trainer.guard = None
+    trainer.guard_cold_cycles_remaining = 0
     trainer.config = OnlineConfig(cycles=9, model_updates=2, actor_updates=3,
         record_tasks=world_only, record_stair_source=world_only, course_coordinate=0 if world_only else None,
         policy_start_cycle=3 if world_only else 0)
@@ -99,6 +101,7 @@ def _stub_trainer(tmp_path, monkeypatch, calls, **config):
 
     trainer = object.__new__(OnlineTrainer)
     trainer.guard = None
+    trainer.guard_cold_cycles_remaining = 0
     trainer.config = OnlineConfig(**{'cycles': 3, 'model_updates': 1, 'actor_updates': 2, 'record_tasks': True,
                                      'record_stair_source': True, 'course_coordinate': 0, 'policy_start_cycle': 2,
                                      **config})
@@ -198,3 +201,68 @@ def test_guard_judges_only_policy_cycles_and_restores_after_a_sustained_drop(tmp
     # Restored to the actor that collected the best (baseline) return, then that cycle's two updates.
     torch.testing.assert_close(learner.actor.decoder[0].weight, original['decoder.0.weight'] + 2.)
     torch.testing.assert_close(learner.actor.estimator[0].weight, original['estimator.0.weight'] + .5)
+
+
+@pytest.mark.parametrize('budget', [0, 20])
+def test_cold_resume_defers_only_guard_then_starts_a_new_bad_streak(tmp_path, monkeypatch, budget):
+    from supermimic_rl.world_model_v2.guard import NativeRegressionGuard
+    from supermimic_rl.world_model_v2.policy import EstimatorActor
+
+    calls = []
+    trainer = _stub_trainer(tmp_path, monkeypatch, calls, cycles=64 + budget + 2,
+        policy_start_cycle=budget, guard_drop_fraction=.05, guard_patience=2)
+    trainer.cycle = 64
+    learner = trainer.learner
+    learner.actor = EstimatorActor(history_length=1, estimator_hidden=(4,), actor_hidden=(4,), frame_dim=35)
+    learner.optimizers = {'actor': torch.optim.Adam(learner.actor.decoder.parameters(), lr=1.25e-5),
+                          'estimator': torch.optim.Adam(learner.actor.estimator.parameters(), lr=1e-3)}
+    previous = NativeRegressionGuard(.05, 2, 5e-5)
+    previous.best_reward = .09385
+    previous.best = previous.snapshot(learner.actor, learner.optimizers['actor'],
+                                      estimator_optimizer=learner.optimizers['estimator'])
+    previous.bad_cycles, previous.restorations = 1, 2
+    saved = copy.deepcopy(previous.state_dict())
+    trainer._initialize_guard({'guard': saved})
+    assert trainer.guard.best_reward == previous.best_reward and trainer.guard.restorations == 2
+    assert trainer.guard.bad_cycles == (0 if budget else 1)
+    torch.testing.assert_close(trainer.guard.best, previous.best, rtol=0, atol=0)
+    # Even a higher reward during birth settling must not replace the saved
+    # best. Two new bad observations after the wait are needed to restore.
+    rewards = iter(([.0146, .2] * (budget // 2)) + [.01, .01])
+    observations = []
+    original_observe = trainer.guard.observe
+
+    def observe(reward, *args, **kwargs):
+        observations.append(reward)
+        return original_observe(reward, *args, **kwargs)
+
+    trainer.guard.observe = observe
+    trainer.collector.collect = lambda *args, **kwargs: {
+        'terminations': 0, 'student_reward_mean': next(rewards)}
+    original_fit = learner.fit_model
+    learner.fit_model = lambda windows: calls.append('world') or original_fit(windows)
+    trainer.train()
+    metrics = [json.loads(line) for line in (tmp_path / 'metrics.jsonl').read_text().splitlines()]
+    assert observations == [.01, .01]
+    assert calls == ['world', 'actor', 'actor'] * (budget + 2)
+    assert all(row['policy_learning'] for row in metrics)
+    if budget:
+        deferred = [row['guard'] for row in metrics[:budget]]
+        assert [row['remaining_cycles'] for row in deferred] == list(range(budget - 1, -1, -1))
+        assert all(row['deferred_reason'] == 'cold_resume' and row['cold_resume_previous_bad_cycles'] == 1
+                   and row['best_student_reward'] == .09385 and row['restorations'] == 2
+                   and row['bad_cycles'] == 0 and not row['restored'] for row in deferred)
+        assert not metrics[budget]['guard']['restored'] and metrics[budget]['guard']['bad_cycles'] == 1
+        assert metrics[budget + 1]['guard']['restored']
+    else:
+        assert metrics[0]['guard']['restored']  # Zero budget retains the previous streak/behavior.
+        assert all('deferred_reason' not in row['guard'] for row in metrics)
+    assert trainer.guard.best_reward == .09385 and trainer.guard.restorations == 3
+
+
+def test_fresh_guard_keeps_existing_absolute_policy_start(tmp_path, monkeypatch):
+    trainer = _stub_trainer(tmp_path, monkeypatch, [], guard_drop_fraction=.05)
+    trainer._initialize_guard(None)
+    assert trainer.guard_cold_cycles_remaining == 0
+    assert trainer.guard_cold_previous_bad_cycles is None
+    assert trainer.guard.best is None and trainer.guard.bad_cycles == trainer.guard.restorations == 0
