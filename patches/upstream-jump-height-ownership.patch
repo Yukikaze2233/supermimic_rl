@@ -1,0 +1,12 @@
+diff --git a/src/transformer_rl/formal/lab_env/skill_fsm.py b/src/transformer_rl/formal/lab_env/skill_fsm.py
+--- a/src/transformer_rl/formal/lab_env/skill_fsm.py
++++ b/src/transformer_rl/formal/lab_env/skill_fsm.py
+@@ -446,7 +446,7 @@ class JumpFSM:
+         self.state_time = torch.where(exited, torch.zeros_like(self.state_time), self.state_time)
+         self.landing_time = torch.where(exited, torch.zeros_like(self.landing_time), self.landing_time)
+         active_out = self.state != int(JumpState.NORMAL)
+-        self._height = command
++        self._height = command.clone()
+         self._speed = torch.where(
+             self.state == int(JumpState.PRELOAD), torch.full_like(self._speed, self.config.preload_speed_scale),
+             torch.where(self.state == int(JumpState.LANDING),

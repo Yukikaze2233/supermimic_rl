@@ -1,0 +1,37 @@
+diff --git a/src/transformer_rl/formal/lab_env/env.py b/src/transformer_rl/formal/lab_env/env.py
+index f9ca109..3025227 100644
+--- a/src/transformer_rl/formal/lab_env/env.py
++++ b/src/transformer_rl/formal/lab_env/env.py
+@@ -133,7 +133,7 @@ class WheeledLabEnv(DirectRLEnv):
+         if wheel_material is not None:
+             self._wheel_materials.randomize_startup(
+                 wheel_material, seed=int(getattr(cfg, 'seed', 0) or 0) + 32452843)
+-        self._startup_dynamics = LabStartupDynamics(
++        self._startup_dynamics = self._build_startup_dynamics(
+             self.robot, self._binding, self.num_envs, self._asset.manifest['total_mass_kg'],
+             int(getattr(cfg, 'seed', 0) or 0) + 15485863,
+             getattr(cfg, 'startup_dynamics_spec', None), device=self._device,
+@@ -960,6 +960,10 @@ class WheeledLabEnv(DirectRLEnv):
+             q, self._clock())
+         self._targets = neutral if self._targets is None else _select_targets(mask, neutral, self._targets)
+ 
++    def _build_startup_dynamics(self, *args, **kwargs):
++        """Allow an auxiliary articulation adapter to account for full-body mass."""
++        return LabStartupDynamics(*args, **kwargs)
++
+     def _apply_action(self) -> None:
+         if self._targets is None:
+             raise RuntimeError("必须先由 _pre_physics_step 生成输出目标")
+diff --git a/src/transformer_rl/formal/lab_env/skill_fsm.py b/src/transformer_rl/formal/lab_env/skill_fsm.py
+index 28b894d..19296ca 100644
+--- a/src/transformer_rl/formal/lab_env/skill_fsm.py
++++ b/src/transformer_rl/formal/lab_env/skill_fsm.py
+@@ -487,7 +487,7 @@ class JumpFSM:
+         self.state_time = torch.where(exited, torch.zeros_like(self.state_time), self.state_time)
+         self.landing_time = torch.where(exited, torch.zeros_like(self.landing_time), self.landing_time)
+         active_out = self.state != int(JumpState.NORMAL)
+-        self._height = command
++        self._height = command.clone()
+         self._speed = torch.where(
+             self.state == int(JumpState.PRELOAD), torch.full_like(self._speed, self.config.preload_speed_scale),
+             torch.where(self.state == int(JumpState.LANDING),

@@ -1,0 +1,7 @@
+{
+  "updates": 12774,
+  "checkpoint_interval": 100,
+  "curriculum_transition_offset": 196608000,
+  "curriculum_transition_cap": null,
+  "steps_per_update": 24
+}

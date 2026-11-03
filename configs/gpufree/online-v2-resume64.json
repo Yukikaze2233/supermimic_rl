@@ -1,0 +1,51 @@
+{
+  "cycles": 2,
+  "collection_steps": 24,
+  "replay_steps": 1000,
+  "model_updates": 2,
+  "model_batch_size": 64,
+  "fit_horizon": 8,
+  "actor_updates": 2,
+  "imagination_batch_size": 16,
+  "imagination_microbatch_size": 8,
+  "estimator_warmup_updates": 4,
+  "action_noise_std": 0.1,
+  "teacher_fraction": 0.5,
+  "teacher_hold_updates": 800,
+  "teacher_fade_updates": 800,
+  "validation_fraction": 0.125,
+  "checkpoint_interval": 1,
+  "replay_checkpoint_interval": 1,
+  "curriculum_transition_cap": 0,
+  "seed": 7,
+  "model_hidden": [
+    2048,
+    2048,
+    2048
+  ],
+  "actor_hidden": [
+    512,
+    256,
+    128
+  ],
+  "estimator_hidden": [
+    128,
+    64
+  ],
+  "critic_hidden": [
+    256,
+    128
+  ],
+  "learning": {
+    "model_learning_rate": 0.0002,
+    "actor_learning_rate": 0.0002,
+    "critic_learning_rate": 0.0002,
+    "estimator_learning_rate": 0.001,
+    "gamma": 0.99,
+    "gae_lambda": 0.95,
+    "gradient_clip": 1.0,
+    "imagination_horizon": 16,
+    "critic_epochs": 5,
+    "critic_minibatches": 4
+  }
+}

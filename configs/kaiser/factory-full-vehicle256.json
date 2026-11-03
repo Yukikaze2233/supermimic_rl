@@ -1,0 +1,43 @@
+{
+  "upstream_root": "/home/kaiser/workspace/supermimic_sources/transformer_rl-full-vehicle-8e12c5a",
+  "expected_commit": "8e12c5a75d6f5b7f12341423150bb0fa79dfd9e2",
+  "runtime_json": "/home/kaiser/workspace/supermimic_rl/configs/kaiser/runtime-full-vehicle.json",
+  "runtime_sha256": "970b4471e75f615f83f5cb52d563b1752a88a6606291adc4669c5cbf288ebc1e",
+  "asset_directory": "/home/kaiser/workspace/supermimic_assets/full-vehicle-v2p0p1-audited-20261101",
+  "asset_manifest_sha256": "e726d23c4d3cc5bb8c0eec2fb396daa2e3c825979bf39497cf335d85c371bd2c",
+  "num_envs": 256,
+  "device": "cuda:0",
+  "seed": 7,
+  "formal_reward": true,
+  "terrain_profile": "plane",
+  "normal_load_source": "contact_force_world_z_abs",
+  "episode_commands": {
+    "forward_m_s": [
+      -0.5,
+      0.5
+    ],
+    "yaw_rad_s": [
+      -1,
+      1
+    ],
+    "height_m": [
+      0.23,
+      0.32
+    ],
+    "standing_fraction": 0.25
+  },
+  "gimbal": {
+    "yaw_velocity_rad_s": [
+      -1.5,
+      1.5
+    ],
+    "pitch_position_rad": [
+      -0.6108652381980153,
+      0.5235987755982988
+    ],
+    "yaw_damping": 0.5,
+    "pitch_stiffness": 20.0,
+    "pitch_damping": 0.5
+  },
+  "compact_state": true
+}

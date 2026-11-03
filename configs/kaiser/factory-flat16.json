@@ -1,0 +1,29 @@
+{
+  "upstream_root": "/home/kaiser/workspace/supermimic_sources/transformer_rl-8f136607",
+  "expected_commit": "3c688b240d2ee822584828ae8969de3d56ca2abe",
+  "runtime_json": "/home/kaiser/workspace/supermimic_rl/configs/kaiser/runtime-flat.json",
+  "runtime_sha256": "6617e8c7b20288623dc6d33b9d685ad246b84097eb667decc16e7488f5960285",
+  "asset_directory": "/home/kaiser/robot-rl-sim60/experiments/locomotion-v2-assets/stop107_reference_v2",
+  "asset_manifest_sha256": "088e699266fa3dc666379a911b23a30e2038ab3d7f113cab4dcd4bdd0a14279b",
+  "num_envs": 16,
+  "device": "cuda:0",
+  "seed": 7,
+  "formal_reward": true,
+  "terrain_profile": "plane",
+  "normal_load_source": "contact_force_world_z_abs",
+  "episode_commands": {
+    "forward_m_s": [
+      -0.5,
+      0.5
+    ],
+    "yaw_rad_s": [
+      -1,
+      1
+    ],
+    "height_m": [
+      0.23,
+      0.32
+    ],
+    "standing_fraction": 0.25
+  }
+}

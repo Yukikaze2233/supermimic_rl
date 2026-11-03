@@ -1,0 +1,257 @@
+{
+  "schema": "rmcs-dm-friction-offline-candidate-v1",
+  "torque_units": "Nm at DM active output",
+  "passive_friction_torque": "-F(abs(v), angle)*sign(v)",
+  "compensation_torque": "+F(abs(v), angle)*sign(v)",
+  "live_controller_applied": false,
+  "isaac_default_applied": false,
+  "right_symmetry_authorized": true,
+  "beta_reference": "speed table is local to recorded beta about 84 degrees / calibration110 about 89 degrees",
+  "motors": {
+    "left_hip": {
+      "derivation": "left measured, gas-subtracted common-angle bidirectional steady motion",
+      "coulomb_plateau_candidate_nm": 2.019506006848738,
+      "candidate_velocity_domain_rad_s": [
+        0.5998648035019005,
+        3.141729440790122
+      ],
+      "viscous_coefficient_nm_s_rad": null,
+      "viscous_identified": false,
+      "static_breakaway_nm": null,
+      "static_breakaway_identified": false,
+      "stribeck_velocity_rad_s": null,
+      "stribeck_identified": false,
+      "low_speed_moving_friction_nm": 2.1784215484179468,
+      "reference_beta_log_deg": 83.79805796011567,
+      "reference_beta_calibration110_deg": 88.5595192380683,
+      "speed_knots_rad_s": [
+        0.2032634599351369,
+        0.5998648035019005,
+        1.499865143388745,
+        3.141729440790122
+      ],
+      "moving_friction_knots_nm": [
+        2.1784215484179468,
+        2.0348615111154214,
+        1.9913343311163996,
+        2.032322178314393
+      ],
+      "outside_measured_speed_and_posture_domain": "not identified; no validated extrapolation rule",
+      "interpretation": "effective installed motor/gear/bearing/cable moving friction, not isolated motor internals"
+    },
+    "right_hip": {
+      "derivation": "user-authorized left-to-right approximation, not independent right-leg identification",
+      "coulomb_plateau_candidate_nm": 2.019506006848738,
+      "candidate_velocity_domain_rad_s": [
+        0.5998648035019005,
+        3.141729440790122
+      ],
+      "viscous_coefficient_nm_s_rad": null,
+      "viscous_identified": false,
+      "static_breakaway_nm": null,
+      "static_breakaway_identified": false,
+      "stribeck_velocity_rad_s": null,
+      "stribeck_identified": false,
+      "low_speed_moving_friction_nm": 2.1784215484179468,
+      "reference_beta_log_deg": 83.79805796011567,
+      "reference_beta_calibration110_deg": 88.5595192380683,
+      "speed_knots_rad_s": [
+        0.2032634599351369,
+        0.5998648035019005,
+        1.499865143388745,
+        3.141729440790122
+      ],
+      "moving_friction_knots_nm": [
+        2.1784215484179468,
+        2.0348615111154214,
+        1.9913343311163996,
+        2.032322178314393
+      ],
+      "outside_measured_speed_and_posture_domain": "not identified; no validated extrapolation rule",
+      "interpretation": "effective installed motor/gear/bearing/cable moving friction, not isolated motor internals",
+      "symmetry_source": "left_hip"
+    },
+    "left_knee": {
+      "derivation": "left measured, gas-subtracted common-angle bidirectional steady motion",
+      "coulomb_plateau_candidate_nm": 2.047246309400147,
+      "candidate_velocity_domain_rad_s": [
+        0.5998648035019005,
+        3.141729440790122
+      ],
+      "viscous_coefficient_nm_s_rad": null,
+      "viscous_identified": false,
+      "static_breakaway_nm": null,
+      "static_breakaway_identified": false,
+      "stribeck_velocity_rad_s": null,
+      "stribeck_identified": false,
+      "low_speed_moving_friction_nm": 2.301084489046435,
+      "reference_beta_log_deg": 83.79805796011567,
+      "reference_beta_calibration110_deg": 88.5595192380683,
+      "speed_knots_rad_s": [
+        0.2032634599351369,
+        0.5998648035019005,
+        1.499865143388745,
+        3.141729440790122
+      ],
+      "moving_friction_knots_nm": [
+        2.301084489046435,
+        2.080066860283476,
+        2.0154183197709417,
+        2.0462537481460235
+      ],
+      "outside_measured_speed_and_posture_domain": "not identified; no validated extrapolation rule",
+      "interpretation": "effective installed motor/gear/bearing/cable moving friction, not isolated motor internals"
+    },
+    "right_knee": {
+      "derivation": "user-authorized left-to-right approximation, not independent right-leg identification",
+      "coulomb_plateau_candidate_nm": 2.047246309400147,
+      "candidate_velocity_domain_rad_s": [
+        0.5998648035019005,
+        3.141729440790122
+      ],
+      "viscous_coefficient_nm_s_rad": null,
+      "viscous_identified": false,
+      "static_breakaway_nm": null,
+      "static_breakaway_identified": false,
+      "stribeck_velocity_rad_s": null,
+      "stribeck_identified": false,
+      "low_speed_moving_friction_nm": 2.301084489046435,
+      "reference_beta_log_deg": 83.79805796011567,
+      "reference_beta_calibration110_deg": 88.5595192380683,
+      "speed_knots_rad_s": [
+        0.2032634599351369,
+        0.5998648035019005,
+        1.499865143388745,
+        3.141729440790122
+      ],
+      "moving_friction_knots_nm": [
+        2.301084489046435,
+        2.080066860283476,
+        2.0154183197709417,
+        2.0462537481460235
+      ],
+      "outside_measured_speed_and_posture_domain": "not identified; no validated extrapolation rule",
+      "interpretation": "effective installed motor/gear/bearing/cable moving friction, not isolated motor internals",
+      "symmetry_source": "left_knee"
+    }
+  },
+  "speed_table": [
+    {
+      "case": "speed_020",
+      "speed_rad_s": 0.2032634599351369,
+      "beta_log_deg": 83.84305460625686,
+      "beta_current_deg": 88.60513044712336,
+      "friction_h_nm": 2.1784215484179468,
+      "recording_min_h_nm": 2.1638691279796056,
+      "recording_max_h_nm": 2.1929739688562884,
+      "friction_k_nm": 2.301084489046435,
+      "recording_min_k_nm": 2.2944500692246983,
+      "recording_max_k_nm": 2.3077189088681713
+    },
+    {
+      "case": "speed_060",
+      "speed_rad_s": 0.5998648035019005,
+      "beta_log_deg": 83.79525779665123,
+      "beta_current_deg": 88.55668073236156,
+      "friction_h_nm": 2.0348615111154214,
+      "recording_min_h_nm": 2.030515497670605,
+      "recording_max_h_nm": 2.0392075245602372,
+      "friction_k_nm": 2.080066860283476,
+      "recording_min_k_nm": 2.079556260877087,
+      "recording_max_k_nm": 2.0805774596898647
+    },
+    {
+      "case": "speed_150",
+      "speed_rad_s": 1.499865143388745,
+      "beta_log_deg": 83.77973056551104,
+      "beta_current_deg": 88.54094150326864,
+      "friction_h_nm": 1.9913343311163996,
+      "recording_min_h_nm": 1.9896959162221983,
+      "recording_max_h_nm": 1.9929727460106008,
+      "friction_k_nm": 2.0154183197709417,
+      "recording_min_k_nm": 2.011339663786956,
+      "recording_max_k_nm": 2.0194969757549277
+    },
+    {
+      "case": "speed_314",
+      "speed_rad_s": 3.141729440790122,
+      "beta_log_deg": 83.77418887204357,
+      "beta_current_deg": 88.53532426951966,
+      "friction_h_nm": 2.032322178314393,
+      "recording_min_h_nm": 2.0215663757254863,
+      "recording_max_h_nm": 2.0430779809033006,
+      "friction_k_nm": 2.0462537481460235,
+      "recording_min_k_nm": 2.0341329288946683,
+      "recording_max_k_nm": 2.0583745673973786
+    }
+  ],
+  "angle_diagnostics": [
+    {
+      "speed_rad_s": 3.134540961063684,
+      "beta_log_deg": 62.6678793976675,
+      "beta_current_deg": 67.01760841306331,
+      "encoder_delta_rad": 0.8897295623800276,
+      "friction_current_h_nm": 2.07383827075373,
+      "friction_current_k_nm": 2.13068955072855,
+      "case": "angle_ref50",
+      "recordings": 2,
+      "paired_cells_total": 9,
+      "minimum_cells_per_recording": 4,
+      "usage": "diagnostic_only_sparse_constant_speed_pairs"
+    },
+    {
+      "speed_rad_s": 3.1581093263615885,
+      "beta_log_deg": 74.46171312250632,
+      "beta_current_deg": 79.07467837114814,
+      "encoder_delta_rad": 0.6280383548337578,
+      "friction_current_h_nm": 2.0181073616061993,
+      "friction_current_k_nm": 2.1665186144733637,
+      "case": "angle_ref60",
+      "recordings": 1,
+      "paired_cells_total": 5,
+      "minimum_cells_per_recording": 5,
+      "usage": "diagnostic_only_sparse_constant_speed_pairs"
+    },
+    {
+      "speed_rad_s": 3.1613662419391324,
+      "beta_log_deg": 88.09226658322024,
+      "beta_current_deg": 92.90915571745253,
+      "encoder_delta_rad": 0.34158618074964986,
+      "friction_current_h_nm": 2.060763408792993,
+      "friction_current_k_nm": 1.972933775510659,
+      "case": "angle_ref75",
+      "recordings": 2,
+      "paired_cells_total": 7,
+      "minimum_cells_per_recording": 3,
+      "usage": "diagnostic_only_sparse_constant_speed_pairs"
+    },
+    {
+      "speed_rad_s": 3.1190914235516685,
+      "beta_log_deg": 98.07862828864836,
+      "beta_current_deg": 103.00015935706618,
+      "encoder_delta_rad": 0.13865867608142707,
+      "friction_current_h_nm": 1.276315563378703,
+      "friction_current_k_nm": 1.4886491124339818,
+      "case": "angle_ref90",
+      "recordings": 1,
+      "paired_cells_total": 1,
+      "minimum_cells_per_recording": 1,
+      "usage": "diagnostic_only_sparse_constant_speed_pairs"
+    },
+    {
+      "speed_rad_s": 3.1519452455538426,
+      "beta_log_deg": 102.58685142710598,
+      "beta_current_deg": 107.54671787231516,
+      "encoder_delta_rad": 0.04842924015057578,
+      "friction_current_h_nm": 1.321883341062171,
+      "friction_current_k_nm": 0.9583583762061308,
+      "case": "angle_ref100",
+      "recordings": 2,
+      "paired_cells_total": 2,
+      "minimum_cells_per_recording": 1,
+      "usage": "diagnostic_only_sparse_constant_speed_pairs"
+    }
+  ],
+  "angle_diagnostics_are_validated_model_knots": false,
+  "unmeasured_static_and_viscous_parameters_are_null": true
+}

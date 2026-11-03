@@ -1,0 +1,16 @@
+{
+  "upstream_root": "/root/gpufree-data/supermimic_sources/transformer_rl-41e8280",
+  "expected_commit": "41e8280ea87f686b51be78dc3eb208f95bf0da71",
+  "runtime_json": "/root/gpufree-data/supermimic_rl_claude/configs/gpufree/runtime-physx-tgs12-6.json",
+  "runtime_sha256": "e31f7d63c02beaf8c18cf3e12918dfe922a07c59b108e9a0de9aa75efd6d19d0",
+  "course_json": "/root/gpufree-data/supermimic_rl/configs/gpufree/course.json",
+  "course_sha256": "f9fdd5b2e8b68fd2b4f047d1a8efe7336e9ea79a04ecd08898dd8a90ae66db0a",
+  "asset_directory": "/root/gpufree-data/supermimic_rl/assets/full_vehicle_v2p0p1_source_audited_v2",
+  "asset_manifest_sha256": "e726d23c4d3cc5bb8c0eec2fb396daa2e3c825979bf39497cf335d85c371bd2c",
+  "identified_bundle": "/root/gpufree-data/supermimic_rl/configs/identified/20261031",
+  "num_envs": 64,
+  "device": "cuda:0",
+  "seed": 7,
+  "record_substeps": true,
+  "substep_audit": true
+}

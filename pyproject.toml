@@ -1,0 +1,25 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "supermimic-rl"
+version = "0.1.0"
+description = "Differentiable world-model learning for a closed-chain wheeled-legged robot"
+requires-python = ">=3.11"
+dependencies = ["torch>=2.7,<3", "numpy>=1.26"]
+
+[project.optional-dependencies]
+test = ["pytest>=8"]
+train = ["tensorboard>=2.18"]
+
+[project.scripts]
+supermimic-rl = "supermimic_rl.cli:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+# tests/ holds the shared `support` package used by test modules.
+pythonpath = ["src", "tests"]

@@ -1,0 +1,42 @@
+{
+  "schema": "dm-leg-moving-friction-v1",
+  "torque_units": "Nm at DM active output",
+  "joint_names": [
+    "L_joint1",
+    "LL_joint1",
+    "R_joint1",
+    "RR_joint1"
+  ],
+  "motor_names": [
+    "left_hip",
+    "left_knee",
+    "right_hip",
+    "right_knee"
+  ],
+  "coulomb_nm": [
+    2.019506006848738,
+    2.047246309400147,
+    2.019506006848738,
+    2.047246309400147
+  ],
+  "viscous_coefficient_nm_s_rad": null,
+  "static_breakaway_nm": null,
+  "stribeck_velocity_rad_s": null,
+  "numerical_regularization": {
+    "kind": "linear_velocity_band",
+    "velocity_rad_s": 0.05,
+    "identified": false
+  },
+  "physical_static_model_enabled": false,
+  "bias_applied": false,
+  "controller_compensation": false,
+  "outside_identified_domain": "constant_coulomb_prior_not_identified",
+  "low_speed_table_usage": "evidence only; low-speed moving friction is not a static peak",
+  "files_sha256": {
+    "parameters.json": "87e8f191c8fd18787a7b435c66b5e292b1b287f6b62a8ac80ab1d7791b236a57",
+    "README.md": "7bc6138fd690a93ad757ebd4afe6d26c2e10de8a92c43cf371d98147a70c8568"
+  },
+  "source_directory": "/home/noir/Documents/workspace/RMCS/reports/dm_leg_friction_20261031",
+  "source_parameter_sha256": "87e8f191c8fd18787a7b435c66b5e292b1b287f6b62a8ac80ab1d7791b236a57",
+  "hardware_ready": false
+}

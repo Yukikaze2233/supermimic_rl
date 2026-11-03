@@ -1,0 +1,5 @@
+{
+  "updates": 2000,
+  "checkpoint_interval": 100,
+  "curriculum_transition_cap": 0
+}

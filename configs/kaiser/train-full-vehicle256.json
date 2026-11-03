@@ -1,0 +1,81 @@
+{
+  "run": {
+    "seed": 7,
+    "updates": 3000,
+    "warmup_steps": 256,
+    "collection_steps": 8,
+    "replay_steps": 512,
+    "model_batches": 10,
+    "model_batch_size": 256,
+    "imagination_batch_size": 256,
+    "validation_batch_size": 64,
+    "validation_fraction": 0.125,
+    "action_noise_std": 0.1,
+    "checkpoint_interval": 25,
+    "tensorboard": false,
+    "initial_world_batches": 1000,
+    "evaluation_interval": 0,
+    "evaluation_steps": 1000
+  },
+  "learning": {
+    "model_hidden": [
+      512,
+      512,
+      512
+    ],
+    "actor_hidden": [
+      256,
+      128,
+      64
+    ],
+    "critic_hidden": [
+      256,
+      128,
+      64
+    ],
+    "history_length": 5,
+    "fit_horizon": 8,
+    "imagination_horizon": 32,
+    "learning_rate": 0.0002,
+    "gamma": 0.99,
+    "gae_lambda": 0.95,
+    "critic_epochs": 5,
+    "critic_minibatches": 4,
+    "gradient_clip": 1.0,
+    "actor_element_clip": 0.1,
+    "actor_architecture": "transferred_transformer",
+    "actor_policy_config": {
+      "body_ffn": 64,
+      "body_heads": 2,
+      "body_width": 32,
+      "critic_hidden_dims": [
+        256,
+        128,
+        64
+      ],
+      "critic_input_dim": 185,
+      "estimate_log_std_max": 2.0,
+      "estimate_log_std_min": -4.0,
+      "gate_bias": -2.0,
+      "history_length": 5,
+      "initial_leg_std": 0.75,
+      "initial_wheel_std": 0.35,
+      "leg_hidden_dims": [
+        64,
+        32
+      ],
+      "mean_init_scale": 0.01,
+      "mirror_canonical": true,
+      "prediction_hidden_dim": 32,
+      "state_hidden_dim": 32,
+      "temporal_ffn": 128,
+      "temporal_heads": 4,
+      "temporal_layers": 2,
+      "temporal_width": 64,
+      "wheel_hidden_dims": [
+        64,
+        32
+      ]
+    }
+  }
+}

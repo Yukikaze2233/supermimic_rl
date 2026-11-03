@@ -1,0 +1,156 @@
+{
+  "action_transport": {
+    "enabled": false,
+    "delays_steps": [
+      0
+    ],
+    "nominal_fraction": 1.0
+  },
+  "asset_directory": "/home/kaiser/workspace/supermimic_assets/full-vehicle-v2p0p1-audited-20261101",
+  "authorized_boot": "f165a503-97f5-49d5-a1d8-c0f274c7f524",
+  "communication": {
+    "enabled": false,
+    "total_delay_range_s": [
+      0.0001,
+      0.002
+    ],
+    "uplink_fraction": 1.0
+  },
+  "dynamics": {
+    "base_com_offset_m": [
+      0.04,
+      0.02,
+      0.02
+    ],
+    "base_mass_scale": [
+      0.9,
+      1.3
+    ],
+    "link_mass_scale": [
+      0.9,
+      1.1
+    ],
+    "nominal_fraction": 1.0
+  },
+  "environment_spacing_m": 2.0,
+  "episode_randomization": {
+    "enabled": false,
+    "full_at_update": 5000,
+    "spring_force_scale": [
+      0.9,
+      1.1
+    ],
+    "leg_strength": [
+      0.8,
+      1.0
+    ],
+    "wheel_strength": [
+      0.9,
+      1.0
+    ],
+    "leg_encoder_bias_rad": 0.035,
+    "no_load_speed_scale": [
+      0.92,
+      1.05
+    ],
+    "leg_time_constant_scale": [
+      1.0,
+      2.5
+    ],
+    "push_interval_s": [
+      5.0,
+      10.0
+    ],
+    "push_linear_m_s": 0.25,
+    "push_yaw_rad_s": 0.0,
+    "wrench_interval_s": [
+      5.0,
+      10.0
+    ],
+    "external_force_n": 10.0,
+    "external_torque_nm": 1.0
+  },
+  "format": "managed_lab_runtime_v4",
+  "pair_domain": null,
+  "physics": {},
+  "profile_collection": false,
+  "response_source_pin": {
+    "bytes": 2080,
+    "path": "/home/kaiser/robot-rl-sim60/experiments/formal-course-20261021-8e971a70/frozen_assets/response_source.json",
+    "sha256": "438a135765b1dcfd8440271aafe2491a3a8de9b8e7535d8c9c74bd747e351c04"
+  },
+  "sensors": {
+    "extra_delay_probability": 0.0,
+    "gravity_halfwidth": 0.0,
+    "gyro_halfwidth_rad_s": 0.0,
+    "leg_position_halfwidth_rad": 0.0,
+    "leg_velocity_halfwidth_rad_s": 0.0,
+    "nominal_episode_fraction": 0.0,
+    "observation_delays_s": [
+      0.0
+    ],
+    "physics_dt_s": 0.005,
+    "policy_dt_s": 0.02,
+    "wheel_velocity_halfwidth_rad_s": 0.0,
+    "shared_delay": true
+  },
+  "task": {
+    "action_bounds": [
+      3.0,
+      3.0,
+      3.0,
+      3.0,
+      9.0,
+      9.0
+    ],
+    "action_rate_cost": 0.01,
+    "base_contact_force_n": 30.0,
+    "effort_cost": 0.0001,
+    "failure_tilt_rad": 1.2,
+    "forward_sigma_m_s": 0.35,
+    "forward_weight": 3.0,
+    "height_sigma_m": 0.025,
+    "height_weight": 2.0,
+    "lateral_cost": 0.5,
+    "minimum_height_m": 0.08,
+    "minimum_recovery_height_m": 0.01,
+    "nominal_height_m": 0.32,
+    "vertical_cost": 0.2,
+    "yaw_sigma_rad_s": 0.5,
+    "yaw_weight": 2.0
+  },
+  "termination_limits": {
+    "failure_tilt_rad": 0.6981317007977318,
+    "forbidden_body_load_n": 1.0,
+    "forbidden_body_names": [
+      "base_link"
+    ],
+    "forbidden_contact_confirm_s": 0.4,
+    "healthy_tilt_rad": 0.5,
+    "knee_pivot_residual_m": 0.01,
+    "minimum_normal_height_m": 0.08,
+    "minimum_recovery_height_m": 0.01,
+    "passive_knee_overrun_rad": 0.02,
+    "preparation_timeout_s": 5.0,
+    "pose_failure_confirm_s": 0.4
+  },
+  "terrain_atlas_pin": {
+    "bytes": 92507,
+    "path": "/home/kaiser/robot-rl-sim60/experiments/timing-course-cpu-check-11ab872f/atlas/manifest.json",
+    "sha256": "2a4e2fa0ecf2d8a23a51f7692fac6d6fe53070a596e216d24eb3d2241768b161"
+  },
+  "wheel_material": null,
+  "action_latch": {
+    "enabled": true,
+    "delay_substeps": [
+      1,
+      2
+    ],
+    "nominal_fraction": 0.0
+  },
+  "motor_envelope": {
+    "enabled": true
+  },
+  "command_pool": null,
+  "birth_randomization": null
+}

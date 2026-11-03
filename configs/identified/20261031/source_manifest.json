@@ -1,0 +1,50 @@
+{
+  "schema": "identified-execution-source-bundle-v1",
+  "source_commit": "444749daa37bba264bcfa014a641216018702d55",
+  "files": {
+    "wheel_model.json": {
+      "remote_path": "/home/kaiser/workspace/isaac_sim-6-task-200hz/model/wheel_leg_v2.0.2/friction_v1/training/wheel_model.json",
+      "sha256": "01d52214771bb9dea2cb592eff4dc6fbd27bb096faa90ff1e17b5d898a1e877c"
+    },
+    "leg_model.json": {
+      "remote_path": "/home/kaiser/workspace/isaac_sim-6-task-200hz/model/dm_leg_friction_20261031/model.json",
+      "sha256": "90d299995f24ba38e6c1ed67e32dd40b9b2fa26e041f2f814db1e177ac040b52"
+    },
+    "leg_parameters.json": {
+      "remote_path": "/home/kaiser/workspace/isaac_sim-6-task-200hz/model/dm_leg_friction_20261031/parameters.json",
+      "sha256": "87e8f191c8fd18787a7b435c66b5e292b1b287f6b62a8ac80ab1d7791b236a57"
+    },
+    "gas_spring_model.json": {
+      "remote_path": "/home/kaiser/workspace/isaac_sim-6-task-200hz/model/wheel_leg_v2.0.2/friction_v1/training/gas_spring_model.json",
+      "sha256": "698f67ccc7d6364b73f1b426ed3e6386ffc9e11912ef95a89d716eb7ee0e06b9"
+    },
+    "gas_spring_source.json": {
+      "remote_path": "/home/kaiser/workspace/isaac_sim-6-task-200hz/model/gas_spring_identified_symmetric_20261028/model.json",
+      "sha256": "eb0c709e8915c14a4cb852551a6079af89a6f4b8a9d135751fdf86cc98c1baf0"
+    },
+    "reference_source/identified_wheel_response.py": {
+      "remote_path": "/home/kaiser/workspace/isaac_sim-6-task-200hz/src/wheeled_tasks/chassis/identified_wheel_response.py",
+      "sha256": "775451a040d28c52b775c12d9c8cd35660a597168ff1beda92a54aa9126858c8"
+    },
+    "reference_source/leg_motor_friction.py": {
+      "remote_path": "/home/kaiser/workspace/isaac_sim-6-task-200hz/src/wheeled_tasks/chassis/leg_motor_friction.py",
+      "sha256": "09473ff4559826416685ba09495af758a3288afd2e4bc90879feeb58be2e12d6"
+    },
+    "reference_source/gas_spring_compensation.py": {
+      "remote_path": "/home/kaiser/workspace/isaac_sim-6-task-200hz/src/wheeled_tasks/chassis/gas_spring_compensation.py",
+      "sha256": "47fe59b4dd385c74702ef0d52ae5d81ddaeecaa57eb4d7f3f0d00c259c50e14b"
+    },
+    "reference_source/v5_control.py": {
+      "remote_path": "/home/kaiser/workspace/isaac_sim-6-task-200hz/src/wheeled_tasks/chassis/v5_control.py",
+      "sha256": "141e21d88513e5f8cccdb6cdbf19abcd66f433c6e0ccb3cd7e93d5afc0c7c7fe"
+    },
+    "identified_model_spec.json": {
+      "remote_path": "/home/kaiser/workspace/isaac_sim-6-task-200hz/model/wheel_leg_v2.0.2/friction_v1/training/model_spec.json",
+      "sha256": "8a9d759525c48955e8965b2e14b9e158c1d8fc9f3d68f33e4024a3c94bf8f812"
+    },
+    "leg_README.md": {
+      "remote_path": "/home/kaiser/workspace/isaac_sim-6-task-200hz/model/dm_leg_friction_20261031/README.md",
+      "sha256": "7bc6138fd690a93ad757ebd4afe6d26c2e10de8a92c43cf371d98147a70c8568"
+    }
+  }
+}

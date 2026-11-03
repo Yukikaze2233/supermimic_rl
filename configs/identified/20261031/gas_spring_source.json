@@ -1,0 +1,95 @@
+{
+  "kind": "effective_monotone_table",
+  "compression_domain_m": [
+    0.022997316706837613,
+    0.061786172348818356
+  ],
+  "beta_domain_deg": [
+    56.0,
+    101.0
+  ],
+  "physical_pressure_identified": false,
+  "side": "left",
+  "compression_knots_m": [
+    0.022997316706837613,
+    0.023851879860738903,
+    0.024710385829300824,
+    0.0255726206601143,
+    0.026438366973481182,
+    0.02730740393265295,
+    0.029054448982586897,
+    0.03257791966534841,
+    0.037017290950069205,
+    0.0414655126583645,
+    0.04588815350788536,
+    0.05024846638999555,
+    0.05450746504313243,
+    0.058624096921555034,
+    0.06022134543002581,
+    0.061786172348818356
+  ],
+  "force_knots_n": [
+    86.96568880192817,
+    131.180235008863,
+    185.6833378164023,
+    309.43303430630766,
+    346.73845194767057,
+    346.73845194774657,
+    350.9023784132604,
+    366.38968062207243,
+    391.0983361312043,
+    415.32100551306803,
+    446.8609801438889,
+    476.8546490648272,
+    508.4192241986821,
+    548.7025541907423,
+    567.0002991924416,
+    589.4892440110364
+  ],
+  "schema_version": 1,
+  "status": "native_static_validated_symmetric_assumption",
+  "gas_pressure_pa": null,
+  "extrapolation": "reject",
+  "extended_pin_distance_m": 0.232,
+  "stroke_m": 0.08,
+  "spring_slide_compression_at_q_zero_m": 0.06972718009112547,
+  "motor_order": [
+    "L_joint1",
+    "LL_joint1"
+  ],
+  "holding_torque_rule": "Use each leg's own -J_length.T*F; mirror geometry changes motor signs, axial force stays positive",
+  "fitted_mean_load_only": true,
+  "direction_friction_enabled": false,
+  "production_default_replaced": false,
+  "training_started": false,
+  "source_sha256": {
+    "/home/noir/Documents/workspace/wheel_leg扫频/wheel_leg_膝关节气簧辨识数据.csv": "17d8ebf42472573a28a85352df0584b964ec4ecc183d4b26e29d5f4c729dc0ba",
+    "/home/noir/wheel_leg_joints_2026-10-27_14-13-22.csv": "abc75e2fb5791cca1ff7e3d74f2d5f9694fa5a29e838820e5e55f6e601c21e02"
+  },
+  "asset_files_sha256": {
+    "manifest.json": "875fa71e89d4d669af0a5471b2334f878d302e06f1b354fc245b95cb5d6f29ba",
+    "model_spec.json": "7429f6e59369e590e0fd96cba8b45fd60c362a0231c4bcc2e80a4c4688eadd88",
+    "robot.usda": "f9a1e4a9350ff0d98af187ed287f73428a10ed339c9ef7b9de04688fa30f0f98",
+    "fit_10mpa.json": "85d9712eb240c9719752930f7ada6c08d8323358f9775de3b1c7f29ce80183b9"
+  },
+  "validation_report": "/home/noir/Documents/workspace/isaac_wheeled_rl_train/reports/gas_spring_real2sim_20261027/symmetric_20261028/validation_receipt.json",
+  "calibration_side": "left",
+  "application_sides": [
+    "left",
+    "right"
+  ],
+  "right_leg_symmetry_assumed": true,
+  "right_leg_measured": false,
+  "right_leg_authority": "User instruction: temporarily assume right leg symmetric to left",
+  "motor_order_by_side": {
+    "left": [
+      "L_joint1",
+      "LL_joint1"
+    ],
+    "right": [
+      "R_joint1",
+      "RR_joint1"
+    ]
+  },
+  "calibration_validation_report": "/home/noir/Documents/workspace/isaac_wheeled_rl_train/reports/gas_spring_real2sim_20261027/validation_receipt.json"
+}

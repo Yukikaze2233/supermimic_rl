@@ -1,0 +1,50 @@
+{
+  "run": {
+    "seed": 7,
+    "updates": 6400,
+    "warmup_steps": 64,
+    "collection_steps": 16,
+    "replay_steps": 512,
+    "model_batches": 8,
+    "model_batch_size": 256,
+    "imagination_batch_size": 512,
+    "validation_batch_size": 128,
+    "validation_fraction": 0.125,
+    "action_noise_std": 0.1,
+    "checkpoint_interval": 100,
+    "tensorboard": true,
+    "initial_world_batches": 0,
+    "evaluation_interval": 0,
+    "evaluation_steps": 1000,
+    "world_pretrain_iterations": 60,
+    "world_pretrain_collection_steps": 16
+  },
+  "learning": {
+    "model_hidden": [
+      512,
+      512,
+      512
+    ],
+    "actor_hidden": [
+      256,
+      128,
+      64
+    ],
+    "critic_hidden": [
+      256,
+      128,
+      64
+    ],
+    "history_length": 5,
+    "fit_horizon": 8,
+    "imagination_horizon": 16,
+    "learning_rate": 0.0002,
+    "gamma": 0.99,
+    "gae_lambda": 0.95,
+    "critic_epochs": 5,
+    "critic_minibatches": 4,
+    "gradient_clip": 1.0,
+    "actor_element_clip": 0.1,
+    "actor_architecture": "history_mlp"
+  }
+}

@@ -1,0 +1,198 @@
+{
+  "schema": "identified-wheel-response-v1",
+  "gear_ratio": 15.62,
+  "bus_voltage_v": 24.0,
+  "coordinate": "wheel_output",
+  "controller_velocity_p_nm_per_rad_s": 0.5,
+  "software_torque_cap_nm": 4.5,
+  "current_conversion_peak_nm": 4.880434419381787,
+  "axes": {
+    "L_joint3": {
+      "side": "left",
+      "effective_total_inertia_kg_m2": 0.004269571255748743,
+      "cad_inertia_kg_m2": 0.0005832499999999998,
+      "additional_armature_kg_m2": 0.0036863212557487436,
+      "friction_speed_knots_rad_s": [
+        0.75,
+        2.0,
+        6.0,
+        12.0,
+        20.0,
+        35.75,
+        48.75,
+        55.25
+      ],
+      "moving_friction_nm": [
+        0.041392965355212,
+        0.04635881917133683,
+        0.05207525339656162,
+        0.05449486963749839,
+        0.055020881181436186,
+        0.052411631970080585,
+        0.05484968217269762,
+        0.05921630006263292
+      ],
+      "direction_bias_nm": 0.000345880302504356,
+      "aggregate_delay_s": 0.0055,
+      "powered_resistance_diagnostic_nm": [
+        0.041392965355212,
+        0.04635881917133683,
+        0.05397570064148991,
+        0.055117125853098185,
+        0.056748679158864695,
+        0.0540052908550307,
+        0.05522918972850393,
+        0.06757527399120268
+      ],
+      "moving_friction_source": "powered low-speed excitation up to 2rad/s; zero-current training coasts above 6rad/s; interpolate between",
+      "static_breakaway_nominal_nm": 0.19,
+      "static_breakaway_observed_interval_nm": [
+        0.15,
+        0.23
+      ],
+      "static_breakaway_exactly_identified": false,
+      "high_speed_envelope": {
+        "measured_airborne_plateau_rad_s": [
+          59.27862194417616,
+          58.79591884759386
+        ],
+        "measured_plateau_p05_p95_rad_s": [
+          [
+            59.164650379705336,
+            59.392593508646975
+          ],
+          [
+            58.70876412182206,
+            58.889777783040415
+          ]
+        ],
+        "zero_torque_speed_rad_s": [
+          59.35708336577695,
+          58.87283752365476
+        ],
+        "rolloff_slope_nm_per_rad_s": [
+          0.7591269588280473,
+          0.7653592440088477
+        ],
+        "rolloff_width_fraction_prior": 0.1,
+        "rolloff_width_randomization_recommendation": [
+          0.05,
+          0.2
+        ],
+        "loaded_torque_speed_curve_identified": false,
+        "braking": "retain independent 4.5Nm software cap; do not collapse braking with motoring speed limit"
+      }
+    },
+    "R_joint3": {
+      "side": "right",
+      "effective_total_inertia_kg_m2": 0.004366774166460313,
+      "cad_inertia_kg_m2": 0.0005832499999999998,
+      "additional_armature_kg_m2": 0.0037835241664603133,
+      "friction_speed_knots_rad_s": [
+        0.75,
+        2.0,
+        6.0,
+        12.0,
+        20.0,
+        35.75,
+        48.75,
+        55.25
+      ],
+      "moving_friction_nm": [
+        0.14020281398281045,
+        0.16001039895309335,
+        0.21388960480995,
+        0.22182155107416107,
+        0.21075946885507976,
+        0.23114733871267137,
+        0.253521971957936,
+        0.2733241741888768
+      ],
+      "direction_bias_nm": 0.007037543830024003,
+      "aggregate_delay_s": 0.0035,
+      "powered_resistance_diagnostic_nm": [
+        0.14020281398281045,
+        0.16001039895309335,
+        0.2097282727938093,
+        0.2149999564345179,
+        0.21926029489243967,
+        0.23447913885684385,
+        0.25372092942550567,
+        0.2654807088786922
+      ],
+      "moving_friction_source": "powered low-speed excitation up to 2rad/s; zero-current training coasts above 6rad/s; interpolate between",
+      "static_breakaway_nominal_nm": 0.375,
+      "static_breakaway_observed_interval_nm": [
+        0.3,
+        0.45
+      ],
+      "static_breakaway_exactly_identified": false,
+      "high_speed_envelope": {
+        "measured_airborne_plateau_rad_s": [
+          57.13327484825482,
+          56.7712475258181
+        ],
+        "measured_plateau_p05_p95_rad_s": [
+          [
+            56.94555697736171,
+            57.287471670774174
+          ],
+          [
+            56.57682544525024,
+            56.958965396711214
+          ]
+        ],
+        "zero_torque_speed_rad_s": [
+          57.489230028088215,
+          57.107190285927395
+        ],
+        "rolloff_slope_nm_per_rad_s": [
+          0.787632078145693,
+          0.7926547673544633
+        ],
+        "rolloff_width_fraction_prior": 0.1,
+        "rolloff_width_randomization_recommendation": [
+          0.05,
+          0.2
+        ],
+        "loaded_torque_speed_curve_identified": false,
+        "braking": "retain independent 4.5Nm software cap; do not collapse braking with motoring speed limit"
+      }
+    }
+  },
+  "source_files": [
+    {
+      "path": "/home/noir/Documents/workspace/wheel_leg扫频/wheel_leg_轮子低速辨识数据.csv",
+      "sha256": "9435cda103468a8dd3ef88188da0d418dc0e6bf09b72eb52d893bd1551735c12",
+      "new_gearbox_confirmed": true
+    },
+    {
+      "path": "/home/noir/Documents/workspace/wheel_leg扫频/wheel_leg_轮子高速辨识数据.csv",
+      "sha256": "a0dd1035621e67f93f827adefaa2ca18cd106a9e3b3a8678c7811cf3f058896a",
+      "new_gearbox_confirmed": true
+    }
+  ],
+  "status": "airborne_identified_candidate",
+  "scope": "new gearbox wheel-output effective dynamics; independent left/right; research real2sim",
+  "uncertainty": {
+    "inertia_scale_training_prior": [
+      0.94,
+      1.06
+    ],
+    "friction_variation": "Use retained zero-current decays and temperature variation; do not confuse hold tracking error with a full plant validation.",
+    "delay": "3.0-6.0ms between training directions; aggregate effective I/O, not isolated shaft-torque latency.",
+    "loaded_capacity": "No dynamometer/ground-load data; high-speed rolloff shape remains a randomized prior."
+  },
+  "limitations": [
+    "Airborne data identifies effective output inertia/losses, not tire-ground contact or traction.",
+    "Torque is nominal C620 current conversion, not a shaft torque sensor; inertia is relative to that scale.",
+    "Aggregate command-to-reported-RPM delay must replace overlapping transport/feedback delays, not be added twice.",
+    "No-load maximum speeds are measured. High-speed rolloff width and loaded torque-speed capacity are explicit priors.",
+    "Static breakaway is bounded by these records; position-dependent cogging/presliding is not uniquely identified."
+  ],
+  "asset_rebinding": {
+    "source_model_sha256": "2c67e1113f0a460cd477e3ec6897e258619304a69879da3acabec148bb61823d",
+    "model_spec_sha256": "8a9d759525c48955e8965b2e14b9e158c1d8fc9f3d68f33e4024a3c94bf8f812",
+    "rule": "same measured total inertia minus new CAD axial inertia; no refit"
+  }
+}
