@@ -116,15 +116,17 @@ def create_course(configuration):
 
         from ..reward_kernel import RewardExtensions
 
-        reward_kernel_receipt = install_shared_reward(
-            native._formal_reward.composer, verify_native=configuration.get("audit_reward_kernel", False),
-            extensions=RewardExtensions(**configuration.get("reward_extensions", {})),
-            jump_tasks=native._terrain_course.tasks)
         build_scope.close()
         health = strategy.course_health(health, native)
         curriculum = make_course_curriculum(configuration["num_envs"], configuration["device"],
                                             configuration.get("seed", 7), course_configuration)
         native.set_task_sampler(LabTaskDrawSampler(curriculum))
+        # The native sampler installation creates LabTerrainCourse and its
+        # jump task owner; the environment constructor leaves it unset.
+        reward_kernel_receipt = install_shared_reward(
+            native._formal_reward.composer, verify_native=configuration.get("audit_reward_kernel", False),
+            extensions=RewardExtensions(**configuration.get("reward_extensions", {})),
+            jump_tasks=native._terrain_course.tasks)
         course_schedule_receipt = install_jump_first_command_pool(native._terrain_course.tasks, curriculum)
         jump_takeoff_receipt = stair_label_receipt = None
         if configuration.get("jump_takeoff") is not None:
