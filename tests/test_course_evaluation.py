@@ -238,6 +238,137 @@ def test_phase_partition_and_terrain_metadata_belong_to_the_pre_reset_interval()
     assert evaluator.sample() is None
 
 
+def test_recovery_phase_uses_native_pre_action_active_even_after_new_command_draw():
+    from transformer_rl.formal.lab_env.recovery_lifecycle import RecoveryLifecycle
+    from supermimic_rl.course.recovery_evaluation import RecoveryEvaluation
+
+    n = 3
+    recovery = RecoveryLifecycle(n)
+    recovery.reset(torch.arange(n), torch.tensor([True, False, False]))
+    router = SimpleNamespace(tile=torch.zeros(n, dtype=torch.long), step_table=torch.zeros(1),
+        slope_table=torch.zeros(1), roughness_table=torch.zeros(1))
+    counters = {'physical_request_outcomes': {}, 'request_end_counts': {},
+                'recovery': {'counts': {}}, 'authored_stair_completion': {}}
+    env = SimpleNamespace(_episode_id=torch.ones(n, dtype=torch.long),
+        _terrain_course=SimpleNamespace(recovery=recovery, router=router, metrics=lambda: counters))
+    evaluator = CourseEvaluation(SimpleNamespace(env=env))
+    evaluator.schema = StateSchema((Field('unused', ()),), ())
+    evaluator.before, evaluator._active = counters, True
+    evaluator.plan = SimpleNamespace(names=('recovery_fixture',), row_names=('recovery_fixture',) * n,
+        command_source=torch.ones(n, dtype=torch.long), description=lambda: {})
+    evaluator.recovery_evidence = RecoveryEvaluation(env, evaluator.plan.row_names)
+    evaluator.recovery_evidence.install()
+    evaluator.recovery_evidence.after_handoff[1] = True
+    context = evaluator.sample()
+    # Handoff/reset can change all live values before the completed interval is recorded.
+    recovery.active.zero_()
+    evaluator.recovery_evidence.after_handoff.zero_()
+    evaluator.plan.command_source.fill_(2)
+    snapshot = Snapshot(torch.zeros(n, 1), torch.zeros(n, 35), torch.zeros(n, 11), torch.empty(n, 0),
+        torch.ones(n, dtype=torch.long), torch.zeros(n, dtype=torch.long), torch.ones(n, dtype=torch.bool))
+    transition = Transition(snapshot, torch.zeros(n, 6), snapshot, torch.tensor([1., 2., 3.]),
+        torch.zeros(n, dtype=torch.bool), torch.zeros(n, dtype=torch.bool), torch.ones(n, dtype=torch.bool))
+    try:
+        evaluator.step(transition, NativeTrackingSample(torch.ones(n, 3), torch.zeros(n, 3), course=context))
+        report = evaluator.summary()
+        bucket = report['buckets']['recovery_fixture']
+        phases = bucket['recovery_phases']
+        assert set(phases) == {'recovery', 'post_handoff_tracking', 'other'}
+        assert phases['recovery']['reward_sum'] == 1
+        assert phases['post_handoff_tracking']['reward_sum'] == 2
+        assert bucket['command_phases']['scheduled_segment']['samples'] == 3
+        assert sum(value['samples'] for value in phases.values()) == bucket['samples']
+        assert 'recovery_active' not in bucket['routed_terrain_ranges']
+        assert report['recovery_diagnostics']['by_scenario']['recovery_fixture']['births'] == 1
+    finally:
+        evaluator.close()
+    assert 'finish_interval' not in recovery.__dict__
+
+
+def test_begin_cleans_up_partially_installed_recovery_hooks(monkeypatch):
+    from transformer_rl.formal.lab_env.recovery_lifecycle import RecoveryLifecycle
+    from supermimic_rl.course import evaluation
+
+    class Plan:
+        def __init__(self, adapter, config):
+            self.row_names = ('recovery_fixture',)
+            self.installed = False
+
+        def install(self):
+            self.installed = True
+
+        def close(self):
+            self.installed = False
+
+    owner = RecoveryLifecycle(1)
+    owner.reset(torch.tensor([0]), torch.tensor([True]))
+    env = SimpleNamespace(_episode_id=torch.ones(1, dtype=torch.long),
+        _terrain_course=SimpleNamespace(recovery=owner, metrics=lambda: {}))
+    evaluator = CourseEvaluation(SimpleNamespace(env=env, reset=lambda: None))
+    original_install = evaluation.RecoveryEvaluation.install
+
+    def fail_after_install(self):
+        original_install(self)
+        raise RuntimeError('incomplete install fixture')
+
+    monkeypatch.setattr(evaluation, 'FixedCourseScenarios', Plan)
+    monkeypatch.setattr(evaluation.RecoveryEvaluation, 'install', fail_after_install)
+    with pytest.raises(RuntimeError, match='incomplete install fixture'):
+        evaluator.begin(StateSchema((Field('unused', ()),), ()))
+    assert not evaluator.plan.installed and not evaluator._active
+    for name in ('observe_physics', 'finish_interval', 'reset'):
+        assert name not in owner.__dict__
+
+
+def test_native_jump_request_reaches_course_report_and_hooks_restore(monkeypatch):
+    from supermimic_rl.course import evaluation
+    from support.world_v2.jump_task import native_jumps
+    from transformer_rl.formal.lab_env.course_tasks import RequestCommand
+    from transformer_rl.formal.tasks.protocol import CompletedEstimate
+
+    class Plan:
+        def __init__(self, adapter, config):
+            self.names = self.row_names = ('jump_fixture',)
+
+        def install(self):
+            pass
+
+        def close(self):
+            pass
+
+        def description(self):
+            return {}
+
+    env = native_jumps()
+    env._episode_id = torch.zeros(1, dtype=torch.long)
+    env._interval_policy_owned = torch.ones(1, dtype=torch.bool)
+    counters = {'physical_request_outcomes': {}, 'request_end_counts': {},
+                'recovery': {'counts': {}}, 'authored_stair_completion': {}}
+    env._terrain_course.metrics = lambda: counters
+    evaluator = CourseEvaluation(SimpleNamespace(env=env, reset=lambda: None))
+    monkeypatch.setattr(evaluation, 'FixedCourseScenarios', Plan)
+    evaluator.begin(StateSchema((Field('unused', ()),), ()))
+    tasks = env._terrain_course.tasks
+    try:
+        now = torch.tensor([.02], dtype=torch.float64)
+        estimate = CompletedEstimate(torch.zeros(1), torch.ones(1, 2), torch.zeros(1), torch.zeros(1),
+                                     now - .01, torch.ones(1, dtype=torch.bool))
+        tasks.step(now, estimate, torch.zeros(1),
+            command=RequestCommand(torch.tensor([7]), torch.tensor([.06]), torch.tensor([-1])))
+        snapshot = Snapshot(torch.zeros(1, 1), torch.zeros(1, 35), torch.zeros(1, 11), torch.empty(1, 0),
+            torch.zeros(1, dtype=torch.long), torch.zeros(1, dtype=torch.long), torch.ones(1, dtype=torch.bool))
+        evaluator.step(Transition(snapshot, torch.zeros(1, 6), snapshot, torch.ones(1),
+            torch.zeros(1, dtype=torch.bool), torch.zeros(1, dtype=torch.bool), torch.ones(1, dtype=torch.bool)), None)
+        request = evaluator.summary()['jump_diagnostics']['requests'][0]
+        assert request['request_id'] == 7 and request['observed_intervals'] == 1
+        assert request['physical_end_reason'] == 'active_at_evaluation_end'
+        assert not request['native_verified_physical_success']
+    finally:
+        evaluator.close()
+    assert all(name not in tasks.__dict__ for name in ('step', 'observe_physics', 'reset'))
+    assert 'step' not in tasks.protocol.__dict__
+
+
 def test_course_metrics_use_transition_endpoint_and_subtract_old_training_counters():
     schema = StateSchema(tuple(Field(name, ()) for name in (
         "course.tasks.family", "course.tasks.terrain_kind", "course.terrain_tile", "course.gimbal.mode",

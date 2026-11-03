@@ -1,0 +1,243 @@
+"""Recovery diagnostics observe real native clocks and preserve their decisions."""
+from dataclasses import replace
+import json
+from types import SimpleNamespace
+
+import pytest
+import torch
+
+from supermimic_rl.course.recovery_evaluation import RecoveryEvaluation
+
+
+@pytest.fixture
+def native_types():
+    lifecycle = pytest.importorskip('transformer_rl.formal.lab_env.recovery_lifecycle')
+    from transformer_rl.formal.tasks.protocol import CompletedEstimate
+    return lifecycle.RecoveryLifecycle, lifecycle.RecoveryLifecycleConfig, CompletedEstimate
+
+
+def setup(native_types, n=1):
+    lifecycle, config, _ = native_types
+    owner = lifecycle(n, config=config(policy_dt_s=.02, stable_s=.04, timeout_s=.08))
+    owner.reset(torch.arange(n), torch.ones(n, dtype=torch.bool))
+    env = SimpleNamespace(_terrain_course=SimpleNamespace(recovery=owner),
+                          _episode_id=torch.ones(n, dtype=torch.long))
+    evidence = RecoveryEvaluation(env, ('recovery_fixture',) * n)
+    return env, owner, evidence
+
+
+def physics(n=1, **overrides):
+    result = dict(height_m=torch.full((n,), .32), command_height_m=torch.full((n,), .32),
+        tilt_rad=torch.zeros(n), angular_speed_rad_s=torch.zeros(n), velocity_z_m_s=torch.zeros(n),
+        wheel_load_n=torch.full((n, 2), 20.), base_load_n=torch.zeros(n),
+        policy_owned=torch.ones(n, dtype=torch.bool))
+    result.update(overrides)
+    return result
+
+
+def estimate(native_types, now, **overrides):
+    _, _, completed = native_types
+    n = len(now)
+    result = completed(torch.zeros(n), torch.ones(n, 2), torch.zeros(n), torch.zeros(n),
+                       now - .01, torch.ones(n, dtype=torch.bool))
+    return replace(result, **overrides)
+
+
+def transition(evidence, start, *, valid=None, end=None):
+    start = torch.as_tensor(start, dtype=torch.long)
+    evidence.observe_transition(SimpleNamespace(start=SimpleNamespace(episode_id=start),
+        end=SimpleNamespace(episode_id=start if end is None else torch.tensor(end))),
+        torch.ones(len(start), dtype=torch.bool) if valid is None else torch.tensor(valid))
+
+
+def test_height_only_miss_keeps_native_handoff_and_distinct_physical_verification(native_types):
+    env, owner, evidence = setup(native_types, 2)
+    _, reference, _ = setup(native_types, 2)
+    values = physics(2, height_m=torch.tensor([.23, .32]))
+    rng = torch.random.get_rng_state().clone()
+    evidence.install()
+    try:
+        for index in range(2):
+            for _ in range(4):
+                owner.observe_physics(**values)
+                reference.observe_physics(**values)
+            now = torch.full((2,), .02 * (index + 1), dtype=torch.float64)
+            args = dict(policy_owned=torch.ones(2, dtype=torch.bool), failed=torch.zeros(2, dtype=torch.bool))
+            actual = owner.finish_interval(now, estimate(native_types, now), **args)
+            expected = reference.finish_interval(now, estimate(native_types, now), **args)
+            torch.testing.assert_close(actual.handoff, expected.handoff)
+            transition(evidence, [1, 1])
+        for name, value in vars(reference).items():
+            if isinstance(value, torch.Tensor):
+                torch.testing.assert_close(getattr(owner, name), value)
+        torch.testing.assert_close(torch.random.get_rng_state(), rng)
+        report = evidence.summary()
+        first, second = report['episodes']
+        assert first['outcome'] == second['outcome'] == 'handoff'
+        assert first['last_physical_conditions']['height'] is False
+        assert first['only_failed_condition_ticks']['height'] == 8
+        assert first['max_physical_stable_s'] == 0
+        assert first['max_estimated_stable_s'] == pytest.approx(.04)
+        assert not first['native_verified_physical_success']
+        assert second['native_verified_physical_success']
+        assert first['validated_boundary'] and second['validated_boundary']
+        assert all(first['last_estimate_conditions'].values())
+        group = report['by_scenario']['recovery_fixture']
+        assert group['births'] == 2 and group['validated_verified_episodes'] == 1
+        assert evidence.sample()['recovery_after_handoff'].all()
+        json.dumps(report, allow_nan=False)
+    finally:
+        evidence.close()
+    for name in ('observe_physics', 'finish_interval', 'reset'):
+        assert name not in owner.__dict__
+
+
+def test_timeout_reports_physical_and_estimator_obstructions_and_tick_maximum(native_types):
+    _, owner, evidence = setup(native_types)
+    evidence.install()
+    try:
+        for index in range(4):
+            # A transient at the last substep must not hide earlier continuous stability.
+            for tick in range(4):
+                owner.observe_physics(**physics(angular_speed_rad_s=torch.tensor([.8 if tick == 3 else 0.])))
+            now = torch.tensor([.02 * (index + 1)], dtype=torch.float64)
+            owner.finish_interval(now, estimate(native_types, now, angular_speed_rad_s=torch.tensor([.8])),
+                policy_owned=torch.tensor([True]), failed=torch.tensor([False]))
+            transition(evidence, [1])
+        record = evidence.summary()['episodes'][0]
+        assert record['outcome'] == 'timeout' and record['validated_boundary']
+        assert record['only_failed_condition_ticks']['angular_speed'] == 4
+        assert record['max_physical_stable_s'] == pytest.approx(.015)
+        assert record['physical_stable_at_end_s'] == 0
+        assert record['max_estimated_stable_s'] == 0
+        assert record['failed_estimate_condition_intervals']['angular_speed'] == 4
+        assert record['last_estimate']['angular_speed_rad_s'] == pytest.approx(.8)
+        assert record['last_physical_values']['angular_speed_rad_s'] == pytest.approx(.8)
+    finally:
+        evidence.close()
+
+
+def test_auto_reset_keeps_old_boundary_identity_and_invalid_raw_outcome(native_types):
+    env, owner, evidence = setup(native_types)
+    evidence.install()
+    try:
+        for index in range(2):
+            for _ in range(4):
+                owner.observe_physics(**physics())
+            now = torch.tensor([.02 * (index + 1)], dtype=torch.float64)
+            owner.finish_interval(now, estimate(native_types, now),
+                policy_owned=torch.tensor([True]), failed=torch.tensor([False]))
+            if index == 0:
+                transition(evidence, [1], valid=[False])
+        # _reset_idx calls terrain.reset_commands/recovery.reset BEFORE publishing the new ID.
+        owner.reset(torch.tensor([0]), torch.tensor([True]))
+        assert evidence.pending_birth == {0}
+        assert (0, 2) not in evidence.records
+        env._episode_id += 1
+        transition(evidence, [1])
+        records = evidence.summary()['episodes']
+        old, new = records
+        assert old['outcome'] == 'handoff' and old['boundary_valid']
+        assert old['had_invalid'] and not old['validated_boundary']
+        assert old['observed_intervals'] == 2 and old['invalid_intervals'] == 1
+        assert new['episode_id'] == 2 and new['observed_intervals'] == 0
+        assert new['outcome'] == 'active_at_evaluation_end'
+        assert new['birth_source'] == 'native_reset'
+        assert not evidence.sample()['recovery_after_handoff'].any()
+        assert evidence.summary()['by_scenario']['recovery_fixture']['validated_outcomes'] == {}
+    finally:
+        evidence.close()
+
+
+def test_reset_without_finish_retains_interrupted_birth_and_rejects_cross_episode_boundary(native_types):
+    env, owner, evidence = setup(native_types)
+    evidence.install()
+    try:
+        owner.observe_physics(**physics())
+        owner.reset(torch.tensor([0]), torch.tensor([False]))
+        env._episode_id += 1
+        transition(evidence, [1], end=[2])
+        record = evidence.summary()['episodes'][0]
+        assert record['outcome'] == 'reset_before_completion'
+        assert record['boundary_valid'] is False and record['had_invalid']
+        assert record['physical_ticks'] == 1
+    finally:
+        evidence.close()
+
+
+@pytest.mark.parametrize('first_read', ['sample', 'observe', 'finish', 'summary'])
+def test_deferred_birth_binds_on_first_post_reset_read(native_types, first_read):
+    env, owner, evidence = setup(native_types)
+    evidence.install()
+    try:
+        owner.reset(torch.tensor([0]), torch.tensor([True]))
+        assert evidence.pending_birth == {0}
+        assert len(evidence.records) == 1
+        env._episode_id += 1
+        if first_read == 'observe':
+            owner.observe_physics(**physics())
+        elif first_read == 'finish':
+            owner.finish_interval(torch.tensor([.02], dtype=torch.float64), None,
+                policy_owned=torch.tensor([True]), failed=torch.tensor([False]))
+        else:
+            getattr(evidence, first_read)()
+        assert not evidence.pending_birth
+        record = evidence.summary()['episodes'][1]
+        assert record['episode_id'] == 2 and record['birth_source'] == 'native_reset'
+        assert record['observed_intervals'] == 0
+        assert record['physical_ticks'] == int(first_read == 'observe')
+    finally:
+        evidence.close()
+
+
+def test_nonfinite_and_nonowned_ticks_are_explicit_and_never_predicate_evidence(native_types):
+    _, owner, evidence = setup(native_types)
+    previous = owner.observe_physics
+    owner.observe_physics = previous  # A pre-existing instance override must survive close.
+    evidence.install()
+    try:
+        owner.observe_physics(**physics(policy_owned=torch.tensor([False])))
+        owner.observe_physics(**physics(height_m=torch.tensor([float('nan')])))
+        owner.finish_interval(torch.tensor([.02], dtype=torch.float64), None,
+            policy_owned=torch.tensor([True]), failed=torch.tensor([True]))
+        transition(evidence, [1])
+        record = evidence.summary()['episodes'][0]
+        assert record['outcome'] == 'failed' and record['had_invalid']
+        assert record['non_policy_owned_physical_ticks'] == record['nonfinite_physical_ticks'] == 1
+        assert record['valid_owned_physical_ticks'] == 0
+        assert sum(record['failed_condition_ticks'].values()) == 0
+        assert record['last_physical_values']['height_error_m'] is None
+        assert not record['validated_boundary']
+        json.dumps(evidence.summary(), allow_nan=False)
+    finally:
+        evidence.close()
+    assert owner.observe_physics is previous
+    evidence.close()  # Exception cleanup is idempotent.
+
+
+def test_each_physical_predicate_uses_the_bound_native_configuration(native_types):
+    _, owner, evidence = setup(native_types, 6)
+    owner.config = replace(owner.config, height_tolerance_m=.02, tilt_rad=.1,
+        angular_speed_rad_s=.25, vertical_speed_m_s=.08, wheel_load_n=8., base_load_n=1.)
+    values = physics(6)
+    values['height_m'][0] = .35
+    values['tilt_rad'][1] = .11
+    values['angular_speed_rad_s'][2] = .26
+    values['velocity_z_m_s'][3] = -.09
+    values['wheel_load_n'][4, 0] = 7.
+    values['base_load_n'][5] = 1.1
+    evidence.install()
+    try:
+        owner.observe_physics(**values)
+        owner.finish_interval(torch.full((6,), .02, dtype=torch.float64), None,
+            policy_owned=torch.ones(6, dtype=torch.bool), failed=torch.ones(6, dtype=torch.bool))
+        transition(evidence, [1] * 6)
+        report = evidence.summary()
+        assert report['configuration']['wheel_load_n'] == 8.
+        for index, record in enumerate(report['episodes']):
+            failed = record['only_failed_condition_ticks']
+            assert failed[evidence.CONDITIONS[index]] == 1 and sum(failed.values()) == 1
+            assert record['last_physical_conditions'][evidence.CONDITIONS[index]] is False
+            assert record['max_physical_stable_s'] == 0
+    finally:
+        evidence.close()
