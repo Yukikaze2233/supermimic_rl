@@ -26,7 +26,7 @@ from support.world_v2.jump_task import native_jumps
 from support.world_v2.recovery_imagination import fixture as recovery_imagination_fixture
 from support.world_v2.recovery_task import native_recovery
 from supermimic_rl.world_model_v2.recovery_task import RecoveryTaskState
-from test_world_v2_recovery_upgrade import fixture as recovery_upgrade_fixture
+from support.world_v2.recovery_upgrade import fixture as recovery_upgrade_fixture
 
 
 ROOT = Path(__file__).resolve().parents[1]

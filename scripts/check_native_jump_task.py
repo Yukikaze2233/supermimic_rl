@@ -213,7 +213,7 @@ def audit(replay, schema, *, jump_config, stair_scenario, source_rng, terrain, g
         'randomness': 'stair RNG replayed at original full-vector size/device; automatic jump deadline recovered from following record, its value excluded from independent equality checks; due/range/IDs checked',
         'reference_scope': 'next reference reconstructed from independently recorded task state; per-tick native phase/reference not recorded, so no independent four-reference equality claim',
         'boundary_scope': 'adjacent consecutive valid policy-owned same episode/control epoch; reset/terminal/truncated/recovery/unknown command-resampling boundaries excluded and counted',
-        'scope': 'actual recorded four-tick physics, resultant forces and deployed estimates; no learned motion, no teacher jump qualification or robot jump-success claim'}
+        'scope': 'actual recorded four-tick physics, wheel normal support loads and deployed estimates; no learned motion, no teacher jump qualification or robot jump-success claim'}
 
 
 def check(path, *, atlas, table, asset, device):

@@ -115,3 +115,14 @@ python scripts/upgrade_online_task_semantics.py \
 ```
 
 输出新的 checkpoint/replay 配对和配置，不覆盖源运行。启动前先用真实记录核验请求、冷却、ToF 和奖励链路，再检查按技能划分的预测与接触事件报告；软件迁移通过不等于跳跃、台阶或翻正已学会。完整推扰课程还需要为世界模型记录并推进外扰，不能直接复用 PPO 的有推扰 runtime。
+
+带跳跃任务记录的数据可直接核验想象奖励组装：
+
+```sh
+python scripts/check_reward_assembly.py <target-native>/replay.pt \
+  --terrain-atlas <atlas> --table configs/linkage/leg_linkage_08bf7e00.json \
+  --asset <asset-directory> --bundle configs/identified/20261031 \
+  --recorded-jumps --device cpu --output <reward-parity.json>
+```
+
+此检查用真实四子步物理状态替代网络输出，分别报告普通、跳跃、活动跳跃及 HOLD 未起跳区间与原生总奖励的误差。参考曲线仍从记录的任务记忆重建，不是独立记录四条原生参考曲线的对照。
