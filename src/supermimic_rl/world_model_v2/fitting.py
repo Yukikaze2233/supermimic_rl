@@ -10,12 +10,13 @@ and the previous action are advanced by code from the model's own ticks.
 from __future__ import annotations
 
 from dataclasses import dataclass, fields, replace
+import math
 
 import torch
 from torch import Tensor
 
 from .model import FlatTerrain, Ticks, WorldModelV2
-from .physical import increments
+from .physical import INCREMENT_DIM, increments
 from .records import CONTACT_LABEL_DIM, decode_memory, decode_physical
 
 # Increment floors: position, rotation, velocity, angular velocity, joint angles, joint rates.
@@ -40,6 +41,7 @@ class FitTerms:
     ticks: Tensor
     per_step_state: Tensor
     terrain_truncated_fraction: Tensor
+    wheel_contact: Tensor | None = None
 
 
 def recorded_rollout(model, windows):
@@ -82,8 +84,11 @@ class WorldModelFit:
                      'motor_strength', 'action', 'ticks', 'valid')
     OPTIONAL_RECORD_FIELDS = ('reward_route', 'terrain_tile')
 
-    def __init__(self, model: WorldModelV2):
+    def __init__(self, model: WorldModelV2, *, wheel_contact_weight: float = 0.):
+        if not math.isfinite(wheel_contact_weight) or wheel_contact_weight < 0:
+            raise ValueError('Wheel contact weight must be finite and nonnegative')
         self.model = model
+        self.wheel_contact_weight = wheel_contact_weight
         motion = model.motion
         floor = motion.output_norm.mean.new_tensor(TICK_FLOOR * motion.TICKS)
         if floor.numel() != motion.output_dim:
@@ -113,6 +118,7 @@ class WorldModelFit:
         empty = windows['action'].new_zeros(batch)
         truncated = torch.zeros(batch, dtype=torch.bool, device=empty.device)
         state_terms, tick_terms = [], []
+        wheel_terms = []
         for step, rows, prediction, supported in recorded_rollout(model, windows):
             true_start = decode_physical(windows["physical"][rows, step])
             true_end = decode_physical(windows["end_physical"][rows, step])
@@ -123,10 +129,22 @@ class WorldModelFit:
                           / tick_scale).square().mean((-2, -1))
             state_terms.append(empty.index_copy(0, rows, state_error * alive))
             tick_terms.append(empty.index_copy(0, rows, tick_error * alive))
+            if self.wheel_contact_weight:
+                # Keep the continuous native support labels and the same tick
+                # scales, but average these two channels independently of the
+                # other 54 outputs. No classification head or contact floor.
+                wheel_scale = tick_scale[..., INCREMENT_DIM:INCREMENT_DIM + 2]
+                wheel_error = ((prediction.ticks.wheel_load - true_ticks.wheel_load)
+                               / wheel_scale).square().mean((-2, -1))
+                wheel_terms.append(empty.index_copy(0, rows, wheel_error * alive))
             truncated[rows[~supported]] = True
         state_terms.extend([empty] * (horizon - len(state_terms)))
         tick_terms.extend([empty] * (horizon - len(tick_terms)))
         per_step = torch.stack(state_terms, -1)
         count = per_step.numel()
+        wheel_contact = None
+        if self.wheel_contact_weight:
+            wheel_terms.extend([empty] * (horizon - len(wheel_terms)))
+            wheel_contact = torch.stack(wheel_terms, -1).sum() / count
         return FitTerms(per_step.sum() / count, torch.stack(tick_terms, -1).sum() / count,
-                        per_step.detach(), truncated.float().mean())
+                        per_step.detach(), truncated.float().mean(), wheel_contact)

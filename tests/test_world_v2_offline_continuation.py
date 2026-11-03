@@ -12,7 +12,8 @@ from support.world_v2.offline_continuation import ROOT, fixture
 SCRIPT = ROOT / 'scripts/fit_world_v2.py'
 
 
-def test_online_world_only_h8_split_optimizer_and_exact_resumption(tmp_path, monkeypatch):
+@pytest.mark.parametrize('wheel_contact_weight', [0., 1.])
+def test_online_world_only_h8_split_optimizer_and_exact_resumption(tmp_path, monkeypatch, wheel_contact_weight):
     checkpoint, _, _ = fixture(tmp_path)
     original = checkpoint.read_bytes()
     seen = []
@@ -34,19 +35,29 @@ def test_online_world_only_h8_split_optimizer_and_exact_resumption(tmp_path, mon
         runpy.run_path(str(SCRIPT), run_name='__main__')
 
     first, restored, full = (tmp_path / name for name in ('first.json', 'restored.json', 'full.json'))
-    run(['--online-checkpoint', str(checkpoint), '--iterations', '1', '--output', str(first)])
+    candidate = ['--wheel-contact-weight', str(wheel_contact_weight)]
+    run(['--online-checkpoint', str(checkpoint), '--iterations', '1', '--output', str(first), *candidate])
     first_state = torch.load(first.with_suffix('.checkpoint.pt'), weights_only=True)
     assert set(first_state) >= {'model', 'optimizer', 'generator', 'source', 'schema'}
     assert 'learner' not in first_state and 'actor' not in first_state and 'critic' not in first_state
     assert first_state['configuration']['train_env_ids'] == [0]
     assert first_state['configuration']['validation_env_ids'] == [1]
+    assert first_state['configuration']['wheel_contact_weight'] == wheel_contact_weight
+    first_terms = first_state['history'][0]
+    if wheel_contact_weight:
+        assert first_terms['wheel_contact'] >= 0
+        assert first_terms['loss'] == pytest.approx(
+            first_terms['state'] + first_terms['ticks'] + wheel_contact_weight * first_terms['wheel_contact'])
+    else:
+        assert first_terms['wheel_contact'] is None
+        assert first_terms['loss'] == pytest.approx(first_terms['state'] + first_terms['ticks'])
     assert first_state['source']['initial_model_updates'] == 42
     assert all(value['step'] == 2 for value in first_state['optimizer']['state'].values())
     unavailable = tmp_path / 'online-unavailable.pt'
     checkpoint.rename(unavailable)
     run(['--resume', str(first.with_suffix('.checkpoint.pt')), '--iterations', '3', '--output', str(restored)])
     unavailable.rename(checkpoint)
-    run(['--online-checkpoint', str(checkpoint), '--iterations', '3', '--output', str(full)])
+    run(['--online-checkpoint', str(checkpoint), '--iterations', '3', '--output', str(full), *candidate])
     actual = torch.load(restored.with_suffix('.checkpoint.pt'), weights_only=True)
     expected = torch.load(full.with_suffix('.checkpoint.pt'), weights_only=True)
     for name in actual['model']:
@@ -60,6 +71,10 @@ def test_online_world_only_h8_split_optimizer_and_exact_resumption(tmp_path, mon
     report = json.loads(restored.read_text())
     assert report['validation']['8_step']['sampled_windows'] == 2
     assert 'no Isaac, actor, critic or new PPO-data ingestion' in report['scope']
+    assert actual['configuration']['wheel_contact_weight'] == wheel_contact_weight
+    with pytest.raises(ValueError, match='model/data/training contract differs'):
+        run(['--resume', str(first.with_suffix('.checkpoint.pt')), '--iterations', '2',
+             '--wheel-contact-weight', str(1. - wheel_contact_weight)])
 
 
 def test_online_world_continuation_refuses_a_different_holdout_split(tmp_path, monkeypatch):
@@ -153,10 +168,12 @@ def test_legacy_uniform_checkpoint_without_event_setting_resumes_as_fraction_zer
     path = first.with_suffix('.checkpoint.pt')
     saved = torch.load(path, weights_only=True)
     del saved['configuration']['contact_event_fraction']
+    del saved['configuration']['wheel_contact_weight']
     torch.save(saved, path)
     run(['--resume', str(path), '--iterations', '2', '--output', str(output)])
     configuration = json.loads(output.read_text())['configuration']
     assert configuration['contact_event_fraction'] == 0.
+    assert configuration['wheel_contact_weight'] == 0.
     assert configuration['normalization'] == 'update_on_real_training_windows'
 
 

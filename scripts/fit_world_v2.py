@@ -76,6 +76,8 @@ def main():
     parser.add_argument('--validation-fraction', type=float)
     parser.add_argument('--contact-event-fraction', type=float, default=None,
                         help='Candidate fraction of fitting windows containing >=10 ms double-wheel-off; default 0')
+    parser.add_argument('--wheel-contact-weight', type=float, default=None,
+                        help='Extra separately averaged continuous wheel-load MSE; default 0, 1 gives equal group coefficient')
     parser.add_argument('--validation-horizon', type=int, default=16)
     parser.add_argument('--validation-batch', type=int, default=1024)
     parser.add_argument('--device', default='cuda' if torch.cuda.is_available() else 'cpu')
@@ -127,6 +129,7 @@ def main():
     learning_rate = setting('learning_rate', learning.get('model_learning_rate', 2e-4))
     fraction = setting('validation_fraction', source_config.get('validation_fraction', .125))
     event_fraction = setting('contact_event_fraction', 0.)
+    wheel_contact_weight = setting('wheel_contact_weight', 0.)
     seed = setting('seed', 0)
     replay_device = torch.device(setting('replay_device', 'cpu'))
     tf32 = setting('allow_tf32', False if source['kind'] == 'online_pair' else True)
@@ -135,6 +138,8 @@ def main():
         raise ValueError('Positive batch/window/network/rate and a disjoint validation fraction are required')
     if not math.isfinite(event_fraction) or not 0 <= event_fraction < 1:
         raise ValueError('Contact event fraction must be finite and in [0, 1)')
+    if not math.isfinite(wheel_contact_weight) or wheel_contact_weight < 0:
+        raise ValueError('Wheel contact weight must be finite and nonnegative')
     if source_config:
         if fraction != source_config.get('validation_fraction', .125):
             raise ValueError('Online continuation must preserve the original held-out environment IDs')
@@ -168,7 +173,7 @@ def main():
         expected_asset_manifest_sha256=data_source.get('asset_manifest_sha256'))),
         WheelExecution.from_bundle(args.identified_bundle, schema.policy_dt_s / schema.substeps_per_step),
         hidden=tuple(hidden), terrain=terrain).to(device)
-    fit = WorldModelFit(model)
+    fit = WorldModelFit(model, wheel_contact_weight=wheel_contact_weight)
     optimizer = torch.optim.Adam(model.parameters(), lr=learning_rate)
     contract = {'version': MODEL_CONTRACT, 'input_dim': model.motion.input_norm.mean.numel(),
                 'output_dim': model.motion.output_dim, 'ticks': 4, 'hidden': hidden,
@@ -177,6 +182,7 @@ def main():
         'learning_rate': learning_rate, 'validation_fraction': fraction, 'seed': seed,
         'replay_device': str(replay_device), 'allow_tf32': tf32, 'gradient_clip': clip,
         'contact_event_fraction': event_fraction,
+        'wheel_contact_weight': wheel_contact_weight,
         'normalization': ('update_on_uniform_prefix_only' if event_fraction else 'update_on_real_training_windows'),
         'train_env_ids': train_ids, 'validation_env_ids': valid_ids}
     if terrain is not None:
@@ -188,6 +194,7 @@ def main():
         expected_configuration = dict(resumed['configuration'])
         # Existing checkpoints used the same uniform path and had no event setting.
         expected_configuration.setdefault('contact_event_fraction', 0.)
+        expected_configuration.setdefault('wheel_contact_weight', 0.)
         old_batch = expected_configuration['batch']
         if args.batch is not None:
             expected_configuration['batch'] = batch
@@ -245,6 +252,8 @@ def main():
         'model_device': str(device), 'window': window, 'batch': batch, 'eligible_training_windows': candidates.numel(),
         'train_envs': len(train_ids), 'validation_envs': len(valid_ids), 'scope': scope,
         'contact_event_fraction': event_fraction, 'eligible_contact_event_windows': 0 if events is None else events.numel(),
+        'wheel_contact_weight': wheel_contact_weight,
+        'wheel_contact_scope': 'continuous native wheel support N; same output std/error-floor scales; mean over two wheels, four ticks and the fitting horizon',
         'contact_event_scope': 'candidate oversampling of native wheel support <=2 N for two consecutive 5 ms ticks; not jump qualification',
         'normalization': configuration['normalization'],
         'resume_changes': resume_changes,
@@ -259,6 +268,8 @@ def main():
             fit.observe({name: value[:uniform_count] for name, value in windows.items()})
             terms = fit.terms(windows)
             loss = terms.state + terms.ticks
+            if wheel_contact_weight:
+                loss = loss + wheel_contact_weight * terms.wheel_contact
             optimizer.zero_grad(set_to_none=True)
             updated = bool(torch.isfinite(loss))
             if updated:
@@ -276,6 +287,8 @@ def main():
             record = {'iteration': iteration, 'batch': batch, 'state': float(terms.state.detach()),
                 'uniform_windows': uniform_count, 'contact_event_windows': batch - uniform_count,
                 'ticks': float(terms.ticks.detach()),
+                'wheel_contact': None if terms.wheel_contact is None else float(terms.wheel_contact.detach()),
+                'loss': float(loss.detach()),
                 'terrain_truncated_fraction': float(terms.terrain_truncated_fraction),
                 'per_step_state': [value if math.isfinite(value) else None
                                    for value in terms.per_step_state.mean(0).tolist()], 'skipped': skipped,
