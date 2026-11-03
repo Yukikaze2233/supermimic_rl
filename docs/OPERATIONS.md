@@ -96,6 +96,10 @@ python scripts/report_world_v2_data.py --online-checkpoint <online>/training/res
 
 完整在线配对报告通过只读 mmap 视图读取 replay，避免再分配一份完整训练回放；采样窗口仍拥有独立存储。训练恢复默认复制数据，不受此选项影响。读取活跃运行时，应依据最后写入的 `resume.json` 固定同一代 checkpoint/replay，避免两槽轮换期间混用不同循环；报告记录对应循环和 replay 文件名。
 
+离线续拟合可用 `fit_world_v2.py --online-checkpoint <resume.pt> --contact-event-fraction <fraction>` 增加接触事件窗口的采样比例，默认值为 0。事件定义沿用原生两轮支撑载荷 ≤2 N、连续两个 5 ms 子步，包含跨控制步的连续事件；合法窗口和训练/留出环境划分保持不变。其余窗口均匀采样，只有均匀部分更新归一化统计，整个 batch 使用原损失；采样比例需要根据留出集运动与接触指标验证。
+
+检查离线续拟合的模型时，在配对报告命令中增加 `--world-checkpoint <fit>.checkpoint.pt`。报告校验原始配对身份和训练/留出环境列表，记录新权重 SHA256，并报告原始接触预测；旧在线模型标定的滤波阈值不会沿用到新权重。
+
 启用跳跃触发门控时，采集器额外记录上次请求结束时间与门控状态，想象按原生顺序检查上一时刻的指令高度、回合时间和冷却。Actor 与运动网络维度不变，Critic 追加三个任务特征。旧的无门控配对 checkpoint 可通过 `scripts/upgrade_online_jump_trigger.py --checkpoint <resume.pt> --reference-dataset <gated-native-replay.pt> --output <new-directory>` 显式扩展：保留运动监督，旧任务起点全部标为未知，重新采集后才用于想象；新增 Critic 列及 Adam 历史补零，再用新数据标定归一化。
 
 这项迁移只允许新增门控及其声明的参考轨迹，不允许同时更换奖励、课程、物理或传感器合同。跨奖励/课程版本的旧运行还需要单独验证这些合同的迁移，不能直接替换来源标识后续训。

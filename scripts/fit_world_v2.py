@@ -57,7 +57,8 @@ def paired_replay(source, schema, device):
     if (dataset['cycle'] != source['cycle'] or dataset['schema_fingerprint'] != schema.fingerprint
             or schema.fingerprint != source['schema_fingerprint']):
         raise ValueError('World continuation checkpoint and replay generation differ')
-    return CompactReplay.from_state_dict(dataset['replay'], device)
+    return CompactReplay.from_state_dict(dataset['replay'], device,
+                                         read_only=torch.device(device).type == 'cpu')
 
 
 def main():
@@ -73,6 +74,8 @@ def main():
     parser.add_argument('--iterations', type=int, default=2000)
     parser.add_argument('--learning-rate', type=float)
     parser.add_argument('--validation-fraction', type=float)
+    parser.add_argument('--contact-event-fraction', type=float, default=None,
+                        help='Candidate fraction of fitting windows containing >=10 ms double-wheel-off; default 0')
     parser.add_argument('--validation-horizon', type=int, default=16)
     parser.add_argument('--validation-batch', type=int, default=1024)
     parser.add_argument('--device', default='cuda' if torch.cuda.is_available() else 'cpu')
@@ -123,12 +126,15 @@ def main():
     learning = source_config.get('learning', {})
     learning_rate = setting('learning_rate', learning.get('model_learning_rate', 2e-4))
     fraction = setting('validation_fraction', source_config.get('validation_fraction', .125))
+    event_fraction = setting('contact_event_fraction', 0.)
     seed = setting('seed', 0)
     replay_device = torch.device(setting('replay_device', 'cpu'))
     tf32 = setting('allow_tf32', False if source['kind'] == 'online_pair' else True)
     clip = old_configuration.get('gradient_clip', learning.get('gradient_clip', 1.))
     if min(batch, window, *hidden) < 1 or not 0 < fraction < 1 or learning_rate <= 0:
         raise ValueError('Positive batch/window/network/rate and a disjoint validation fraction are required')
+    if not math.isfinite(event_fraction) or not 0 <= event_fraction < 1:
+        raise ValueError('Contact event fraction must be finite and in [0, 1)')
     if source_config:
         if fraction != source_config.get('validation_fraction', .125):
             raise ValueError('Online continuation must preserve the original held-out environment IDs')
@@ -150,6 +156,8 @@ def main():
                                     device=device)
     if 'terrain_tile' in replay.data and terrain is None:
         raise ValueError('Recorded terrain routes require --terrain-atlas; start scans cannot stand in for geometry')
+    if event_fraction and (schema.policy_dt_s != .02 or schema.substeps_per_step != 4):
+        raise ValueError('Contact event sampling requires recorded 200 Hz physics and 50 Hz policy steps')
     held = max(1, round(replay.num_envs * fraction))
     if held >= replay.num_envs:
         raise ValueError('Replay needs distinct training and held-out environment rows')
@@ -168,7 +176,8 @@ def main():
     configuration = {'replay': source['replay'], 'window': window, 'batch': batch,
         'learning_rate': learning_rate, 'validation_fraction': fraction, 'seed': seed,
         'replay_device': str(replay_device), 'allow_tf32': tf32, 'gradient_clip': clip,
-        'normalization': 'update_on_real_training_windows',
+        'contact_event_fraction': event_fraction,
+        'normalization': ('update_on_uniform_prefix_only' if event_fraction else 'update_on_real_training_windows'),
         'train_env_ids': train_ids, 'validation_env_ids': valid_ids}
     if terrain is not None:
         configuration['terrain_atlas_sha256'] = terrain.manifest_sha256
@@ -177,6 +186,8 @@ def main():
     resume_changes = []
     if resumed is not None:
         expected_configuration = dict(resumed['configuration'])
+        # Existing checkpoints used the same uniform path and had no event setting.
+        expected_configuration.setdefault('contact_event_fraction', 0.)
         old_batch = expected_configuration['batch']
         if args.batch is not None:
             expected_configuration['batch'] = batch
@@ -201,6 +212,7 @@ def main():
     candidates = replay.window_candidates(window, train_ids)
     if not candidates.numel():
         raise ValueError(f'No complete eligible training windows of length {window}')
+    events = replay.contact_event_window_candidates(window, train_ids) if event_fraction else None
     field_names = fit.RECORD_FIELDS + tuple(name for name in fit.OPTIONAL_RECORD_FIELDS if name in replay.data)
     staging = None
     if replay.device.type == 'cpu' and device.type == 'cuda':
@@ -208,14 +220,14 @@ def main():
             dtype=replay.data[name].dtype, pin_memory=True) for name in field_names}
 
     def sample():
-        recorded = replay.sample_windows(batch, window, generator=generator, candidates=candidates,
-                                         field_names=field_names, out=staging)
+        recorded, uniform_count = replay.sample_contact_windows(batch, window, generator=generator,
+            env_ids=train_ids, contact_event_fraction=event_fraction, field_names=field_names, out=staging)
         moved = {name: value.to(device, non_blocking=staging is not None) for name, value in recorded.items()}
         if staging is not None:
             # One wait after all copies instead of a wait per field. It also
             # makes sample_seconds include transfer and permits buffer reuse.
             torch.cuda.current_stream(device).synchronize()
-        return moved
+        return moved, uniform_count
 
     started, stop_requested = time.perf_counter(), False
     if device.type == 'cuda':
@@ -232,6 +244,9 @@ def main():
     print(json.dumps({'phase': 'initialized', 'source': source, 'replay_device': str(replay_device),
         'model_device': str(device), 'window': window, 'batch': batch, 'eligible_training_windows': candidates.numel(),
         'train_envs': len(train_ids), 'validation_envs': len(valid_ids), 'scope': scope,
+        'contact_event_fraction': event_fraction, 'eligible_contact_event_windows': 0 if events is None else events.numel(),
+        'contact_event_scope': 'candidate oversampling of native wheel support <=2 N for two consecutive 5 ms ticks; not jump qualification',
+        'normalization': configuration['normalization'],
         'resume_changes': resume_changes,
         'sample_fields': field_names, 'pinned_sample_buffers': staging is not None,
         'sample_bytes': sum(batch * window * replay.data[name][0, 0].numel()
@@ -239,9 +254,9 @@ def main():
     try:
         for iteration in range(first_iteration, args.iterations + 1):
             tick = time.perf_counter()
-            windows = sample()
+            windows, uniform_count = sample()
             sampled = time.perf_counter()
-            fit.observe(windows)
+            fit.observe({name: value[:uniform_count] for name, value in windows.items()})
             terms = fit.terms(windows)
             loss = terms.state + terms.ticks
             optimizer.zero_grad(set_to_none=True)
@@ -259,6 +274,7 @@ def main():
             if device.type == 'cuda':
                 torch.cuda.synchronize(device)
             record = {'iteration': iteration, 'batch': batch, 'state': float(terms.state.detach()),
+                'uniform_windows': uniform_count, 'contact_event_windows': batch - uniform_count,
                 'ticks': float(terms.ticks.detach()),
                 'terrain_truncated_fraction': float(terms.terrain_truncated_fraction),
                 'per_step_state': [value if math.isfinite(value) else None

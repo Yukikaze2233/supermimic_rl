@@ -15,6 +15,26 @@ from pathlib import Path
 import torch
 
 from supermimic_rl.world_model_v2.data_report import report
+from supermimic_rl.world_model_v2.records import MODEL_CONTRACT
+
+
+def offline_world_source(path, schema):
+    """Load a fitted model independently of the replay's online generation."""
+    world = torch.load(path, map_location="cpu", weights_only=True, mmap=True)
+    contract = world.get("model_contract", {})
+    if (world.get("format") != "supermimic-offline-world-v2"
+            or contract.get("version") != MODEL_CONTRACT
+            or contract.get("schema_fingerprint") != schema.fingerprint):
+        raise ValueError("World checkpoint and dataset contracts differ")
+    with path.open("rb") as stream:
+        digest = hashlib.file_digest(stream, "sha256").hexdigest()
+    source = {"kind": "offline_world_checkpoint", "path": str(path.resolve()),
+              "sha256": digest, "iteration": world["iteration"],
+              "training_source": world.get("source"),
+              "training_env_ids": world["configuration"]["train_env_ids"],
+              "validation_env_ids": world["configuration"]["validation_env_ids"],
+              "contact_floor": "none; original online floors belong to different model weights"}
+    return world["model"], contract["hidden"], world["configuration"]["validation_fraction"], source
 
 
 def checkpoint_contact_floor(learner, device):
@@ -59,7 +79,8 @@ def _model(schema, args, hidden, state, device):
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--replay", type=Path, help="Compact or packed native dataset")
-    parser.add_argument("--world-checkpoint", type=Path, help="Offline fit *.checkpoint.pt for --replay")
+    parser.add_argument("--world-checkpoint", type=Path,
+                        help="Offline fit *.checkpoint.pt; overrides the model for either replay source")
     parser.add_argument("--online-checkpoint", type=Path, help="Complete online pair (replay and world model)")
     parser.add_argument("--linkage", type=Path, required=True)
     parser.add_argument("--identified-bundle", type=Path, default=Path("configs/identified/20261031"))
@@ -95,14 +116,24 @@ def main():
         from supermimic_rl.world_model_v2.ingest import load_recorded_replay
         replay, schema = load_recorded_replay(args.replay, "cpu", record_terrain=args.terrain_atlas is not None)
         fraction = args.validation_fraction
-        if args.world_checkpoint is not None:
-            world = torch.load(args.world_checkpoint, map_location="cpu", weights_only=True)
-            if world["model_contract"]["schema_fingerprint"] != schema.fingerprint:
-                raise ValueError("World checkpoint and dataset contracts differ")
-            state, hidden = world["model"], world["model_contract"]["hidden"]
-            fraction = world["configuration"]["validation_fraction"]
+    if args.world_checkpoint is not None:
+        state, hidden, fraction, model_source = offline_world_source(args.world_checkpoint, schema)
+        # Contact floors were calibrated against the original online weights.
+        # Report the override's raw loads instead of silently reusing that filter.
+        contact_floor = None
+        pair_identity["prediction_model"] = model_source
     held = max(1, round(replay.num_envs * fraction))
     valid_ids = list(range(replay.num_envs - held, replay.num_envs))
+    if args.world_checkpoint is not None:
+        if (model_source['validation_env_ids'] != valid_ids
+                or model_source['training_env_ids'] != list(range(replay.num_envs - held))):
+            raise ValueError('World checkpoint environment split differs from the reported replay')
+        if args.online_checkpoint is not None:
+            with args.online_checkpoint.open('rb') as stream:
+                origin_digest = hashlib.file_digest(stream, 'sha256').hexdigest()
+            origin = model_source['training_source'] or {}
+            if origin.get('kind') != 'online_pair' or origin.get('checkpoint_sha256') != origin_digest:
+                raise ValueError('World override must originate from the selected online pair for held-out reporting')
     fit = None if state is None else _model(schema, args, hidden, state, args.device)
     result = report(replay, fit=fit, env_ids=valid_ids, horizon=args.horizon, batch=args.batch,
                     generator=torch.Generator().manual_seed(args.seed), device=args.device,
