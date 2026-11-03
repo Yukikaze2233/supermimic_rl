@@ -7,7 +7,9 @@ Only real replay labels train the velocity/contact estimator.
 from __future__ import annotations
 
 from contextlib import contextmanager
+import copy
 from dataclasses import dataclass
+import math
 
 import torch
 from torch import Tensor, nn
@@ -37,6 +39,15 @@ class LearningConfig:
     # Differentiate the actor objective's final bootstrap value through the
     # imagined state (legacy). False keeps it as a value, not a gradient source.
     bootstrap_gradient: bool = True
+    # Trust region around the initialization teacher: weight of the KL between
+    # equal-std Gaussians, 0.5 * ((student - teacher) / teacher_std)^2, on real
+    # start histories. Imagination may improve the student only near the
+    # teacher, where the world model has data. 0 disables it.
+    anchor_coefficient: float = 0.
+
+    def __post_init__(self):
+        if not math.isfinite(self.anchor_coefficient) or self.anchor_coefficient < 0:
+            raise ValueError('Anchor coefficient must be finite and nonnegative')
 
 
 @torch.no_grad()
@@ -84,6 +95,20 @@ class Learner:
         }
         self.updates = {name: 0 for name in self.optimizers}
         self.skipped = {name: 0 for name in self.optimizers}
+        self.anchor = None   # (frozen teacher actor, teacher action std [6])
+
+    def set_anchor(self, actor: EstimatorActor, std: Tensor) -> None:
+        """Freeze a copy of ``actor`` (normally the PPO initialization) as the trust-region center."""
+        device = next(self.actor.parameters()).device
+        if std.shape != (6,) or not bool((std > 0).all()) or not bool(torch.isfinite(std).all()):
+            raise ValueError('Anchor needs six positive finite action standard deviations')
+        self.anchor = (copy.deepcopy(actor).requires_grad_(False).eval().to(device), std.to(device).float().clone())
+
+    def _anchor_deviation(self, frames: Tensor) -> Tensor:
+        teacher, std = self.anchor
+        with torch.no_grad():
+            target = teacher(frames)
+        return .5 * ((self.actor(frames) - target) / std).square().mean()
 
     def _step(self, name: str, loss: Tensor) -> bool:
         optimizer = self.optimizers[name]
@@ -230,6 +255,15 @@ class Learner:
                 # alive during critic fitting and increase peak GPU memory.
                 del rollout, loss
         finite = finite and accepted > 0
+        anchor = float('nan')
+        if finite and train_actor and config.anchor_coefficient:
+            if self.anchor is None:
+                raise ValueError('anchor_coefficient requires set_anchor with the initialization teacher')
+            deviation = self._anchor_deviation(frames)
+            finite = bool(torch.isfinite(deviation))
+            if finite:
+                (config.anchor_coefficient * deviation).backward()
+                anchor = float(deviation.detach())
         if finite and train_actor:
             norm = nn.utils.clip_grad_norm_(self.actor.decoder.parameters(), config.gradient_clip)
             finite = bool(torch.isfinite(norm))
@@ -252,6 +286,7 @@ class Learner:
                     total_loss += float(loss.detach())
                     batches += 1
         return {"actor/updated": finite and train_actor, "actor/loss": actor_loss if accepted else float('nan'),
+                "actor/anchor_kl": anchor,
                 "actor/skipped": self.skipped["actor"], "critic/loss": total_loss / max(batches, 1),
                 "critic/skipped": self.skipped["critic"],
                 "imagination/mean_length": length_sum / batch_size,
@@ -286,7 +321,9 @@ class Learner:
         return {"model": self.model.state_dict(), "actor": self.actor.state_dict(),
                 "critic": self.critic.state_dict(), "updates": self.updates.copy(), "skipped": self.skipped.copy(),
                 "optimizers": {name: optimizer.state_dict() for name, optimizer in self.optimizers.items()},
-                **({} if floor is None else {"contact_floor": {"body": floor[0], "base": floor[1]}})}
+                **({} if floor is None else {"contact_floor": {"body": floor[0], "base": floor[1]}}),
+                **({} if self.anchor is None else
+                   {"anchor": {"actor": self.anchor[0].state_dict(), "std": self.anchor[1]}})}
 
     def load_state_dict(self, state: dict) -> None:
         for name in ("model", "actor", "critic"):
@@ -294,6 +331,11 @@ class Learner:
         for name, optimizer in self.optimizers.items():
             optimizer.load_state_dict(state["optimizers"][name])
         self.updates, self.skipped = dict(state["updates"]), dict(state["skipped"])
+        anchor = state.get("anchor")
+        if anchor is not None:
+            teacher = copy.deepcopy(self.actor)
+            teacher.load_state_dict(anchor["actor"])
+            self.set_anchor(teacher, anchor["std"])
         floor = state.get("contact_floor")
         device = next(self.model.parameters()).device
         self.imagination.contact_floor = (None if floor is None else

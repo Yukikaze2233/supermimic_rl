@@ -82,7 +82,7 @@ def test_learner_checkpoint_round_trips_floors_and_reads_legacy_state():
     def learner():
         value = Learner.__new__(Learner)
         value.model, value.actor, value.critic = (torch.nn.Linear(1, 1) for _ in range(3))
-        value.optimizers = {}
+        value.optimizers, value.anchor = {}, None
         value.updates, value.skipped = {"actor": 0}, {"actor": 0}
         value.imagination = SimpleNamespace(contact_floor=None)
         return value

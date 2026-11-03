@@ -39,6 +39,7 @@ def test_checkpoint_request_during_model_fit_finishes_policy_updates_before_full
             return {}
 
     trainer = object.__new__(OnlineTrainer)
+    trainer.guard = None
     trainer.config = OnlineConfig(cycles=9, model_updates=2, actor_updates=3,
         record_tasks=world_only, record_stair_source=world_only, course_coordinate=0 if world_only else None,
         policy_start_cycle=3 if world_only else 0)
@@ -97,8 +98,10 @@ def _stub_trainer(tmp_path, monkeypatch, calls, **config):
             return 24
 
     trainer = object.__new__(OnlineTrainer)
-    trainer.config = OnlineConfig(cycles=3, model_updates=1, actor_updates=2, record_tasks=True,
-                                  record_stair_source=True, course_coordinate=0, policy_start_cycle=2, **config)
+    trainer.guard = None
+    trainer.config = OnlineConfig(**{'cycles': 3, 'model_updates': 1, 'actor_updates': 2, 'record_tasks': True,
+                                     'record_stair_source': True, 'course_coordinate': 0, 'policy_start_cycle': 2,
+                                     **config})
     trainer.cycle, trainer.output = 0, tmp_path
     trainer.env = SimpleNamespace(num_envs=2)
     trainer.device = torch.device('cpu')
@@ -144,3 +147,31 @@ def test_contact_floor_is_refit_after_each_world_fit_before_imagination(tmp_path
     assert metrics[-1]['contact_floor']['base_link'] == {key: report['channels']['base_link'][key] for key in
         ('floor_n', 'false_positive_raw', 'false_positive_floored', 'true_positive_raw', 'true_positive_floored')}
     assert json.loads((tmp_path / 'world-validation-000003.json').read_text())['contact_floor'] == report
+
+
+def test_guard_judges_only_policy_cycles_and_restores_after_a_sustained_drop(tmp_path, monkeypatch):
+    from supermimic_rl.world_model_v2.guard import NativeRegressionGuard
+
+    rewards = iter([.02, .09, .09, .09, .05, .04])
+    trainer = _stub_trainer(tmp_path, monkeypatch, [], cycles=6, guard_drop_fraction=.1, guard_patience=2)
+    learner = trainer.learner
+    learner.actor = torch.nn.Linear(2, 2)
+    learner.optimizers = {'actor': torch.optim.Adam(learner.actor.parameters(), lr=5e-5)}
+    original = {name: value.clone() for name, value in learner.actor.state_dict().items()}
+
+    def update_policy(start, frames, **kwargs):
+        if kwargs['train_actor']:
+            with torch.no_grad():
+                learner.actor.weight.add_(1.)
+        return {'actor/updated': float(kwargs['train_actor'])}
+
+    learner.update_policy = update_policy
+    trainer.collector.collect = lambda *args, **kwargs: {'terminations': 0, 'student_reward_mean': next(rewards)}
+    trainer.guard = NativeRegressionGuard(.1, 2, 5e-5)
+    trainer.train()
+    metrics = [json.loads(line) for line in (tmp_path / 'metrics.jsonl').read_text().splitlines()]
+    assert ['guard' in row for row in metrics] == [False, False, True, True, True, True]
+    assert metrics[2]['guard']['best_student_reward'] == .09 and not metrics[4]['guard']['restored']
+    assert metrics[5]['guard']['restored'] and metrics[5]['guard']['actor_learning_rate'] == 2.5e-5
+    # Restored to the actor that collected the best (baseline) return, then that cycle's two updates.
+    torch.testing.assert_close(learner.actor.weight, original['weight'] + 2.)
