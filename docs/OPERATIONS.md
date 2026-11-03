@@ -111,8 +111,11 @@ python scripts/upgrade_online_task_semantics.py \
   --source-course <old-course.json> --target-course <v5-course.json> \
   --source-teacher <old-teacher.pt> --target-teacher <reevaluated-same-teacher.pt> \
   --course-coordinate <sampling-coordinate> --critic-warmup-cycles <warmup-cycles> \
+  --sampler-device cuda:0 \
   --output <new-handoff-directory>
 ```
+
+`--sampler-device` 必须与源课程采样器的设备类型一致；远端 a05 使用 `cuda:0`，需在可用 CUDA 的机器上迁移。CPU 来源使用默认 `cpu`。迁移保留原 RNG 字节，不将 CUDA Philox 状态转换成 CPU 状态或重新播种。
 
 输出新的 checkpoint/replay 配对和配置，不覆盖源运行。启动前先用真实记录核验请求、冷却、ToF 和奖励链路，再检查按技能划分的预测与接触事件报告；软件迁移通过不等于跳跃、台阶或翻正已学会。完整推扰课程还需要为世界模型记录并推进外扰，不能直接复用 PPO 的有推扰 runtime。
 

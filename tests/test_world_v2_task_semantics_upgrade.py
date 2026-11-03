@@ -179,6 +179,43 @@ def test_real_c15_curriculum_missing_new_optional_defaults_is_explicitly_normali
     assert upgraded['environment']['actual_transitions'] == saved['environment']['actual_transitions']
 
 
+def test_cpu_sampler_rejects_cuda_rng_bytes_without_converting_or_reseeding(tmp_path):
+    saved, dataset, reference, options, _ = fixture(tmp_path)
+    rng = torch.zeros(16, dtype=torch.uint8)  # CUDA Philox layout; deliberately not a CPU generator state.
+    saved['environment']['curriculum']['sampler']['rng'] = rng
+    with pytest.raises(ValueError, match='does not match sampler_device=cpu: 16 bytes'):
+        upgrade_task_semantics(saved, dataset, reference, **options)
+    assert saved['environment']['curriculum']['sampler']['rng'] is rng
+    assert not rng.any()
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason='Native CUDA sampler roundtrip requires CUDA')
+def test_cuda_sampler_roundtrip_preserves_philox_state_and_strict_course_restore(tmp_path):
+    saved, dataset, reference, options, _ = fixture(tmp_path)
+    source = make_course_curriculum(2, 'cuda:0', 93, json.loads(options['source_course_raw']))
+    source.set_progress(196608000, 768)
+    source.sample(torch.arange(2, device='cuda:0'))
+    old = source.state_dict()
+    for name in ('jump_height_stage', 'jump_height_gates', 'recovery_posture_stages'):
+        old['config'].pop(name)
+    saved['environment']['curriculum'] = old
+    expected_rng = old['sampler']['rng'].clone()
+    upgraded, _, receipt = upgrade_task_semantics(saved, dataset, reference, **options, sampler_device='cuda:0')
+    assert receipt['course']['sampler_device'] == 'cuda:0'
+    assert receipt['course']['sampler_rng_bytes'] == expected_rng.numel()
+    assert torch.equal(upgraded['environment']['curriculum']['sampler']['rng'], expected_rng)
+    # Persist on the producer device, load on CPU as the real CLI does, then
+    # restore the unchanged byte stream through the native CUDA sampler.
+    path = tmp_path / 'cuda-curriculum.pt'
+    torch.save(upgraded['environment']['curriculum'], path)
+    restored = make_course_curriculum(2, 'cuda:0', 1, json.loads(options['target_course_raw']))
+    restored.load_state_dict(torch.load(path, weights_only=True, map_location='cpu'))
+    expected = torch.Generator(device='cuda:0')
+    expected.set_state(expected_rng)
+    torch.testing.assert_close(torch.rand(16, device='cuda:0', generator=restored.sampler.generator),
+                               torch.rand(16, device='cuda:0', generator=expected), rtol=0, atol=0)
+
+
 @pytest.mark.parametrize('damage', ['unknown', 'missing_required', 'wrong_default'])
 def test_legacy_curriculum_normalization_still_checks_the_pinned_source(tmp_path, damage):
     saved, dataset, reference, options, _ = fixture(tmp_path)
@@ -269,7 +306,7 @@ def test_cli_writes_new_pair_without_touching_source_and_records_provenance(tmp_
     before = {path: path.read_bytes() for path in (*paths.values(), tmp_path / saved['replay_file'])}
     output = tmp_path / 'handoff'
     arguments = ['upgrade_online_task_semantics', '--output', str(output), '--course-coordinate', '491520000',
-                 '--critic-warmup-cycles', '3']
+                 '--critic-warmup-cycles', '3', '--sampler-device', 'cpu']
     for name, path in paths.items():
         arguments.extend(['--' + name, str(path)])
     monkeypatch.setattr('sys.argv', arguments)
@@ -279,6 +316,7 @@ def test_cli_writes_new_pair_without_touching_source_and_records_provenance(tmp_
     report = json.loads((output / 'migration.json').read_text())
     assert migrated['resume_migrations'][-1] == report
     assert migrated['guard'] is None and migrated['critic_norm_from'] == 0
+    assert report['course']['sampler_device'] == 'cpu'
     assert report['reference_dataset']['sha256'] == file_sha256(paths['reference-dataset'])
     assert (output / migrated['replay_file']).is_file()
     with pytest.raises(FileExistsError):

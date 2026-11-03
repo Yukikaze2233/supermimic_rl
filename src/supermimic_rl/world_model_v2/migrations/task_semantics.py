@@ -54,7 +54,7 @@ def _check_runtime(source, target, source_raw, target_raw):
         raise ValueError('Task handoff may change only runtime terrain_policy.use_mode_labels')
 
 
-def _course(saved, source, target, source_raw, target_raw, coordinate, num_envs):
+def _course(saved, source, target, source_raw, target_raw, coordinate, num_envs, sampler_device):
     courses = []
     for provenance, raw in ((source, source_raw), (target, target_raw)):
         course = json.loads(raw)
@@ -71,7 +71,16 @@ def _course(saved, source, target, source_raw, target_raw, coordinate, num_envs)
             or not courses[1]['base'].get('jump_height_gates')):
         raise ValueError('Task handoff only replaces v5 task mixtures and difficulty gates')
     old = saved['environment']['curriculum']
-    original = make_course_curriculum(num_envs, 'cpu', 0, courses[0])
+    sampler_device = torch.device(sampler_device)
+    if sampler_device.type == 'cuda' and not torch.cuda.is_available():
+        raise ValueError('CUDA sampler migration requires an available CUDA device')
+    original = make_course_curriculum(num_envs, sampler_device, 0, courses[0])
+    expected_rng = original.sampler.generator.get_state()
+    saved_rng = old['sampler']['rng']
+    if saved_rng.shape != expected_rng.shape or saved_rng.dtype != expected_rng.dtype:
+        raise ValueError(f'Saved sampler RNG does not match sampler_device={sampler_device}: '
+                         f'{saved_rng.numel()} bytes versus {expected_rng.numel()}; '
+                         'select the original native sampler device, without converting its RNG')
     # c15 saved its config before these three optional defaults were added.
     # Normalize only that known historical omission, then retain the native
     # strict source/configuration and sampler-state validation.
@@ -83,7 +92,7 @@ def _course(saved, source, target, source_raw, target_raw, coordinate, num_envs)
         raise ValueError('Source curriculum checkpoint has unknown or missing nonlegacy fields')
     normalized = CourseCurriculumConfig.from_dict({**{k: defaults[k] for k in missing}, **old['config']}).to_dict()
     original.load_state_dict({**old, 'config': normalized})
-    current = make_course_curriculum(num_envs, 'cpu', 0, courses[1])
+    current = make_course_curriculum(num_envs, sampler_device, 0, courses[1])
     current.set_progress(coordinate, old['actor_updates'])
     state = current.state_dict()
     state['sampler']['rng'] = old['sampler']['rng']
@@ -92,6 +101,7 @@ def _course(saved, source, target, source_raw, target_raw, coordinate, num_envs)
     receipt = {'source_coordinate': old['real_transitions'], 'target_coordinate': coordinate,
         'target_stage': current.stage_names[current.stage], 'sampler_credits_reset': True,
         'sampling_counts_preserved': True, 'sampler_rng_preserved': True,
+        'sampler_device': str(sampler_device), 'sampler_rng_bytes': saved_rng.numel(),
         'source_checkpoint_defaults_materialized': {k: defaults[k] for k in sorted(missing)},
         'coordinate_is_capability_promotion': False}
     return {**saved['environment'], 'curriculum': state}, receipt
@@ -132,13 +142,14 @@ def _teacher(saved, source, target, source_path, target_path):
 
 def upgrade_task_semantics(saved, dataset, reference, *, source_runtime_raw, target_runtime_raw,
                            source_course_raw, target_course_raw, source_teacher_path, target_teacher_path,
-                           course_coordinate, critic_warmup_cycles):
+                           course_coordinate, critic_warmup_cycles, sampler_device='cpu'):
     """Rebind a complete ungated a05 recovery pair to an observed R7 producer.
 
     Legacy task clocks, goals and frames are retained as historical data, never
     rewritten into new-policy starts. The world model still uses their physical
     action/tick supervision. New native rows alone calibrate and train the fresh
     critic. This does not qualify any skill or resume simulator state.
+    ``sampler_device`` must match the native RNG backend; RNG bytes are retained.
     """
     config = OnlineConfig.from_dict(saved['config'])
     if (saved.get('format') != 'supermimic-online-v2' or saved.get('model_contract') != MODEL_CONTRACT
@@ -218,7 +229,7 @@ def upgrade_task_semantics(saved, dataset, reference, *, source_runtime_raw, tar
     if not valid.any():
         raise ValueError('Target dataset needs valid owned native task starts with known gate history')
     environment, course_receipt = _course(saved, source, target, source_course_raw, target_course_raw,
-                                          course_coordinate, dataset['replay']['num_envs'])
+                                          course_coordinate, dataset['replay']['num_envs'], sampler_device)
     teacher_source = _teacher(saved, source, target, source_teacher_path, target_teacher_path)
     base = Critic.feature_size(schema.goal_dim, storage['sim_context'].shape[-1], task_dim=MOTION_TASK_DIM,
                                terrain=True, stairs=True, jumps=True, recovery=True)

@@ -18,6 +18,8 @@ def main():
         parser.add_argument('--' + name, type=Path, required=True)
     parser.add_argument('--course-coordinate', type=int, required=True)
     parser.add_argument('--critic-warmup-cycles', type=int, required=True)
+    parser.add_argument('--sampler-device', default='cpu',
+                        help='Original native sampler RNG device, e.g. cuda:0 for CUDA Philox checkpoints')
     args = parser.parse_args()
     if args.output.exists():
         raise FileExistsError('Task migration requires a new output directory')
@@ -29,7 +31,8 @@ def main():
         **{name + '_raw': getattr(args, name).read_bytes() for name in
            ('source_runtime', 'target_runtime', 'source_course', 'target_course')},
         source_teacher_path=args.source_teacher, target_teacher_path=args.target_teacher,
-        course_coordinate=args.course_coordinate, critic_warmup_cycles=args.critic_warmup_cycles)
+        course_coordinate=args.course_coordinate, critic_warmup_cycles=args.critic_warmup_cycles,
+        sampler_device=args.sampler_device)
     for name in ('checkpoint', 'reference_dataset', 'source_runtime', 'target_runtime',
                  'source_course', 'target_course', 'source_teacher', 'target_teacher'):
         path = getattr(args, name)
