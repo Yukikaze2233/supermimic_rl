@@ -26,9 +26,11 @@ class CourseEvaluationConfig:
     scenarios: tuple[str, ...] = ()
     family: str | None = None
     seed: int = 0
+    recovery_qualification: bool = False
 
     def __post_init__(self):
         if (not isinstance(self.evaluation_stage, str)
+                or type(self.recovery_qualification) is not bool
                 or type(self.seed) is not int or not 0 <= self.seed < 2**63
                 or not isinstance(self.scenarios, (tuple, list))
                 or any(not isinstance(name, str) for name in self.scenarios)
@@ -80,6 +82,17 @@ class FixedCourseScenarios:
         self.row_names = tuple(names[row % len(names)] for row in range(adapter.num_envs))
         self.births = torch.zeros(adapter.num_envs, dtype=torch.long, device=self.device)
         self.command_source = torch.zeros_like(self.births)
+        self.qualification_clock = None
+        self.qualification_commands = None
+        if config.recovery_qualification:
+            recovery = self.env._terrain_course.recovery
+            self.qualification_clock = torch.zeros(adapter.num_envs, dtype=torch.float64, device=self.device)
+            self.qualification_commands = torch.tensor(
+                [self.scenarios[name]['commands'][0] for name in self.row_names], device=self.device)
+            self.qualification_rows = torch.tensor(
+                [self.scenarios[name]['family'] == 'RECOVERY' for name in self.row_names],
+                dtype=torch.bool, device=self.device)
+            self.qualification_timeout_s = recovery.config.timeout_s
         self._restore = []
         self.fixed_tiles = self._fixed_tiles()
 
@@ -255,6 +268,20 @@ class FixedCourseScenarios:
         self._install(tasks, '_draw_segments', self.draw_segments)
         self._install(tasks, 'begin_tracking', begin_tracking)
         self._install(self.env._gimbal_course, '_draw', self.draw_gimbal)
+        if self.config.recovery_qualification:
+            original_step = tasks.stream.step
+
+            def stationary_request(requested):
+                # Override the external target, never the admitted command or
+                # actuator path. Native handoff still draws its ordinary RNG.
+                hold = self.qualification_rows & (
+                    self.qualification_clock < self.qualification_timeout_s - 1e-9)
+                target = torch.where(hold[:, None], self.qualification_commands, requested)
+                result = original_step(target)
+                self.command_source[hold] = 1
+                return result
+
+            self._install(tasks.stream, 'step', stationary_request)
         if self.fixed_tiles:
             router = self.env._terrain_course.router
             original_reset = router.reset
@@ -285,7 +312,10 @@ class FixedCourseScenarios:
         self._restore.clear()
 
     def description(self):
-        return {"selection": asdict(self.config), "scenarios": self.scenarios,
+        selection = asdict(self.config)
+        if not self.config.recovery_qualification:
+            selection.pop('recovery_qualification')
+        result = {"selection": selection, "scenarios": self.scenarios,
                 "fixed_atlas_tiles": self.fixed_tiles,
                 "resolved_curriculum": {"stage": self.curriculum.stage,
                     "stage_name": self.curriculum.stage_name,
@@ -303,6 +333,16 @@ class FixedCourseScenarios:
                 "parameter_source": "instantiated pinned native contracts; jump low/high=effective domain endpoints, intermediate=initial-domain upper endpoint capped by effective domain; not success thresholds",
                 "placement": "requested terrain kind/height; actual routed tiles and declared collision profiles are reported separately",
                 "randomness": "scheduled command targets and collision tiles fixed; native birth/recovery handoff commands, request timing, birth, dynamics and sensor DR retained; training terrain coverage/proficiency routing excluded"}
+        if self.config.recovery_qualification:
+            result['randomness'] = ('Native birth, handoff and segment RNG draws remain unchanged; '
+                'recovery requests inside the qualification budget use the pre-authored stationary override. '
+                'Other fixed scenarios, dynamics and sensor DR retain their existing evaluation behavior.')
+            result['recovery_qualification'] = {
+                'request': 'Pre-authored vx=vy=yaw_rate=0 and original recovery height; override before native command admission/slew, independently of success or handoff.',
+                'budget_clock': 'Policy-owned physical ticks from each recovery birth; successful certification does not release the fixed command early.',
+                'timeout_s': self.qualification_timeout_s,
+                'randomness': 'Native handoff/segment RNG and underlying trajectories remain unchanged; only admitted requests inside the qualification window are overridden.'}
+        return result
 
 
 class CourseEvaluation:
@@ -333,7 +373,10 @@ class CourseEvaluation:
             self.recovery_phase_buckets = {}
             self._install_authored_evidence()
             if getattr(self.adapter.env._terrain_course, 'recovery', None) is not None:
-                self.recovery_evidence = RecoveryEvaluation(self.adapter.env, self.plan.row_names)
+                options = ({'qualification_commands': self.plan.qualification_commands,
+                            'qualification_clock': self.plan.qualification_clock}
+                           if self.config.recovery_qualification else {})
+                self.recovery_evidence = RecoveryEvaluation(self.adapter.env, self.plan.row_names, **options)
                 self.recovery_evidence.install()
             tasks = getattr(self.adapter.env._terrain_course, 'tasks', None)
             if getattr(tasks, 'protocol', None) is not None:
@@ -648,4 +691,8 @@ class CourseEvaluation:
                 'Phase totals partition observed samples, not certified skill successes.')
         if self.jump_evidence is not None:
             report['jump_diagnostics'] = self.jump_evidence.summary()
+        if self.config.recovery_qualification:
+            report['command_phase_semantics'] += (
+                ' With recovery_qualification enabled, scheduled_segment also includes the fixed '
+                'qualification request override; it does not assert that a new native segment was drawn.')
         return report

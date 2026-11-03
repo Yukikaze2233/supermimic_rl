@@ -16,13 +16,15 @@ def native_types():
     return lifecycle.RecoveryLifecycle, lifecycle.RecoveryLifecycleConfig, CompletedEstimate
 
 
-def setup(native_types, n=1):
+def setup(native_types, n=1, *, qualification=False):
     lifecycle, config, _ = native_types
     owner = lifecycle(n, config=config(policy_dt_s=.02, stable_s=.04, timeout_s=.08))
     owner.reset(torch.arange(n), torch.ones(n, dtype=torch.bool))
     env = SimpleNamespace(_terrain_course=SimpleNamespace(recovery=owner),
                           _episode_id=torch.ones(n, dtype=torch.long))
-    evidence = RecoveryEvaluation(env, ('recovery_fixture',) * n)
+    options = ({'qualification_commands': torch.tensor([[0., 0., 0., .32]]).expand(n, -1).clone(),
+                'qualification_clock': torch.zeros(n, dtype=torch.float64)} if qualification else {})
+    evidence = RecoveryEvaluation(env, ('recovery_fixture',) * n, **options)
     return env, owner, evidence
 
 
@@ -239,5 +241,143 @@ def test_each_physical_predicate_uses_the_bound_native_configuration(native_type
             assert failed[evidence.CONDITIONS[index]] == 1 and sum(failed.values()) == 1
             assert record['last_physical_conditions'][evidence.CONDITIONS[index]] is False
             assert record['max_physical_stable_s'] == 0
+    finally:
+        evidence.close()
+
+
+def test_qualification_continues_after_native_handoff_and_keeps_request_clock_after_success(native_types):
+    _, owner, evidence = setup(native_types, qualification=True)
+    _, baseline, _ = setup(native_types)
+    evidence.install()
+    try:
+        for index in range(5):
+            values = physics(height_m=torch.tensor([.23 if index == 0 else .32]))
+            for _ in range(4):
+                owner.observe_physics(**values)
+                baseline.observe_physics(**values)
+            now = torch.tensor([.02 * (index + 1)], dtype=torch.float64)
+            args = dict(policy_owned=torch.tensor([True]), failed=torch.tensor([False]))
+            owner.finish_interval(now, estimate(native_types, now), **args)
+            baseline.finish_interval(now, estimate(native_types, now), **args)
+            if index == 1:
+                assert not owner.active.any() and not owner._verified.any()
+                assert evidence.summary()['qualification']['episodes'][0]['outcome'] == 'incomplete_at_evaluation_end'
+            if index == 2:
+                q = evidence.summary()['qualification']['episodes'][0]
+                assert q['outcome'] == 'success' and not q['validated_boundary']
+            transition(evidence, [1])
+        q = evidence.summary()['qualification']
+        record = q['episodes'][0]
+        assert record['outcome'] == 'success' and record['validated_boundary']
+        assert record['first_qualifying_tick_at_s'] == pytest.approx(.06)
+        assert record['max_physical_stable_s'] == pytest.approx(.04)
+        assert record['budget_elapsed_s'] == pytest.approx(.06)
+        assert evidence.qualification['clock'].item() == pytest.approx(.08)
+        assert q['by_scenario']['recovery_fixture']['success_rate'] == 1
+        assert evidence.summary()['episodes'][0]['outcome'] == 'handoff'
+        assert not evidence.summary()['episodes'][0]['native_verified_physical_success']
+        for name, value in vars(baseline).items():
+            if isinstance(value, torch.Tensor):
+                torch.testing.assert_close(getattr(owner, name), value)
+    finally:
+        evidence.close()
+
+
+@pytest.mark.parametrize('late', ['failure', 'nonfinite', 'invalid_transition'])
+def test_qualification_success_waits_for_complete_valid_interval(native_types, late):
+    env, owner, evidence = setup(native_types, qualification=True)
+    owner.config = replace(owner.config, stable_s=.025)
+    env._terminated = torch.tensor([False])
+    evidence.install()
+    try:
+        for index in range(2):
+            for tick in range(4):
+                values = physics()
+                if index == 1 and tick == 3:
+                    env._terminated.fill_(late == 'failure')
+                    if late == 'nonfinite':
+                        values['height_m'].fill_(float('nan'))
+                owner.observe_physics(**values)
+            now = torch.tensor([.02 * (index + 1)], dtype=torch.float64)
+            owner.finish_interval(now, None, policy_owned=torch.tensor([True]), failed=env._terminated)
+            transition(evidence, [1], valid=[not (index == 1 and late == 'invalid_transition')])
+        record = evidence.summary()['qualification']['episodes'][0]
+        assert record['first_qualifying_tick_at_s'] == pytest.approx(.025)
+        if late == 'failure':
+            assert record['outcome'] == 'failure' and record['validated_boundary']
+        else:
+            assert record['outcome'] == 'success' and not record['validated_boundary']
+            assert record['had_invalid']
+        assert evidence.summary()['qualification']['by_scenario']['recovery_fixture']['validated_outcomes'].get('success', 0) == 0
+    finally:
+        evidence.close()
+
+
+def test_later_tracking_failure_does_not_rewrite_completed_qualification(native_types):
+    _, owner, evidence = setup(native_types, qualification=True)
+    evidence.install()
+    try:
+        for index in range(3):
+            for _ in range(4):
+                owner.observe_physics(**physics())
+            now = torch.tensor([.02 * (index + 1)], dtype=torch.float64)
+            owner.finish_interval(now, estimate(native_types, now),
+                policy_owned=torch.tensor([True]), failed=torch.tensor([index == 2]))
+            transition(evidence, [1])
+            if index == 1:
+                completed = evidence.summary()['qualification']['episodes'][0]
+        assert evidence.summary()['qualification']['episodes'][0] == completed
+        assert completed['outcome'] == 'success' and completed['validated_boundary']
+    finally:
+        evidence.close()
+
+
+def test_qualification_reset_binds_after_native_episode_publication_without_inheriting_stability(native_types):
+    env, owner, evidence = setup(native_types, qualification=True)
+    evidence.install()
+    try:
+        for _ in range(4):
+            owner.observe_physics(**physics())
+        owner.reset(torch.tensor([0]), torch.tensor([True]))
+        assert evidence.qualification['clock'].item() == 0
+        env._episode_id += 1
+        transition(evidence, [1])
+        for _ in range(4):
+            owner.observe_physics(**physics())
+        owner.finish_interval(torch.tensor([.04], dtype=torch.float64), None,
+            policy_owned=torch.tensor([True]), failed=torch.tensor([False]))
+        transition(evidence, [2])
+        first, second = evidence.summary()['qualification']['episodes']
+        assert first['outcome'] == 'incomplete_reset' and first['initial_birth']
+        assert first['episode_id'] == 1 and first['budget_elapsed_s'] == pytest.approx(.02)
+        assert second['episode_id'] == 2 and not second['initial_birth']
+        assert second['outcome'] == 'incomplete_at_evaluation_end'
+        assert second['max_physical_stable_s'] == pytest.approx(.02)
+        assert evidence.summary()['qualification']['by_scenario']['recovery_fixture']['completed_valid'] == 0
+    finally:
+        evidence.close()
+
+
+def test_qualification_budget_counts_owned_ticks_and_uses_original_height(native_types):
+    _, owner, evidence = setup(native_types, 2, qualification=True)
+    evidence.install()
+    try:
+        for index in range(6):
+            for _ in range(4):
+                owner.observe_physics(**physics(2, height_m=torch.tensor([.2, .32]),
+                    command_height_m=torch.full((2,), .4),
+                    policy_owned=torch.full((2,), index >= 2, dtype=torch.bool)))
+            now = torch.full((2,), .02 * (index + 1), dtype=torch.float64)
+            owner.finish_interval(now, None, policy_owned=torch.full((2,), index >= 2, dtype=torch.bool),
+                failed=torch.zeros(2, dtype=torch.bool))
+            transition(evidence, [1, 1])
+            if index == 1:
+                assert not evidence.qualification['clock'].any()
+        failed, success = evidence.summary()['qualification']['episodes']
+        assert failed['outcome'] == 'timeout' and failed['validated_boundary']
+        assert failed['budget_elapsed_s'] == pytest.approx(.08)
+        assert success['outcome'] == 'success' and success['validated_boundary']
+        assert success['target_height_m'] == pytest.approx(.32)
+        assert not owner._verified.any()  # Native still used its actual .4 m target.
     finally:
         evidence.close()
