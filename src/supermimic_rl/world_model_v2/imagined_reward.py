@@ -112,10 +112,11 @@ class LocomotionRewardContext:
                 ticks.resultant_contact_force[:, tick].clamp_min(0), ground_valid[:, tick], terrain_rows, tick_reference,
                 action.new_full((n,), (step * 4 + tick + 1) * self.assembly.parameters.physics_dt_s),
                 ids, ids, valid,
-                # The replay does not record the first-flight latch yet, so jump
-                # flight terms fail closed here until jump imagination is synced.
+                # Replays without the first-flight latch leave it None, so jump
+                # flight terms fail closed instead of being inferred.
                 jump_progress=None if jump_interval is None else JumpProgress(
-                    jump_interval.reference_stage[:, tick], jump_interval.ascent_seen[:, tick])))
+                    jump_interval.reference_stage[:, tick], jump_interval.ascent_seen[:, tick],
+                    None if jump_interval.flight_closed is None else jump_interval.flight_closed[:, tick])))
         result = self.assembly.integrate(start, tuple(samples), action, reward_memory,
             controller_memory.wheel_torque_history, self.legs, self.encoder_bias, self.motor_strength)
         return replace(result, termination_height=torch.stack(heights, -1)[..., None],

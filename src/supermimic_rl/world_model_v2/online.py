@@ -28,7 +28,8 @@ from .replay import CompactReplay
 from .stair_source import StairScenario, StairSourceState
 from .stair_task import StairTaskState
 from .terrain import AtlasTerrain
-from .jump_task import JumpTaskConfig, JumpTaskState, JumpTask, JUMP_RECORD_FIELDS, JUMP_TRIGGER_RECORD_FIELDS
+from .jump_task import (JumpTaskConfig, JumpTaskState, JumpTask, JUMP_FLIGHT_LATCH_RECORD_FIELDS,
+                        JUMP_RECORD_FIELDS, JUMP_TRIGGER_RECORD_FIELDS)
 from .recovery_task import RecoveryTaskConfig, RecoveryTask, RECOVERY_RECORD_FIELDS
 from .guard import GUARD_MODES, NativeRegressionGuard
 from .validation import calibrate_contact_floor, validate
@@ -36,7 +37,8 @@ from .validation import calibrate_contact_floor, validate
 CHECKPOINT_FORMAT = 'supermimic-online-v2'
 
 
-GUARD_SETTINGS = ('guard_drop_fraction', 'guard_patience', 'guard_window', 'guard_mode')
+GUARD_SETTINGS = ('guard_drop_fraction', 'guard_patience', 'guard_window', 'guard_mode',
+                  'guard_min_rate_fraction', 'guard_recover_after')
 
 
 @dataclass(frozen=True)
@@ -93,6 +95,9 @@ class OnlineConfig:
     # Collections averaged per judgment, and "restore" or review-only "report" (see guard.py).
     guard_window: int = 1
     guard_mode: str = 'restore'
+    # Restore mode: lowest actor rate as a base fraction, and good judgments that undo one halving.
+    guard_min_rate_fraction: float = 0.
+    guard_recover_after: int = 0
 
     @classmethod
     def from_dict(cls, value):
@@ -132,7 +137,9 @@ class OnlineConfig:
         if (self.initial_actor is None) != (self.initial_actor_sha256 is None):
             raise ValueError('initial_actor and initial_actor_sha256 must be given together')
         if (not 0 <= self.guard_drop_fraction < 1 or type(self.guard_patience) is not int or self.guard_patience < 1
-                or type(self.guard_window) is not int or self.guard_window < 1 or self.guard_mode not in GUARD_MODES):
+                or type(self.guard_window) is not int or self.guard_window < 1 or self.guard_mode not in GUARD_MODES
+                or not 0 <= self.guard_min_rate_fraction <= 1
+                or type(self.guard_recover_after) is not int or self.guard_recover_after < 0):
             raise ValueError('Guard needs a drop fraction in [0, 1), a positive integer patience and window, '
                              f'and a mode in {GUARD_MODES}')
         if self.learning.anchor_coefficient and self.initial_actor is None:
@@ -167,7 +174,8 @@ def policy_start_candidates(replay, config, env_ids, policy_dt_s):
                     raise ValueError('Jump imagination requires complete native records; old rows are not inferred')
                 ordinary &= data['jump_record_valid'][slots, env, 0] > .5
                 jump = JumpTaskState.decode({name: data[name][slots, env] for name in
-                                            (*JUMP_RECORD_FIELDS, *JUMP_TRIGGER_RECORD_FIELDS) if name in data})
+                                            (*JUMP_RECORD_FIELDS, *JUMP_TRIGGER_RECORD_FIELDS,
+                                             *JUMP_FLIGHT_LATCH_RECORD_FIELDS) if name in data})
                 if jump.trigger_flags is not None:
                     ordinary &= jump.trigger_flags[:, 0]
             if config.record_recovery:
@@ -290,7 +298,8 @@ class OnlineTrainer:
             record_terrain=config.record_stair_source, record_stairs=config.record_stair_source,
             record_stair_source=config.record_stair_source, record_jumps=config.record_jumps,
             record_recovery=config.record_recovery,
-            record_jump_trigger=jump_task is not None and jump_task.config.trigger is not None)
+            record_jump_trigger=jump_task is not None and jump_task.config.trigger is not None,
+            record_jump_flight_latch=jump_task is not None and jump_task.config.flight_latch)
         if any(name not in replay.data or tuple(replay.data[name].shape[2:]) != shape for name, shape in expected.items()):
             raise ValueError('Online replay field layout differs from the current compact contract')
         self.mixing = MixedDecision(environment, self.learner.actor, teacher_decision, seed=config.seed + 2,
@@ -330,7 +339,8 @@ class OnlineTrainer:
         config = self.config
         self.guard = (NativeRegressionGuard(config.guard_drop_fraction, config.guard_patience,
                                             config.learning.actor_learning_rate, window=config.guard_window,
-                                            mode=config.guard_mode)
+                                            mode=config.guard_mode, min_rate_fraction=config.guard_min_rate_fraction,
+                                            recover_after=config.guard_recover_after)
                       if config.guard_drop_fraction else None)
         self.guard_cold_cycles_remaining = 0
         self.guard_cold_previous_bad_cycles = None

@@ -107,7 +107,7 @@ class FirstFlightLatch:
         self.request = current.clone()
 
 
-def _install_flight_latch(tasks) -> FirstFlightLatch:
+def install_flight_latch(tasks) -> FirstFlightLatch:
     latch = FirstFlightLatch(tasks)
     observe_physics = tasks.observe_physics
 
@@ -142,7 +142,7 @@ def install_shared_reward(composer, *, verify_native=False, extensions: RewardEx
     composer.supermimic_reward_extensions = extensions
     composer.supermimic_jump_tasks = jump_tasks
     if extensions.needs_jump_progress:
-        _install_flight_latch(jump_tasks)
+        install_flight_latch(jump_tasks)
     if extensions.success_event is not None:
         composer.tuning = replace(composer.tuning, success_event=float(extensions.success_event))
     if verify_native:

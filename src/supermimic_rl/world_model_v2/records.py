@@ -20,7 +20,7 @@ from .sensing import SensorQueues, SensorTransforms
 from .motion_task import MOTION_TASK_DIM
 from .stair_task import STAIR_RECORD_FIELDS
 from .stair_source import TOF_RECORD_FIELDS
-from .jump_task import JUMP_RECORD_FIELDS, JUMP_TRIGGER_RECORD_FIELDS
+from .jump_task import JUMP_FLIGHT_LATCH_RECORD_FIELDS, JUMP_RECORD_FIELDS, JUMP_TRIGGER_RECORD_FIELDS
 from .recovery_task import RECOVERY_RECORD_FIELDS
 
 PHYSICAL_DIM = 3 + 4 + 3 + 3 + 6 + 8
@@ -119,15 +119,16 @@ class RecordSpec:
     def fields(self, *, record_terrain: bool = False, record_tasks: bool = False,
                record_stairs: bool = False, record_stair_source: bool = False,
                record_jumps: bool = False, record_recovery: bool = False,
-               record_jump_trigger: bool = False) -> dict[str, tuple[int, ...]]:
+               record_jump_trigger: bool = False,
+               record_jump_flight_latch: bool = False) -> dict[str, tuple[int, ...]]:
         if record_stair_source and not (record_terrain and record_tasks and record_stairs):
             raise ValueError('Ideal stair-source records require terrain, command and stair task records')
         if record_jumps and not record_stair_source:
             raise ValueError('Jump records require the complete command, terrain and stair arbitration state')
         if record_recovery and not record_jumps:
             raise ValueError('Recovery records require complete jump and stair arbitration state')
-        if record_jump_trigger and not record_jumps:
-            raise ValueError('Jump trigger records require the native jump task')
+        if (record_jump_trigger or record_jump_flight_latch) and not record_jumps:
+            raise ValueError('Jump trigger and flight-latch records require the native jump task')
         result = {
             "physical": (PHYSICAL_DIM,), "height": (1,), "scan": (TERRAIN_SCAN_DIM,),
             "memory": (MEMORY_DIM,), "queues": (QUEUE_DIM,), "goal": (self.goal_dim,),
@@ -159,6 +160,8 @@ class RecordSpec:
             result['jump_record_valid'] = (1,)
         if record_jump_trigger:
             result.update(JUMP_TRIGGER_RECORD_FIELDS)
+        if record_jump_flight_latch:
+            result.update(JUMP_FLIGHT_LATCH_RECORD_FIELDS)
         if record_recovery:
             result.update(RECOVERY_RECORD_FIELDS)
             result['recovery_record_valid'] = (1,)

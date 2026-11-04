@@ -371,3 +371,43 @@ def test_gate_critic_carries_relative_cooldown_and_episode_readiness():
             admitted=torch.zeros(1, 4), base_mode=torch.zeros(1, dtype=torch.long),
             task_family=torch.full((1,), 4), elapsed_s=torch.ones(1), ground_z=torch.zeros(1),
             blocked_by_stair=torch.zeros(1, dtype=torch.bool), interval_uniform=torch.zeros(1))
+
+
+def test_first_flight_latch_matches_the_native_owner_through_bounces_and_new_requests():
+    from supermimic_rl.course.reward import install_flight_latch
+
+    n, native = 2, native_jumps(2)
+    owner = native._terrain_course.tasks
+    latch = install_flight_latch(owner)
+    task = JumpTask(JumpTaskConfig.capture(native))
+    assert task.config.flight_latch and JumpTaskConfig.from_dict(asdict(task.config)) == task.config
+    state = JumpTaskState.capture(native)
+    assert state.record()['jump_flight_latch'].shape == (n, 3)
+    completed = estimate_at(native.time, n)
+    closed_seen = torch.zeros(n, dtype=torch.bool)
+    for step in range(60):
+        physical = physical_ticks(n)
+        force = torch.full((n, 4, 2), 20.)
+        # Row 0 rises and lands, then bounces once more; row 1 only unloads without rising.
+        if 11 <= step < 15 or 20 <= step < 22:
+            force[0] = 0.
+            physical.position[0, :, 2] = .38
+            physical.velocity[0, :, 2] = .4
+        if 11 <= step < 15:
+            force[1] = 0.
+        expected = []
+        for tick in range(4):
+            owner.observe_physics(force[:, tick], physical.velocity[:, tick, 2], torch.zeros(n),
+                physical.position[:, tick, 2], angular_speed_rad_s=torch.zeros(n), dt=.005)
+            expected.append(latch.closed.clone())
+        result = task.observe_interval(state, physical=physical, wheel_support_load=force,
+            base_com_offset=torch.zeros(n, 3), base_mode=owner.base_mode,
+            command_height=owner.stream.current[:, 3], ground_z=torch.zeros(n, 4))
+        same_state(result.state, native)
+        torch.testing.assert_close(result.flight_closed, torch.stack(expected, -1), rtol=0, atol=0)
+        closed_seen |= result.flight_closed.any(-1)
+        state = advance(native, task, result.state, completed).state
+        completed = estimate_at(native.time, n)
+    assert closed_seen.tolist() == [True, False]
+    legacy = {key: value for key, value in state.record().items() if key != 'jump_flight_latch'}
+    assert JumpTaskState.decode(legacy).flight_latch is None

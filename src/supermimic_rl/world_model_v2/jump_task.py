@@ -45,6 +45,9 @@ JUMP_TRIGGER_RECORD_VERSION = 1
 JUMP_TRIGGER_RECORD_FIELDS = {'jump_trigger_clock': (1,), 'jump_trigger_flags': (2,)}
 JUMP_TRIGGER_RECORD_DTYPES = {'jump_trigger_clock': torch.float64, 'jump_trigger_flags': torch.bool}
 JUMP_TRIGGER_FEATURE_DIM = 3
+# First-real-flight latch of the shared jump reward: (latch request id, lifted, closed).
+JUMP_FLIGHT_LATCH_RECORD_FIELDS = {'jump_flight_latch': (3,)}
+JUMP_FLIGHT_LATCH_RECORD_DTYPES = {'jump_flight_latch': torch.int64}
 _BOOL_NAMES = {
     'protocol.cancelled', 'protocol.flight_seen', '_physical_cancelled',
     'flight_seen', 'ascent_seen', 'supported_start', '_last_supported',
@@ -58,13 +61,16 @@ class JumpTaskConfig:
     physics_dt_s: float = .005
     trigger: JumpTakeoffConfig | None = None
     trigger_record_version: int = JUMP_TRIGGER_RECORD_VERSION
+    # The native shared reward owns a first-real-flight latch (course.reward.FirstFlightLatch).
+    flight_latch: bool = False
 
     @classmethod
     def capture(cls, native):
         tasks = native._terrain_course.tasks
         gate = getattr(native, 'supermimic_jump_trigger', None)
         return cls(tasks.protocol.config, tasks.reference.config, float(native.physics_dt),
-                   None if gate is None else gate.config)
+                   None if gate is None else gate.config,
+                   flight_latch=hasattr(tasks, 'supermimic_flight_latch'))
 
     @classmethod
     def from_dict(cls, value):
@@ -75,7 +81,8 @@ class JumpTaskConfig:
         return cls(RequestProtocolConfig(**value['request']), JumpReferenceConfig(**value['reference']),
                    value['physics_dt_s'],
                    None if value.get('trigger') is None else JumpTakeoffConfig(**value['trigger']),
-                   value.get('trigger_record_version', JUMP_TRIGGER_RECORD_VERSION))
+                   value.get('trigger_record_version', JUMP_TRIGGER_RECORD_VERSION),
+                   value.get('flight_latch', False))
 
     def __post_init__(self):
         if self.request.policy_dt_s != .02 or self.physics_dt_s != .005:
@@ -91,6 +98,7 @@ class JumpTaskState:
     values: Tensor
     trigger_clock: Tensor | None = None  # last_end_s, absolute float64 clock
     trigger_flags: Tensor | None = None  # known state, was_active
+    flight_latch: Tensor | None = None   # int64 (latch request id, lifted, closed)
 
     @classmethod
     @torch.no_grad()
@@ -101,11 +109,14 @@ class JumpTaskState:
         gate = getattr(native, 'supermimic_jump_trigger', None)
         trigger = None if gate is None else (
             gate.last_end_s[:, None], torch.stack((torch.ones_like(gate.was_active), gate.was_active), -1))
+        latch = getattr(course.tasks, 'supermimic_flight_latch', None)
+        flight_latch = None if latch is None else torch.stack(
+            (latch.request.long(), latch.lifted.long(), latch.closed.long()), -1)
         return cls._pack(native._clock(), course.tasks.protocol, course.tasks,
-                         origin_z=course.router.origins[:, 2], trigger=trigger)
+                         origin_z=course.router.origins[:, 2], trigger=trigger, flight_latch=flight_latch)
 
     @classmethod
-    def _pack(cls, now, protocol, owner, *, origin_z=None, trigger=None):
+    def _pack(cls, now, protocol, owner, *, origin_z=None, trigger=None, flight_latch=None):
         def get(name):
             if name == 'now_s':
                 return now
@@ -119,20 +130,30 @@ class JumpTaskState:
         return cls(torch.stack([get(name) for name in JUMP_ID_NAMES], -1).clone(),
                    torch.stack([get(name) for name in JUMP_CLOCK_NAMES], -1).clone(),
                    torch.stack([get(name).float() for name in JUMP_VALUE_NAMES], -1).clone(),
-                   *captured_trigger)
+                   *captured_trigger, None if flight_latch is None else flight_latch.clone())
 
     @classmethod
     def decode(cls, record):
         if ('jump_trigger_clock' in record) != ('jump_trigger_flags' in record):
             raise ValueError('Incomplete jump trigger record')
         return cls(*(record[name] for name in JUMP_RECORD_FIELDS),
-                   record.get('jump_trigger_clock'), record.get('jump_trigger_flags'))
+                   record.get('jump_trigger_clock'), record.get('jump_trigger_flags'),
+                   record.get('jump_flight_latch'))
 
     def record(self):
         result = dict(zip(JUMP_RECORD_FIELDS, (self.ids, self.clock, self.values)))
         if self.trigger_clock is not None:
             result.update(jump_trigger_clock=self.trigger_clock, jump_trigger_flags=self.trigger_flags)
+        if self.flight_latch is not None:
+            result['jump_flight_latch'] = self.flight_latch
         return result
+
+    def _flight_latch_state(self):
+        latch, n = self.flight_latch, len(self.ids)
+        if (latch.shape != (n, 3) or latch.dtype != torch.int64 or latch.device != self.ids.device
+                or ((latch[:, 1:] != 0) & (latch[:, 1:] != 1)).any()):
+            raise ValueError('Invalid first-flight latch record')
+        return latch[:, 0], latch[:, 1].bool(), latch[:, 2].bool()
 
     def _trigger_state(self):
         n, device = len(self.ids), self.ids.device
@@ -251,6 +272,7 @@ class JumpInterval:
     success_credited: Tensor
     reference_stage: Tensor
     ascent_seen: Tensor
+    flight_closed: Tensor | None = None   # per tick; None without a recorded first-flight latch
 
 
 class JumpTask:
@@ -367,7 +389,8 @@ class JumpTask:
             active = protocol.active_id >= 0
             last_end = torch.where(was_active & ~active, now_s, last_end)
             trigger = (last_end[:, None], torch.stack((state.trigger_flags[:, 0], active), -1))
-        return JumpAdvance(JumpTaskState._pack(now_s, protocol, owner, trigger=trigger), command, mode,
+        return JumpAdvance(JumpTaskState._pack(now_s, protocol, owner, trigger=trigger,
+                                               flight_latch=state.flight_latch), command, mode,
             condition.height_m, condition.clock_s, condition.response, condition.finished_id, condition.end_reason,
             postponed)
 
@@ -393,6 +416,7 @@ class JumpTask:
         """
         from transformer_rl.formal.lab_env.course_tasks import LabCourseTasks
         from transformer_rl.formal.tasks.reward import RewardPhase
+        from ..reward_kernel import advance_flight_latch
 
         n = len(state.ids)
         if physical.position.shape != (n, 4, 3) or wheel_support_load.shape != (n, 4, 2):
@@ -406,15 +430,26 @@ class JumpTask:
             gravity = physical.gravity_body
             tilt = torch.atan2(gravity[..., :2].norm(dim=-1), -gravity[..., 2])
             speed = physical.angular_velocity_body.norm(dim=-1)
-            phases, ascents = [], []
+            phases, ascents, closed_ticks = [], [], []
+            latch = None if state.flight_latch is None else state._flight_latch_state()
             for tick in range(4):
                 LabCourseTasks.observe_physics(owner, wheel_support_load[:, tick], velocity_z[:, tick],
                     tilt[:, tick], physical.position[:, tick, 2], angular_speed_rad_s=speed[:, tick],
                     dt=self.config.physics_dt_s)
                 phases.append(owner.phase.clone())
                 ascents.append(owner.ascent_seen.clone())
+                if latch is not None:
+                    # Same update as the native FirstFlightLatch after observe_physics.
+                    request, lifted, closed = latch
+                    changed = owner.physical_id != request
+                    lifted, closed = advance_flight_latch(lifted & ~changed, closed & ~changed,
+                        active=owner.physical_id >= 0, ascent_seen=owner.ascent_seen, air_ticks=owner.air_ticks)
+                    latch = (owner.physical_id.clone(), lifted, closed)
+                    closed_ticks.append(closed.clone())
             trigger = (None if state.trigger_clock is None else (state.trigger_clock, state.trigger_flags))
-            following = JumpTaskState._pack(state.now_s, protocol, owner, trigger=trigger)
+            flight_latch = None if latch is None else torch.stack(
+                (latch[0].long(), latch[1].long(), latch[2].long()), -1)
+            following = JumpTaskState._pack(state.now_s, protocol, owner, trigger=trigger, flight_latch=flight_latch)
             phase = torch.stack(phases, -1)
             success = (owner.success_id >= 0) & (owner.success_id > state.ids[:, 6])
         curve = self.reference(state)
@@ -422,4 +457,5 @@ class JumpTask:
         height = torch.where(landing, ground_z + command_height[:, None], curve.height_world_z_m[:, None])
         velocity = torch.where(landing, 0., curve.velocity_world_z_m_s[:, None])
         return JumpInterval(following, phase, height, velocity, owner.success_id.clone(), success,
-                            curve.clock_stage[:, None].expand(-1, 4), torch.stack(ascents, -1))
+                            curve.clock_stage[:, None].expand(-1, 4), torch.stack(ascents, -1),
+                            torch.stack(closed_ticks, -1) if closed_ticks else None)
