@@ -90,7 +90,13 @@ class CourseAdapter(IsaacAdapter):
 
     def __init__(self, env, launcher, health, curriculum, provenance, log_directory, *,
                  mechanics_backend="newton", evaluation_configuration=None, record_substeps=False, substep_audit=False,
-                 profile_steps=False):
+                 profile_steps=False, desynchronize_episodes=False, seed=0):
+        if type(desynchronize_episodes) is not bool:
+            raise ValueError("desynchronize_episodes must be boolean")
+        if desynchronize_episodes and evaluation_configuration is not None:
+            raise ValueError("Fixed evaluation keeps its scripted episode clocks")
+        self._desynchronize = desynchronize_episodes
+        self._desync_generator = torch.Generator(device="cpu").manual_seed(seed)
         self.env, self._launcher, self._health = env, launcher, health
         self.curriculum, self.provenance = curriculum, provenance
         self._native_log_directory = Path(log_directory)
@@ -169,6 +175,23 @@ class CourseAdapter(IsaacAdapter):
                     (self, "_capture_snapshot", "adapter.capture_snapshot")):
                 if owner is not None and callable(getattr(owner, method, None)):
                     self._profiler.wrap(owner, method, label)
+
+    @torch.no_grad()
+    def reset(self):
+        """Cold reset; optionally spread the first episodes' time limits uniformly.
+
+        All rows are born together, so with equal episode lengths every row
+        times out and is reborn in the same interval. Like RSL-RL's
+        init_at_random_ep_len, the first episode of each row is truncated at a
+        uniform point of its length, after which episodes stay staggered.
+        Only the time-limit counter moves; task clocks are untouched.
+        """
+        snapshot = super().reset()
+        if self._desynchronize:
+            limit = int(self.env.max_episode_length)
+            offset = torch.randint(0, limit, (self.num_envs,), generator=self._desync_generator)
+            self.env.episode_length_buf.copy_(offset.to(self.env.episode_length_buf))
+        return snapshot
 
     def evaluation_begin(self, schema):
         from .evaluation import CourseEvaluation
