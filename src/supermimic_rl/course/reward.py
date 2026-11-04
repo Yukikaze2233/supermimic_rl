@@ -99,12 +99,9 @@ class FirstFlightLatch:
         self.closed = torch.zeros_like(tasks.ascent_seen)
 
     def observe(self, tasks) -> None:
-        current = tasks.physical_id
-        changed = current != self.request
-        self.lifted, self.closed = advance_flight_latch(
-            self.lifted & ~changed, self.closed & ~changed, active=current >= 0,
+        self.request, self.lifted, self.closed = advance_flight_latch(
+            self.request, self.lifted, self.closed, current=tasks.physical_id,
             ascent_seen=tasks.ascent_seen, air_ticks=tasks.air_ticks)
-        self.request = current.clone()
 
 
 def install_flight_latch(tasks) -> FirstFlightLatch:

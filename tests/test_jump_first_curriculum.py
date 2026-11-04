@@ -254,6 +254,11 @@ def test_reported_height_ladder_follows_opened_gates_not_the_coordinate_and_fade
     assert curriculum.jump_height_level() is None
     assist = object.__new__(JumpAssist)
     assist.curriculum, assist.config = curriculum, JumpAssistConfig(probability=1., decay='force')
+    index = curriculum.stage_names.index('active_jump')
+    assist.stage_start, assist.stage_budget = sum(curriculum.stage_budgets[:index]), curriculum.stage_budgets[index]
+    curriculum.set_opened_gates([])
+    assert assist.level() == 0.                      # no assist before its stage, even with the ladder
+    curriculum.opened_gates = None
     # Far past every height fraction and the assist stage: with reported gates
     # the cap and the assist follow the opened ladder only.
     curriculum.set_progress(sum(curriculum.stage_budgets[:6]), 0)

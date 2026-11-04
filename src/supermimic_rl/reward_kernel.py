@@ -65,7 +65,7 @@ class RewardExtensions:
 
     @property
     def needs_jump_progress(self) -> bool:
-        return bool(self.jump_flight or self.jump_lift or self.jump_missed)
+        return bool(self.jump_flight or self.jump_lift or self.jump_push or self.jump_missed)
 
 
 @dataclass(frozen=True)
@@ -106,16 +106,19 @@ class JumpProgress:
                             torch.cat([item.ascent_seen for item in items]), closed)
 
 
-def advance_flight_latch(lifted: Tensor, closed: Tensor, *, active: Tensor, ascent_seen: Tensor,
-                         air_ticks: Tensor) -> tuple[Tensor, Tensor]:
-    """One physical tick of a request's first-real-flight latch.
+def advance_flight_latch(request: Tensor, lifted: Tensor, closed: Tensor, *, current: Tensor,
+                         ascent_seen: Tensor, air_ticks: Tensor) -> tuple[Tensor, Tensor, Tensor]:
+    """One physical tick of a request's first-real-flight latch, after the task owner observed it.
 
-    ``lifted``: airborne for the native two ticks with real ascent (wheel
-    unloading alone sets native flight_seen). ``closed``: touched down after
-    that liftoff. The owner clears both whenever the physical request changes.
+    The latch belongs to ``request``; a different ``current`` physical request
+    clears it. ``lifted``: airborne for the native two ticks with real ascent
+    (wheel unloading alone sets native flight_seen). ``closed``: touched down
+    after that liftoff. Returns the new (request, lifted, closed).
     """
-    lifted = lifted | (active & ascent_seen & (air_ticks >= 2))
-    return lifted, closed | (lifted & (air_ticks == 0))
+    changed = current != request
+    lifted = (lifted & ~changed) | ((current >= 0) & ascent_seen & (air_ticks >= 2))
+    closed = (closed & ~changed) | (lifted & (air_ticks == 0))
+    return current.clone(), lifted, closed
 
 
 @dataclass(frozen=True)
@@ -471,7 +474,10 @@ def physical_reward_densities(sample: RewardPhysics, reference: RewardReference,
         # enough: early wheel unloading moves the native phase to LANDING.
         target = reference.jump_velocity_world_z_m_s
         pushing = (jump & (phase != int(RewardPhase.FLIGHT)) & (target > JUMP_PUSH_MIN_REFERENCE_M_S))
-        if closed is not None:
+        if closed is None:
+            if jump.any():
+                raise ValueError('Jump push rewards require the first-flight latch of the request')
+        else:
             pushing = pushing & ~closed   # no second push after the first real flight landed
         achieved = (sample.velocity_origin_world_m_s[:, 2] / target.clamp_min(JUMP_PUSH_MIN_REFERENCE_M_S)).clamp(0, 1)
         positive['jump_push'] = extensions.jump_push * pushing.to(v_up.dtype) * achieved

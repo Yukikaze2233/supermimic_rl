@@ -219,31 +219,34 @@ def test_success_event_extension_is_paid_and_recorded():
         install_shared_reward(setup('ordinary')[0], verify_native=True, extensions=RewardExtensions(jump_flight=1.))
 
 
-def test_jump_push_pays_reference_upward_speed_only_before_flight_in_the_push_window():
+def test_jump_push_pays_reference_upward_speed_only_before_the_first_real_landing():
     from supermimic_rl.reward_kernel import RewardExtensions
 
     extensions = RewardExtensions(jump_push=2.)
+    fresh = _progress('EXTENSION', [False, False])
     # Reference vertical speeds are [0.2, -0.1] m/s; measured [1.5, -0.5] m/s.
-    _, takeoff = _jump_densities('jump_takeoff', extensions)
+    _, takeoff = _jump_densities('jump_takeoff', extensions, fresh)
     torch.testing.assert_close(takeoff.positive['jump_push'], torch.tensor([2., 0.]))
     assert not takeoff.invalid.any()
     composer, reference = setup('jump_takeoff')
-    install_shared_reward(composer, extensions=extensions)
+    install_shared_reward(composer, extensions=extensions, jump_tasks=_task_owner(lambda: None))
     begin(composer, reference, torch.zeros(2, 6))
     window = composer._window
     history = RewardHistory(window['dq'], window['action_cost'], window['action2_cost'], composer._action_count)
     slow = replace(sample(composer, 1), velocity_origin_world_m_s=torch.tensor([[0., 0., .1], [0., 0., .3]]))
-    partial = physical_reward_densities(slow, reference, history, RewardParameters.from_composer(composer))
+    partial = physical_reward_densities(slow, reference, history, RewardParameters.from_composer(composer),
+                                        jump_progress=fresh)
     torch.testing.assert_close(partial.positive['jump_push'], torch.tensor([1., 0.]))
-    _, flight = _jump_densities('jump_flight', extensions)
+    _, flight = _jump_densities('jump_flight', extensions, fresh)
     assert flight.positive['jump_push'].abs().sum() == 0
     # Early wheel unloading moves the native phase to LANDING; the push is still paid.
-    _, unloaded = _jump_densities('jump_landing', extensions)
+    _, unloaded = _jump_densities('jump_landing', extensions, fresh)
     torch.testing.assert_close(unloaded.positive['jump_push'], torch.tensor([2., 0.]))
     # After the first real flight touched down, a second push is not paid.
-    both = RewardExtensions(jump_push=2., jump_missed=1.)
-    _, landed = _jump_densities('jump_landing', both, _progress('BALLISTIC', [True, True], (True, False)))
+    _, landed = _jump_densities('jump_landing', extensions, _progress('BALLISTIC', [True, True], (True, False)))
     torch.testing.assert_close(landed.positive['jump_push'], torch.tensor([0., 0.]))
+    with pytest.raises(ValueError, match='first-flight latch'):
+        _jump_densities('jump_takeoff', extensions, _progress('EXTENSION', [False, False], None))
     _, ordinary = _jump_densities('ordinary', extensions)
     assert ordinary.positive['jump_push'].abs().sum() == 0
 

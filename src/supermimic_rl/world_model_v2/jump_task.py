@@ -439,13 +439,10 @@ class JumpTask:
                 phases.append(owner.phase.clone())
                 ascents.append(owner.ascent_seen.clone())
                 if latch is not None:
-                    # Same update as the native FirstFlightLatch after observe_physics.
-                    request, lifted, closed = latch
-                    changed = owner.physical_id != request
-                    lifted, closed = advance_flight_latch(lifted & ~changed, closed & ~changed,
-                        active=owner.physical_id >= 0, ascent_seen=owner.ascent_seen, air_ticks=owner.air_ticks)
-                    latch = (owner.physical_id.clone(), lifted, closed)
-                    closed_ticks.append(closed.clone())
+                    # The native FirstFlightLatch update after observe_physics.
+                    latch = advance_flight_latch(*latch, current=owner.physical_id,
+                                                 ascent_seen=owner.ascent_seen, air_ticks=owner.air_ticks)
+                    closed_ticks.append(latch[2].clone())
             trigger = (None if state.trigger_clock is None else (state.trigger_clock, state.trigger_flags))
             flight_latch = None if latch is None else torch.stack(
                 (latch[0].long(), latch[1].long(), latch[2].long()), -1)

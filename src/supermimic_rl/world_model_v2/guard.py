@@ -21,24 +21,36 @@ from __future__ import annotations
 
 from collections import deque
 import copy
+import math
 import statistics
 
 GUARD_MODES = ('restore', 'report')
 
 
+def validate_guard_settings(*, drop_fraction, patience, window, mode, min_rate_fraction, recover_after) -> None:
+    """One validator for the guard and its online configuration (drop fraction 0 disables the guard)."""
+    if (not 0 <= drop_fraction < 1 or type(patience) is not int or patience < 1
+            or type(window) is not int or window < 1 or window % 2 == 0 or mode not in GUARD_MODES
+            or not 0 <= min_rate_fraction <= 1 or type(recover_after) is not int or recover_after < 0):
+        raise ValueError('Guard needs a drop fraction in [0, 1), positive patience, an odd positive window, '
+                         f'a mode in {GUARD_MODES}, a rate floor in [0, 1] and nonnegative recovery')
+
+
 class NativeRegressionGuard:
     def __init__(self, drop_fraction: float, patience: int, base_learning_rate: float, *,
                  window: int = 1, mode: str = 'restore', min_rate_fraction: float = 0., recover_after: int = 0):
-        if (not 0 < drop_fraction < 1 or type(patience) is not int or patience < 1 or not base_learning_rate > 0
-                or type(window) is not int or window < 1 or mode not in GUARD_MODES
-                or not 0 <= min_rate_fraction <= 1 or type(recover_after) is not int or recover_after < 0):
-            raise ValueError('Guard needs a drop fraction in (0, 1), positive patience, learning rate and window, '
-                             f'a mode in {GUARD_MODES}, a rate floor in [0, 1] and nonnegative recovery')
+        validate_guard_settings(drop_fraction=drop_fraction, patience=patience, window=window, mode=mode,
+                                min_rate_fraction=min_rate_fraction, recover_after=recover_after)
+        if not drop_fraction > 0 or not base_learning_rate > 0:
+            raise ValueError('An active guard needs a positive drop fraction and learning rate')
         self.drop_fraction, self.patience, self.base_learning_rate = drop_fraction, patience, base_learning_rate
         self.window, self.mode = window, mode
         self.min_rate_fraction, self.recover_after = min_rate_fraction, recover_after
         self.best_reward, self.best, self.bad_cycles, self.restorations = None, None, 0, 0
         self.halvings = self.good_judgments = 0   # restorations stay the record; halvings can be undone
+        # Halvings beyond the floor would not lower the rate but would delay its recovery.
+        self.max_halvings = (math.inf if min_rate_fraction <= 0
+                             else max(0, math.ceil(math.log2(1 / min_rate_fraction))))
         self.recent = deque(maxlen=window)
 
     @staticmethod
@@ -92,7 +104,7 @@ class NativeRegressionGuard:
                         if estimator_optimizer is not None:
                             estimator_optimizer.load_state_dict(copy.deepcopy(self.best['estimator_optimizer']))
                     self.restorations += 1
-                    self.halvings += 1
+                    self.halvings = min(self.halvings + 1, self.max_halvings)
                     self.bad_cycles, restored = 0, True
                     self.recent.clear()
             else:
@@ -124,7 +136,7 @@ class NativeRegressionGuard:
         judgment starts afresh; past restorations stay counted for the record.
         """
         self.restorations = int(state['restorations'])
-        self.halvings = int(state.get('halvings', self.restorations))
+        self.halvings = min(int(state.get('halvings', self.restorations)), self.max_halvings)
         self.good_judgments = int(state.get('good_judgments', 0))
         if (state.get('window', 1), state.get('mode', 'restore')) != (self.window, self.mode):
             return False

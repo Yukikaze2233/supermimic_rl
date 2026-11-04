@@ -99,6 +99,8 @@ class JumpAssist:
         """
         ladder = getattr(self.curriculum, 'jump_height_level', lambda: None)()
         if ladder is not None:
+            if self._progress() < 0:
+                return 0.          # never before the assist stage
             return self.config.probability * (1 - ladder / len(self.curriculum.config.jump_height_gates))
         progress = self._progress()
         if not 0 <= progress < 1:

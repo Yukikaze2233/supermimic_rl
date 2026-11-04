@@ -308,6 +308,9 @@ class PPOTrainer:
                                  if hasattr(environment, "course_progress") else None)
         self._normalization_samples = None
         self.statistics = EpisodeStatistics(environment.num_envs, self.device)
+        if resume is None and self.course is not None and self.course.mode == "report":
+            # The discovery reset sampled births before the opened gates were applied.
+            self.observation = environment.reset()
         if resume is not None:
             self.load(resume)
             self._apply_opened_gates()

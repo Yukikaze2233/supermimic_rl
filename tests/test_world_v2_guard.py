@@ -232,3 +232,21 @@ def test_restore_restarts_the_window_and_the_rate_has_a_floor_and_recovers():
     for reward in (.09,) * 7:
         observe(reward)
     assert guard.halvings < halvings
+
+
+def test_guard_settings_are_validated_once_and_halvings_stop_at_the_floor():
+    from supermimic_rl.world_model_v2.guard import validate_guard_settings
+
+    with pytest.raises(ValueError, match='odd'):
+        NativeRegressionGuard(.1, 1, 1e-3, window=4)
+    validate_guard_settings(drop_fraction=0., patience=2, window=1, mode='restore', min_rate_fraction=0.,
+                            recover_after=0)                      # a disabled guard is a valid setting
+    actor, optimizer = actor_and_optimizer()
+    guard = NativeRegressionGuard(.05, 1, 1e-3, min_rate_fraction=.25, recover_after=1)
+    observe = lambda reward: guard.observe(reward, guard.snapshot(actor, optimizer), actor, optimizer)
+    observe(.09)
+    for _ in range(5):
+        observe(.01)
+    assert guard.restorations == 5 and guard.halvings == 2 and guard.learning_rate() == pytest.approx(2.5e-4)
+    observe(.09)
+    assert guard.halvings == 1

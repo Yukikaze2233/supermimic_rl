@@ -31,7 +31,7 @@ from .terrain import AtlasTerrain
 from .jump_task import (JumpTaskConfig, JumpTaskState, JumpTask, JUMP_FLIGHT_LATCH_RECORD_FIELDS,
                         JUMP_RECORD_FIELDS, JUMP_TRIGGER_RECORD_FIELDS)
 from .recovery_task import RecoveryTaskConfig, RecoveryTask, RECOVERY_RECORD_FIELDS
-from .guard import GUARD_MODES, NativeRegressionGuard
+from .guard import NativeRegressionGuard, validate_guard_settings
 from .validation import calibrate_contact_floor, validate
 
 CHECKPOINT_FORMAT = 'supermimic-online-v2'
@@ -136,12 +136,10 @@ class OnlineConfig:
             raise ValueError('Recovery collection requires the complete jump and stair arbitration producer')
         if (self.initial_actor is None) != (self.initial_actor_sha256 is None):
             raise ValueError('initial_actor and initial_actor_sha256 must be given together')
-        if (not 0 <= self.guard_drop_fraction < 1 or type(self.guard_patience) is not int or self.guard_patience < 1
-                or type(self.guard_window) is not int or self.guard_window < 1 or self.guard_mode not in GUARD_MODES
-                or not 0 <= self.guard_min_rate_fraction <= 1
-                or type(self.guard_recover_after) is not int or self.guard_recover_after < 0):
-            raise ValueError('Guard needs a drop fraction in [0, 1), a positive integer patience and window, '
-                             f'and a mode in {GUARD_MODES}')
+        validate_guard_settings(drop_fraction=self.guard_drop_fraction, patience=self.guard_patience,
+                                window=self.guard_window, mode=self.guard_mode,
+                                min_rate_fraction=self.guard_min_rate_fraction,
+                                recover_after=self.guard_recover_after)
         if self.learning.anchor_coefficient and self.initial_actor is None:
             raise ValueError('The teacher anchor needs the PPO initial_actor it is centered on')
         if self.initial_actor is not None and self.actor_frame_dim != 35:
@@ -346,6 +344,10 @@ class OnlineTrainer:
         self.guard_cold_previous_bad_cycles = None
         if getattr(self, 'guard_settings_changed', None):
             self.resume_migrations.append({'guard_settings_changed': self.guard_settings_changed})
+        if saved is not None and self.guard is None:
+            # A rate lowered by an earlier guard must not outlive the guard.
+            for group in self.learner.optimizers['actor'].param_groups:
+                group['lr'] = config.learning.actor_learning_rate
         if saved is not None and self.guard is not None:
             if saved.get('guard') is not None and not self.guard.load_state_dict(saved['guard']):
                 self.resume_migrations.append('guard judgment restarted under a new window/mode')

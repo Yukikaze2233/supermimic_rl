@@ -247,7 +247,7 @@ class CourseGates:
     def state_dict(self) -> dict:
         return {"coordinate": self.coordinate, "opened": list(self.opened), "held_updates": self.held_updates,
                 "waiting": dict(self.waiting), "history": list(self.history), "records": self.records,
-                "opened_at": dict(self.opened_at)}
+                "opened_at": dict(self.opened_at), "mode": self.mode}
 
     def load_state_dict(self, state: dict, *, restart_hold: bool = False) -> None:
         """Restore the coordinate and opened gates; optionally restart the waiting gate's clock.
@@ -257,6 +257,9 @@ class CourseGates:
         """
         if not set(state["opened"]) <= set(self._by_key):
             raise ValueError("Saved course gates differ from the configured gates")
+        if state.get("mode", "hold") == "report" and self.mode == "hold":
+            # A reported course may already be past closed gates; holding would freeze it there.
+            raise ValueError("A report-mode course cannot resume in hold mode")
         self.coordinate, self.opened = int(state["coordinate"]), list(state["opened"])
         self.held_updates = 0 if restart_hold else int(state["held_updates"])
         self.waiting = {} if restart_hold else {key: int(value) for key, value in state.get("waiting", {}).items()}

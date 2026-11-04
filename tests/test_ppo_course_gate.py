@@ -300,3 +300,12 @@ def test_report_mode_rejects_a_course_ladder_without_configured_gates():
     environment.check_course_gates(["active_jump@0.25", "active_jump@0.5", "terrain"])
     with pytest.raises(ValueError, match="active_jump@0.5"):
         environment.check_course_gates(["active_jump@0.25", "active_jump@0.3"])
+
+
+def test_a_report_mode_course_cannot_resume_in_hold_mode():
+    reported = CourseGates(gates(window=1), STARTS, mode="report")
+    reported.advance({"rms/height_error_m": .1}, 500)
+    held = CourseGates(gates(window=1), STARTS)
+    with pytest.raises(ValueError, match="hold mode"):
+        held.load_state_dict(reported.state_dict())
+    CourseGates(gates(window=1), STARTS, mode="report").load_state_dict(held.state_dict())
