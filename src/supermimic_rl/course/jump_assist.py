@@ -32,9 +32,12 @@ EXTENSION, BALLISTIC = 1, 2
 RISE_BIN_EDGES = (.10, .20, .30)
 RISE_BINS = tuple(f'{low:.2f}-{high:.2f}' for low, high in zip((.0, *RISE_BIN_EDGES), (*RISE_BIN_EDGES, .40)))
 # "liftoff": the ended request was airborne after real ascent (whether or not it then succeeded).
+# "peak_low/peak_ok/peak_high": its peak rise against the native success window
+# |peak - requested| <= min(3 cm, requested / 2), counted when it ended.
+OUTCOMES = ('ended', 'success', 'liftoff', 'peak_low', 'peak_ok', 'peak_high')
 COUNTERS = ('assisted_requests', 'assisted_ended', 'assisted_success', 'unassisted_ended', 'unassisted_success',
             *(f'{who}{kind}_rise_{name}' for who in ('', 'unassisted_') for name in RISE_BINS
-              for kind in ('ended', 'success', 'liftoff')))
+              for kind in OUTCOMES))
 DECAYS = ('probability', 'force')
 
 
@@ -137,6 +140,12 @@ class JumpAssist:
         self._count('unassisted_ended', ended & ~helped)
         self._count_by_rise('ended', ended, helped)
         self._count_by_rise('liftoff', ended & lifted, helped)
+        # The peak still belongs to the ended request (it resets only at the next acceptance).
+        error = tasks.peak_rise - self.rise
+        tolerance = torch.minimum(torch.full_like(self.rise, .03), self.rise * .5) + 1e-6
+        self._count_by_rise('peak_low', ended & (error < -tolerance), helped)
+        self._count_by_rise('peak_ok', ended & (error.abs() <= tolerance), helped)
+        self._count_by_rise('peak_high', ended & (error > tolerance), helped)
         accepted = changed & (current >= 0)
         level = self.level()
         chance = self.config.assist_request_probability * (float(level > 0) if self.config.decay == 'force' else level)

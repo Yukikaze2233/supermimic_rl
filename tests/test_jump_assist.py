@@ -17,7 +17,8 @@ class Native:
             physical_id=torch.full((3,), -1), success_id=torch.full((3,), -1),
             flight_seen=torch.zeros(3, dtype=torch.bool), ascent_seen=torch.zeros(3, dtype=torch.bool),
             air_ticks=torch.zeros(3, dtype=torch.long), stage=torch.full((3,), EXTENSION),
-            reference_vz=torch.ones(3), launch=torch.ones(3), active_rise=torch.tensor([.05, .25, .35]))
+            reference_vz=torch.ones(3), launch=torch.ones(3), active_rise=torch.tensor([.05, .25, .35]),
+            peak_rise=torch.zeros(3))
         self.tasks.jump_reference = lambda: SimpleNamespace(
             clock_stage=self.tasks.stage, velocity_world_z_m_s=self.tasks.reference_vz,
             launch_velocity_m_s=self.tasks.launch)
@@ -181,3 +182,18 @@ def test_force_decay_keeps_a_fixed_unassisted_request_cohort_at_a_held_gate():
     assert assist.level() == .5
     with pytest.raises(ValueError):
         JumpAssistConfig(probability=1., assist_request_probability=1.1)
+
+
+def test_ended_requests_are_classified_against_the_native_peak_window():
+    native = Native()
+    assist = install_jump_assist(native, curriculum(100), {"probability": 0.})
+    native.tasks.physical_id[:] = torch.tensor([4, 5, 6])
+    native._apply_action()
+    # Requested rises .05/.25/.35 m: windows .025-.075, .22-.28, .32-.38.
+    native.tasks.peak_rise[:] = torch.tensor([.02, .25, .40])
+    native.tasks.physical_id[:] = -1
+    native._apply_action()
+    counters, _ = assist.metrics()
+    assert counters["course/jump_assist/peak_low_rise_0.00-0.10"] == 1
+    assert counters["course/jump_assist/peak_ok_rise_0.20-0.30"] == 1
+    assert counters["course/jump_assist/unassisted_peak_high_rise_0.30-0.40"] == 1
