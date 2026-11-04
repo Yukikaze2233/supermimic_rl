@@ -240,6 +240,10 @@ def test_jump_push_pays_reference_upward_speed_only_before_flight_in_the_push_wi
     # Early wheel unloading moves the native phase to LANDING; the push is still paid.
     _, unloaded = _jump_densities('jump_landing', extensions)
     torch.testing.assert_close(unloaded.positive['jump_push'], torch.tensor([2., 0.]))
+    # After the first real flight touched down, a second push is not paid.
+    both = RewardExtensions(jump_push=2., jump_missed=1.)
+    _, landed = _jump_densities('jump_landing', both, _progress('BALLISTIC', [True, True], (True, False)))
+    torch.testing.assert_close(landed.positive['jump_push'], torch.tensor([0., 0.]))
     _, ordinary = _jump_densities('ordinary', extensions)
     assert ordinary.positive['jump_push'].abs().sum() == 0
 

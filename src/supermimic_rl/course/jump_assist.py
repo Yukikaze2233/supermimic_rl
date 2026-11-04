@@ -65,7 +65,7 @@ class JumpAssistConfig:
 class JumpAssist:
     """Selection, force and outcome accounting; counters stay on device until ``metrics``."""
 
-    def __init__(self, native, curriculum, config: JumpAssistConfig):
+    def __init__(self, native, curriculum, config: JumpAssistConfig, latch):
         if config.stage not in curriculum.stage_names:
             raise ValueError('Jump assist stage is not part of the native course: ' + config.stage)
         self.native, self.curriculum, self.config = native, curriculum, config
@@ -77,9 +77,10 @@ class JumpAssist:
         self.selected = torch.zeros(native.num_envs, dtype=torch.bool, device=device)
         # A request counts as assisted only if assist impulse was actually delivered to it.
         self.impulse = torch.zeros(native.num_envs, device=device)
-        # Real liftoff: airborne for the native 2 ticks after real ascent. Native
-        # flight_seen (2 N wheel unloading) is reachable by retracting the legs.
-        self.lifted = torch.zeros(native.num_envs, dtype=torch.bool, device=device)
+        # Real liftoff (airborne for the native 2 ticks after real ascent) comes
+        # from the per-tick first-flight latch the shared reward also reads.
+        # Native flight_seen (2 N wheel unloading) is reachable by retracting the legs.
+        self.latch = latch
         self.rise = torch.zeros(native.num_envs, device=device)   # requested rise latched at acceptance
         self.edges = torch.tensor(RISE_BIN_EDGES, device=device)
         self.generator = torch.Generator(device=device).manual_seed(config.seed)
@@ -92,14 +93,13 @@ class JumpAssist:
         """Selection chance (probability decay) or force scale (force decay).
 
         With a performance jump height ladder the assist fades per opened
-        height level (1, 3/4, ... of ``probability`` for 3 gates) and stays
-        available while the stage coordinate moves on; otherwise it fades with
-        the coordinate inside the assist stage.
+        height level (1, 2/3, 1/3, 0 of ``probability`` for 3 gates), so the
+        full height range is trained unassisted, independent of the stage
+        coordinate; otherwise it fades with the coordinate inside the assist stage.
         """
         ladder = getattr(self.curriculum, 'jump_height_level', lambda: None)()
         if ladder is not None:
-            steps = len(self.curriculum.config.jump_height_gates) + 1
-            return self.config.probability * (1 - ladder / steps)
+            return self.config.probability * (1 - ladder / len(self.curriculum.config.jump_height_gates))
         progress = self._progress()
         if not 0 <= progress < 1:
             return 0.
@@ -116,16 +116,25 @@ class JumpAssist:
             self._count(f'{kind}_rise_{name}', in_bin)
             self._count(f'unassisted_{kind}_rise_{name}', in_bin & ~helped)
 
-    def track(self, tasks):
-        """Attribute request endings and select newly accepted requests (idempotent)."""
+    def lifted(self, request):
+        """Real liftoff seen for ``request`` (rows whose latch still belongs to it)."""
+        return self.latch.lifted & (self.latch.request == request) & (request >= 0)
+
+    def track(self, tasks, lifted=None):
+        """Attribute request endings and select newly accepted requests (idempotent).
+
+        ``lifted`` is the ended requests' liftoff when the latch has already
+        moved on to the next request (after an observe_physics call).
+        """
         current = tasks.physical_id.long()
         changed = current != self.request
         ended = changed & (self.request >= 0)
         helped = self.impulse > 0
+        lifted = self.lifted(self.request) if lifted is None else lifted
         self._count('assisted_ended', ended & helped)
         self._count('unassisted_ended', ended & ~helped)
         self._count_by_rise('ended', ended, helped)
-        self._count_by_rise('liftoff', ended & self.lifted, helped)
+        self._count_by_rise('liftoff', ended & lifted, helped)
         accepted = changed & (current >= 0)
         level = self.level()
         chance = self.config.assist_request_probability * (float(level > 0) if self.config.decay == 'force' else level)
@@ -136,12 +145,11 @@ class JumpAssist:
             draw = torch.rand(current.shape, device=current.device, generator=self.generator) < chance
         self.selected = torch.where(accepted, draw, self.selected & (current >= 0))
         self.impulse = torch.where(changed, 0., self.impulse)
-        self.lifted = self.lifted & ~changed
         self.rise = torch.where(accepted, tasks.active_rise, self.rise)
         self._count('assisted_requests', accepted & draw)
         self.request = current.clone()
 
-    def record_success(self, before, tasks):
+    def record_success(self, before, tasks, lifted_before):
         """Count successes decided by one native ``observe_physics`` call.
 
         The native task clears ``success_id`` at the next policy step and at
@@ -153,20 +161,19 @@ class JumpAssist:
         self._count('assisted_success', success & helped)
         self._count('unassisted_success', success & ~helped)
         self._count_by_rise('success', success, helped)
-        self.track(tasks)
+        self.track(tasks, lifted_before)
 
     def force_z(self):
         """Upward world force [N] per environment for this substep; None outside the assist stage."""
         native = self.native
         tasks = native._terrain_course.tasks
         self.track(tasks)
-        self.lifted |= (tasks.physical_id >= 0) & tasks.ascent_seen & (tasks.air_ticks >= 2)
         if self.level() <= 0:
             return None
         curve = tasks.jump_reference()
         push = ((curve.clock_stage == EXTENSION)
                 | ((curve.clock_stage == BALLISTIC) & (curve.velocity_world_z_m_s > 0)))
-        window = self.selected & (tasks.physical_id >= 0) & ~self.lifted & push
+        window = self.selected & (tasks.physical_id >= 0) & ~self.lifted(tasks.physical_id.long()) & push
         velocity_z = native._as_torch(native.robot.data.root_com_vel_w)[:, 2]
         mass = native._formal_reward.composer._mass_kg
         shortfall = (curve.launch_velocity_m_s.to(velocity_z.dtype) - velocity_z).clamp_min(0)
@@ -193,7 +200,11 @@ class JumpAssist:
 
 def install_jump_assist(native, curriculum, configuration: dict) -> JumpAssist:
     """Add the assist wrench after the native per-substep action/spring/DR wrenches."""
-    assist = JumpAssist(native, curriculum, JumpAssistConfig(**configuration))
+    from .reward import install_flight_latch
+
+    tasks = native._terrain_course.tasks
+    latch = getattr(tasks, 'supermimic_flight_latch', None) or install_flight_latch(tasks)
+    assist = JumpAssist(native, curriculum, JumpAssistConfig(**configuration), latch)
     original = native._apply_action
     base = [native._base_body_index]
 
@@ -206,13 +217,15 @@ def install_jump_assist(native, curriculum, configuration: dict) -> JumpAssist:
             native.robot.instantaneous_wrench_composer.add_forces_and_torques_index(
                 forces=forces, torques=torch.zeros_like(forces), body_ids=base, is_global=True)
 
-    tasks = native._terrain_course.tasks
     observe_physics = tasks.observe_physics
 
     def observe_and_count(*args, **kwargs):
         before = tasks.physical_id.long().clone()
+        lifted = assist.lifted(before)
         result = observe_physics(*args, **kwargs)
-        assist.record_success(before, tasks)
+        # The latch was updated inside (and may have moved to a new request).
+        lifted = lifted | assist.lifted(before)
+        assist.record_success(before, tasks, lifted)
         return result
 
     native._apply_action = apply_action

@@ -73,12 +73,16 @@ def test_selected_requests_get_capped_shortfall_force_until_real_liftoff_and_out
     # Native flight_seen from wheel unloading without rising keeps the assist on.
     native.tasks.flight_seen[0] = True
     native.tasks.air_ticks[0] = 2
+    native.tasks.observe_physics()         # the shared first-flight latch observes each tick
     native._apply_action()
     assert native.wrenches[-1]["forces"][0, 0, 2] > 0
     native.tasks.ascent_seen[0] = True     # real liftoff ends this request's assist
+    native.tasks.observe_physics()
     native._apply_action()
     assert native.wrenches[-1]["forces"][0, 0, 2] == 0
+    assert native.tasks.supermimic_flight_latch.lifted[0]
     native.tasks.air_ticks[0] = 0
+    native.tasks.observe_physics()
     native._apply_action()
     assert native.wrenches[-1]["forces"][0, 0, 2] == 0
     assist.curriculum.real_transitions = 299   # fade complete: new requests are unassisted

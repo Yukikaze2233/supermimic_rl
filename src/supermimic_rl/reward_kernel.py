@@ -471,6 +471,8 @@ def physical_reward_densities(sample: RewardPhysics, reference: RewardReference,
         # enough: early wheel unloading moves the native phase to LANDING.
         target = reference.jump_velocity_world_z_m_s
         pushing = (jump & (phase != int(RewardPhase.FLIGHT)) & (target > JUMP_PUSH_MIN_REFERENCE_M_S))
+        if closed is not None:
+            pushing = pushing & ~closed   # no second push after the first real flight landed
         achieved = (sample.velocity_origin_world_m_s[:, 2] / target.clamp_min(JUMP_PUSH_MIN_REFERENCE_M_S)).clamp(0, 1)
         positive['jump_push'] = extensions.jump_push * pushing.to(v_up.dtype) * achieved
     p, c = torch.stack(tuple(positive.values())).sum(0), torch.stack(tuple(cost.values())).sum(0)
