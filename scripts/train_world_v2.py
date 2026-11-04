@@ -4,8 +4,10 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 from pathlib import Path
 import signal
+import sys
 import traceback
 
 import torch
@@ -15,6 +17,26 @@ def read_actor(path, device):
     from supermimic_rl.world_model_v2.student_transfer import load_student_actor
 
     return load_student_actor(path, device)
+
+
+def exit_native_failure(output, error):
+    """Preserve the original failure without entering Kit's default exit-zero close."""
+    try:
+        try:
+            (output / 'failure-traceback.txt').write_text(''.join(traceback.format_exception(error)))
+        except OSError as receipt_error:
+            error.add_note(f'Could not write failure-traceback.txt: {receipt_error}')
+        traceback.print_exception(error, file=sys.stderr)
+        for stream in (sys.stdout, sys.stderr):
+            try:
+                stream.flush()
+            except OSError:
+                pass
+    finally:
+        # Kit close/finalizers may call os._exit(0), even while propagating an
+        # exception. The failed process releases native resources at exit;
+        # successful runs retain the ordinary close path below.
+        os._exit(1)
 
 
 def main():
@@ -102,12 +124,9 @@ def main():
                 report['checkpoint'] = str(args.checkpoint.resolve())
             (output / 'summary.json').write_text(json.dumps(report, indent=2) + '\n')
             print(json.dumps(report), flush=True)
-        except BaseException:
-            # Isaac shutdown can terminate the interpreter before Python prints
-            # the original error. Persist it before closing the simulation app.
-            (output / 'failure-traceback.txt').write_text(traceback.format_exc())
-            raise
-        finally:
+        except BaseException as error:
+            exit_native_failure(output, error)
+        else:
             env.close()
 
 
