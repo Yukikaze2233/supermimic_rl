@@ -239,6 +239,79 @@ def test_recovery_qualification_overrides_request_before_native_admission_and_pr
     assert tasks.stream.step == original_step and 'step' not in tasks.stream.__dict__
 
 
+def test_qualification_request_budget_uses_the_installed_physics_clock(adapter):
+    """Owned physics ticks, including those after handoff, govern request expiry."""
+    from transformer_rl.formal.control.observation import CommandMode
+    from transformer_rl.formal.lab_env.recovery_lifecycle import RecoveryLifecycle, RecoveryLifecycleConfig
+    from transformer_rl.formal.tasks.protocol import CompletedEstimate
+
+    n, env = adapter.num_envs, adapter.env
+    tasks = env._terrain_course.tasks
+    owner = RecoveryLifecycle(n, config=RecoveryLifecycleConfig(policy_dt_s=.02, stable_s=.02, timeout_s=.08))
+    env._terrain_course.recovery = owner
+    env._terrain_course.metrics = lambda: {}
+    env._episode_id = torch.zeros(n, dtype=torch.long)
+    ids = torch.arange(n)
+
+    def reset():
+        sample = env._task_sampler(ids)
+        tasks.reset(ids, sample, torch.zeros(n, dtype=torch.float64),
+                    terrain_kind=sample.terrain_kind, terrain_step_height_m=sample.draw.step_up_m)
+        owner.reset(ids, sample.mode == int(CommandMode.RECOVERY))
+        env._episode_id += 1
+
+    adapter.reset = reset
+    name = 'recovery_' + adapter.curriculum.config.recovery_postures[0]
+    evaluator = CourseEvaluation(adapter, CourseEvaluationConfig(
+        scenarios=(name, 'forward_speed'), recovery_qualification=True))
+    evaluator.begin(StateSchema((Field('unused', ()),), ()))
+    try:
+        plan = evaluator.plan
+        rows = plan.qualification_rows
+        assert evaluator.recovery_evidence.qualification['clock'] is plan.qualification_clock
+        requested = torch.tensor([[1., 0., 0., .32]]).expand(n, -1).clone()
+        values = dict(height_m=torch.full((n,), .32), command_height_m=torch.full((n,), .32),
+            tilt_rad=torch.zeros(n), angular_speed_rad_s=torch.zeros(n), velocity_z_m_s=torch.zeros(n),
+            wheel_load_n=torch.full((n, 2), 20.), base_load_n=torch.zeros(n),
+            policy_owned=torch.zeros(n, dtype=torch.bool))
+        owner.observe_physics(**values)
+        assert plan.qualification_clock.eq(0).all()  # Release does not spend policy-owned time.
+        values['policy_owned'].fill_(True)
+        for interval in range(4):
+            admitted = tasks.stream.step(requested)
+            torch.testing.assert_close(admitted.requested[rows], plan.qualification_commands[rows])
+            torch.testing.assert_close(admitted.requested[~rows], requested[~rows])
+            for _ in range(4):
+                owner.observe_physics(**values)
+            if interval == 1:
+                values['policy_owned'].fill_(False)
+                owner.observe_physics(**values)
+                values['policy_owned'].fill_(True)
+            owned_time = torch.full((n,), .02 * (interval + 1), dtype=torch.float64)
+            now = owned_time + (.005 if interval >= 1 else 0.)
+            estimate = CompletedEstimate(torch.zeros(n), torch.ones(n, 2), torch.zeros(n), torch.zeros(n),
+                now - .01, torch.ones(n, dtype=torch.bool))
+            result = owner.finish_interval(now, estimate, policy_owned=values['policy_owned'],
+                                           failed=torch.zeros(n, dtype=torch.bool))
+            if interval == 0:
+                assert result.handoff[rows].all()
+                assert not evaluator.recovery_evidence.qualification['open'][rows].any()
+            torch.testing.assert_close(plan.qualification_clock[rows], owned_time[rows])
+            if interval >= 1:
+                assert not torch.allclose(plan.qualification_clock[rows], now[rows])
+            assert plan.qualification_clock[~rows].eq(0).all()
+        # Physical success/handoff did not release the request early; only
+        # the shared owned-time budget now permits the native request again.
+        torch.testing.assert_close(tasks.stream.step(requested).requested, requested)
+        owner.reset(ids, rows)
+        assert plan.qualification_clock.eq(0).all()
+        torch.testing.assert_close(tasks.stream.step(requested).requested[rows], plan.qualification_commands[rows])
+    finally:
+        evaluator.close()
+    assert 'step' not in tasks.stream.__dict__
+    assert not {'observe_physics', 'finish_interval', 'reset'} & owner.__dict__.keys()
+
+
 def test_fixed_physical_tiles_ignore_training_proficiency_and_ceiling_exploration(adapter):
     from transformer_rl.formal.tasks.terrain_courses import TerrainCourseRouter
 

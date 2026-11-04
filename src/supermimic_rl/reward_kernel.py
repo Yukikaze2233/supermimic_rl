@@ -383,8 +383,11 @@ def physical_reward_densities(sample: RewardPhysics, reference: RewardReference,
             # only the explicit end-of-reference HOLD certifies a missed push.
             missed_jump = (jump & (phase == int(RewardPhase.TAKEOFF))
                            & (jump_reference_stage == int(ReferenceStage.HOLD)))
-        positive['height'] = torch.where(missed_jump, 0., positive['height'])
-        positive['jump_vertical'] = torch.where(missed_jump, 0., positive['jump_vertical'])
+        # A missed request must not keep earning locomotion tracking rewards.
+        # Keep jump_attitude to encourage upright support while waiting,
+        # instead of turning the entire HOLD interval into pure punishment.
+        for name in ('forward', 'yaw', 'height', 'jump_vertical'):
+            positive[name] = torch.where(missed_jump, 0., positive[name])
         cost['jump_missed'] = extensions.jump_missed * missed_jump.to(v_up.dtype)
     if extensions.jump_flight or extensions.jump_lift:
         # Not native terms, so the native availability filter never applies.

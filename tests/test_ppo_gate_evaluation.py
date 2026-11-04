@@ -165,3 +165,27 @@ def test_process_failure_retains_pending_audit_and_explicit_continue_does_not_re
     assert state["status"] == "budget_complete"
     assert [name for name, _ in calls[:3]] == ["train_ppo.py", "evaluate_ppo_skills.py", "evaluate_ppo_skills.py"]
     assert sum(name == "train_ppo.py" for name, _ in calls) == 2
+
+
+@pytest.mark.parametrize("failed_script", ["train_ppo.py", "evaluate_ppo_skills.py"])
+def test_native_exit_zero_without_report_cannot_complete_or_resume_course(run_inputs, monkeypatch, failed_script):
+    calls = []
+    successful_launch = fake_launcher(calls)
+
+    def launch(root, script, arguments, log):
+        if script != failed_script:
+            return successful_launch(root, script, arguments, log)
+        calls.append((script, arguments))
+        output = Path(arguments[arguments.index("--output") + 1])
+        output.mkdir(parents=True)
+        (output / "failure-traceback.txt").write_text("OSError: native checkpoint ENOSPC")
+        # Isaac may exit zero in close after the error. No subprocess exception
+        # is raised, but there is still no completed summary/evaluation report.
+
+    monkeypatch.setattr(runner, "launch", launch)
+    with pytest.raises(FileNotFoundError):
+        runner.run(run_inputs)
+    state = json.loads((run_inputs.output / "orchestration.json").read_text())
+    assert state["status"] == "process_failed" and not state["audits"]
+    assert [name for name, _ in calls] == (["train_ppo.py"] if failed_script == "train_ppo.py"
+                                         else ["train_ppo.py", "evaluate_ppo_skills.py"])

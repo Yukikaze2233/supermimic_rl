@@ -178,6 +178,10 @@ def test_missed_jump_imagination_matches_native_ticks_and_retains_motion_gradien
         torch.testing.assert_close(result.components[name], value * .02, atol=1e-12, rtol=1e-12)
     torch.testing.assert_close(result.components['cost.jump_missed'],
                                torch.tensor([-.02, -.01], dtype=torch.float64))
+    for name in ('positive.forward', 'positive.yaw'):
+        assert result.components[name][0] == 0
+        assert result.components[name][1] > 0  # This row switches to FLIGHT on tick 3.
+    assert (result.components['positive.jump_attitude'] > 0).all()
     loss = sum(result.components.values()).sum()
     gradients = torch.autograd.grad(loss, tuple(tick.state.velocity for tick in samples))
     assert all(torch.isfinite(gradient).all() and gradient.abs().sum() > 0 for gradient in gradients)

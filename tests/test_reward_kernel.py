@@ -200,8 +200,9 @@ def test_jump_push_pays_reference_upward_speed_only_before_flight_in_the_push_wi
     assert ordinary.positive['jump_push'].abs().sum() == 0
 
 
-@pytest.mark.parametrize('case', ['jump_takeoff', 'jump_flight', 'jump_landing', 'ordinary'])
-def test_missed_jump_removes_standing_tracking_only_after_reference_has_finished(case):
+@pytest.mark.parametrize('case', ['jump_takeoff', 'jump_flight', 'jump_landing', 'ordinary', 'recovery'])
+@pytest.mark.parametrize('stage_name', ['COMPRESSION', 'EXTENSION', 'BALLISTIC', 'HOLD'])
+def test_missed_jump_removes_tracking_only_after_reference_has_finished(case, stage_name):
     from transformer_rl.formal.tasks.jump import ReferenceStage
     from supermimic_rl.reward_kernel import RewardExtensions
 
@@ -214,20 +215,56 @@ def test_missed_jump_removes_standing_tracking_only_after_reference_has_finished
     history = RewardHistory(composer._window['dq'], torch.zeros(2), torch.zeros(2), torch.zeros(2))
     base = RewardParameters.from_composer(composer)
     parameters = replace(base, extensions=RewardExtensions(jump_missed=1.))
-    # Both rows have zero vertical target; only the first is beyond the trajectory.
-    stages = torch.tensor([int(ReferenceStage.HOLD), int(ReferenceStage.COMPRESSION)])
+    # Zero vertical speed also occurs before takeoff; it is not a missed jump.
+    stages = torch.tensor([int(getattr(ReferenceStage, stage_name)), int(ReferenceStage.COMPRESSION)])
     original = physical_reward_densities(physics, reference, history, base)
     result = physical_reward_densities(physics, reference, history, parameters, jump_reference_stage=stages)
-    missed = torch.tensor([case == 'jump_takeoff', False])
+    missed = torch.tensor([case == 'jump_takeoff' and stage_name == 'HOLD', False])
     torch.testing.assert_close(result.gates['jump_missed'], missed)
     torch.testing.assert_close(result.cost['jump_missed'], missed.float())
-    for name in ('height', 'jump_vertical'):
-        torch.testing.assert_close(result.positive[name], torch.where(missed, 0., original.positive[name]))
-        torch.testing.assert_close(result.cost[name], original.cost[name])
+    for name, value in original.positive.items():
+        expected = torch.where(missed, 0., value) if name in ('forward', 'yaw', 'height', 'jump_vertical') else value
+        torch.testing.assert_close(result.positive[name], expected, atol=0, rtol=0)
+    for name, value in original.cost.items():
+        torch.testing.assert_close(result.cost[name], value, atol=0, rtol=0)
     if case == 'jump_takeoff':
         assert original.positive['jump_vertical'][0] == 1.
         with pytest.raises(ValueError, match='reference clock stage'):
             physical_reward_densities(physics, reference, history, parameters)
+    assert not result.invalid.any()
+
+
+def test_missed_jump_stable_hold_retains_attitude_without_tracking_profit():
+    from transformer_rl.formal.tasks.jump import ReferenceStage
+    from supermimic_rl.reward_kernel import RewardExtensions
+
+    composer, reference = setup('jump_takeoff')
+    reference = replace(reference, admitted_body_command=torch.tensor([[0., 0., 0., .32]]).repeat(2, 1),
+                        jump_height_world_z_m=torch.full((2,), .32),
+                        jump_velocity_world_z_m_s=torch.zeros(2))
+    begin(composer, reference, torch.zeros(2, 6))
+    physics = replace(sample(composer, 1),
+        velocity_origin_body_m_s=torch.zeros(2, 3), velocity_origin_world_m_s=torch.zeros(2, 3),
+        root_world_z_m=torch.full((2,), .32), height_above_ground_m=torch.full((2,), .32),
+        roll_pitch_rad=torch.zeros(2, 2), gravity_body=torch.tensor([[0., 0., -1.]]).repeat(2, 1),
+        angular_velocity_body_rad_s=torch.zeros(2, 3), policy_velocity_rad_s=torch.zeros(2, 6),
+        active_explicit_effort_nm=torch.zeros(2, 6),
+        body_normal_load_n=torch.tensor([[0., 105., 105., 0., 0.]]).repeat(2, 1),
+        wheel_contact_tangent_speed_m_s=torch.zeros(2, 2), joint_boundary_shortfall_rad=torch.zeros(2, 6),
+        wheel_position_base_m=torch.tensor([[[0., .2, -.26], [0., -.2, -.26]]]).repeat(2, 1, 1))
+    history = RewardHistory(torch.zeros(2, 6), torch.zeros(2), torch.zeros(2), torch.zeros(2))
+    base = RewardParameters.from_composer(composer)
+    original = physical_reward_densities(physics, reference, history, base)
+    result = physical_reward_densities(physics, reference, history,
+        replace(base, extensions=RewardExtensions(jump_missed=1.)),
+        jump_reference_stage=torch.full((2,), int(ReferenceStage.HOLD)))
+
+    assert (original.positive['forward'] > 0).all() and (original.positive['yaw'] > 0).all()
+    for name in ('forward', 'yaw', 'height', 'jump_vertical'):
+        assert not result.positive[name].any()
+    torch.testing.assert_close(result.positive['jump_attitude'], torch.ones(2))
+    torch.testing.assert_close(result.cost['jump_missed'], torch.ones(2))
+    torch.testing.assert_close(result.total, torch.zeros_like(result.total), atol=0, rtol=0)
     assert not result.invalid.any()
 
 
