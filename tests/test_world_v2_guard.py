@@ -168,3 +168,47 @@ def test_legacy_joint_best_resets_both_adams_only_on_real_restore_and_preserves_
     update_estimated_actor(actor, optimizer, estimator_optimizer, .2)
     assert all(int(value['step']) == 1 for value in optimizer.state.values())
     assert all(int(value['step']) == 1 for value in estimator_optimizer.state.values())
+
+
+def test_window_median_ignores_short_population_dips_but_catches_sustained_drops():
+    actor, optimizer = actor_and_optimizer()
+    guard = NativeRegressionGuard(.05, 2, 1e-3, window=5)
+    observe = lambda reward: guard.observe(reward, guard.snapshot(actor, optimizer), actor, optimizer)
+    for reward in (.093, .093, .093, .093):
+        assert observe(reward)['judged_student_reward'] is None
+    assert observe(.093)['best_student_reward'] == .093
+    # A synchronized rebirth costs two collections (.06 and .03 in a05).
+    statuses = [observe(reward) for reward in (.06, .03, .093, .093, .093)]
+    assert not any(status['restored'] or status['bad_cycles'] for status in statuses)
+    statuses = [observe(.06) for _ in range(4)]
+    assert [status['bad_cycles'] for status in statuses] == [0, 0, 1, 0]
+    assert statuses[2]['judged_student_reward'] == .06 and statuses[3]['restored']
+
+
+def test_report_mode_judges_without_restoring_or_changing_the_rate():
+    actor, optimizer = actor_and_optimizer()
+    guard = NativeRegressionGuard(.1, 1, 1e-3, mode='report')
+    guard.observe(.09, None, actor, optimizer)
+    step(actor, optimizer, 1.)
+    weight = actor.weight.detach().clone()
+    status = guard.observe(.01, None, actor, optimizer)
+    assert status['bad_cycles'] == 1 and not status['restored'] and status['mode'] == 'report'
+    torch.testing.assert_close(actor.weight.detach(), weight)
+    assert optimizer.param_groups[0]['lr'] == 1e-3 and guard.learning_rate() == 1e-3
+    with pytest.raises(ValueError):
+        NativeRegressionGuard(.1, 1, 1e-3, mode='skip')
+
+
+def test_changed_window_or_mode_restarts_the_judgment_but_keeps_the_restoration_record():
+    actor, optimizer = actor_and_optimizer()
+    old = NativeRegressionGuard(.1, 1, 1e-3)
+    old.observe(.09, old.snapshot(actor, optimizer), actor, optimizer)
+    old.observe(.01, old.snapshot(actor, optimizer), actor, optimizer)
+    assert old.restorations == 1
+    state = old.state_dict()
+    legacy = {key: state[key] for key in ('best_reward', 'best', 'bad_cycles', 'restorations')}
+    same = NativeRegressionGuard(.1, 1, 1e-3)
+    assert same.load_state_dict(legacy) and same.best_reward == .09 and same.learning_rate() == 5e-4
+    report = NativeRegressionGuard(.1, 1, 1e-3, window=3, mode='report')
+    assert not report.load_state_dict(legacy)
+    assert report.best_reward is None and report.restorations == 1 and report.learning_rate() == 1e-3
