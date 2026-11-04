@@ -14,7 +14,7 @@ from torch import Tensor
 from transformer_rl.formal.tasks.reward import (
     CommandMode, RewardPhysics, RewardReference, RoughDashRewardReference, TerrainRewardReference,
 )
-from ..reward_kernel import RewardHistory, RewardParameters, physical_reward_densities
+from ..reward_kernel import JumpProgress, RewardHistory, RewardParameters, physical_reward_densities
 from .execution import LegExecution, WheelExecution
 from .geometry import WheelGeometry
 from .physical import PhysicalState
@@ -54,7 +54,7 @@ class RewardTick:
     episode_id: Tensor
     control_epoch: Tensor
     policy_owned: Tensor
-    jump_reference_stage: Tensor | None = None
+    jump_progress: JumpProgress | None = None
 
 
 @dataclass(frozen=True)
@@ -196,7 +196,7 @@ class RewardAssembly:
             # within the interval. Native locomotion uses one stable layout.
             for physics, reference, history, tick in zip(physics_ticks, reference_ticks, histories, ticks):
                 densities = physical_reward_densities(physics, reference, history, self.parameters,
-                    jump_reference_stage=tick.jump_reference_stage)
+                    jump_progress=tick.jump_progress)
                 for name, value in densities.components.items():
                     contribution = value.double() * self.parameters.physics_dt_s
                     components[name] = components.get(name, 0.) + contribution
@@ -207,15 +207,9 @@ class RewardAssembly:
                 'passive_knee_limits_rad', 'available_terms', 'velocity_reference',
                 'effort_reference', 'slip_reference', 'boundary_reference'))
             parameters = replace(self.parameters, mass_kg=self.parameters.mass_kg.repeat(expected))
-            stages = tuple(tick.jump_reference_stage for tick in ticks)
-            if all(stage is None for stage in stages):
-                reference_stage = None
-            elif all(stage is not None for stage in stages):
-                reference_stage = torch.cat(stages, dim=0)
-            else:
-                raise ValueError('Jump reference stage coverage changes within a physical interval')
+            progress = JumpProgress.cat(tick.jump_progress for tick in ticks)
             densities = physical_reward_densities(physics, references, self._stack_rows(histories), parameters,
-                                                  jump_reference_stage=reference_stage)
+                                                  jump_progress=progress)
             # Keep the exact original double-precision tick accumulation order.
             # Only the stateless elementwise densities share one larger batch.
             for name, values in densities.components.items():

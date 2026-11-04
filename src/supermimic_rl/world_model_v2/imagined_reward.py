@@ -14,7 +14,7 @@ from transformer_rl.formal.lab_env.terrain_support import TerrainSupportConfig
 from transformer_rl.formal.tasks.reward import RewardPhase, RewardReference, RewardTuning
 from transformer_rl.formal.tasks.gimbal_course import GimbalRewardReference
 from ..contracts import action_bounds_from_source
-from ..reward_kernel import RewardExtensions, RewardParameters
+from ..reward_kernel import JumpProgress, RewardExtensions, RewardParameters
 from .execution import WHEEL_ACTION_BOUND, LegExecution
 from .geometry import RewardGeometry
 from .records import CONTACT_BODIES, WHEEL_BODIES, decode_transforms
@@ -112,7 +112,10 @@ class LocomotionRewardContext:
                 ticks.resultant_contact_force[:, tick].clamp_min(0), ground_valid[:, tick], terrain_rows, tick_reference,
                 action.new_full((n,), (step * 4 + tick + 1) * self.assembly.parameters.physics_dt_s),
                 ids, ids, valid,
-                jump_reference_stage=None if jump_interval is None else jump_interval.reference_stage[:, tick]))
+                # The replay does not record the first-flight latch yet, so jump
+                # flight terms fail closed here until jump imagination is synced.
+                jump_progress=None if jump_interval is None else JumpProgress(
+                    jump_interval.reference_stage[:, tick], jump_interval.ascent_seen[:, tick])))
         result = self.assembly.integrate(start, tuple(samples), action, reward_memory,
             controller_memory.wheel_torque_history, self.legs, self.encoder_bias, self.motor_strength)
         return replace(result, termination_height=torch.stack(heights, -1)[..., None],

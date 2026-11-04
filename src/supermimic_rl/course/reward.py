@@ -9,8 +9,8 @@ from types import MethodType
 
 import torch
 from transformer_rl.formal.tasks.reward import PhysicalRewardComposer, RewardPhysics, RewardReference
-from ..reward_kernel import (NATIVE_SOURCE_SHA256, RewardExtensions, RewardHistory, RewardParameters,
-                             physical_reward_densities)
+from ..reward_kernel import (NATIVE_SOURCE_SHA256, JumpProgress, RewardExtensions, RewardHistory,
+                             RewardParameters, advance_flight_latch, physical_reward_densities)
 
 
 class SharedRewardComposer(PhysicalRewardComposer):
@@ -27,18 +27,20 @@ class SharedRewardComposer(PhysicalRewardComposer):
                     | (sample.episode_id != window['episode']) | (sample.control_epoch != window['control'])
                     | (reference.admitted_body_command != window['command']).any(-1)
                     | (reference.mode != window['mode']))
-        reference_stage = None
-        if self.supermimic_reward_extensions.jump_missed:
+        progress = None
+        if self.supermimic_reward_extensions.needs_jump_progress:
             # The request clock is held across the policy interval. Read its
-            # stage once, while physical flight/landing phases still update at
-            # every substep. The task owner may replace its reference program.
+            # stage once, while the physical phase and the ascent latch update
+            # at every substep (after the task owner observed this substep).
+            tasks = self.supermimic_jump_tasks
             if window['steps'] == 0:
-                window['jump_reference_stage'] = self.supermimic_jump_tasks.jump_reference().clock_stage
-            reference_stage = window['jump_reference_stage']
+                window['jump_reference_stage'] = tasks.jump_reference().clock_stage
+            latch = tasks.supermimic_flight_latch
+            progress = JumpProgress(window['jump_reference_stage'], tasks.ascent_seen.clone(), latch.closed.clone())
         densities = physical_reward_densities(
             sample, reference,
             RewardHistory(window['dq'], window['action_cost'], window['action2_cost'], self._action_count),
-            RewardParameters.from_composer(self), jump_reference_stage=reference_stage)
+            RewardParameters.from_composer(self), jump_progress=progress)
         if (invalid | densities.invalid).any():
             raise ValueError('reward input, PRE-reset identity, timing, phase or finite density bound differs')
         positive, cost = densities.positive, densities.cost
@@ -84,6 +86,41 @@ class SharedRewardComposer(PhysicalRewardComposer):
         window['last_timestamp'] = sample.timestamp_s.detach().clone()
 
 
+class FirstFlightLatch:
+    """Native owner of each request's first-real-flight latch (``advance_flight_latch``).
+
+    Updated after every native ``observe_physics`` call, before the reward
+    composer reads the same substep; cleared whenever the physical request changes.
+    """
+
+    def __init__(self, tasks):
+        self.request = tasks.physical_id.clone()
+        self.lifted = torch.zeros_like(tasks.ascent_seen)
+        self.closed = torch.zeros_like(tasks.ascent_seen)
+
+    def observe(self, tasks) -> None:
+        current = tasks.physical_id
+        changed = current != self.request
+        self.lifted, self.closed = advance_flight_latch(
+            self.lifted & ~changed, self.closed & ~changed, active=current >= 0,
+            ascent_seen=tasks.ascent_seen, air_ticks=tasks.air_ticks)
+        self.request = current.clone()
+
+
+def _install_flight_latch(tasks) -> FirstFlightLatch:
+    latch = FirstFlightLatch(tasks)
+    observe_physics = tasks.observe_physics
+
+    def observe_and_latch(*args, **kwargs):
+        result = observe_physics(*args, **kwargs)
+        latch.observe(tasks)
+        return result
+
+    tasks.observe_physics = observe_and_latch
+    tasks.supermimic_flight_latch = latch
+    return latch
+
+
 def install_shared_reward(composer, *, verify_native=False, extensions: RewardExtensions = RewardExtensions(),
                           jump_tasks=None):
     """Instance-local installation; the frozen native source stays untouched.
@@ -100,10 +137,12 @@ def install_shared_reward(composer, *, verify_native=False, extensions: RewardEx
         raise TypeError("Shared reward installation requires the native composer")
     if verify_native and extensions.active:
         raise ValueError("The native reward audit compares the unextended reward")
-    if extensions.jump_missed and jump_tasks is None:
-        raise ValueError('Missed-jump reward requires the native jump task owner')
+    if extensions.needs_jump_progress and jump_tasks is None:
+        raise ValueError('Jump flight/missed rewards require the native jump task owner')
     composer.supermimic_reward_extensions = extensions
     composer.supermimic_jump_tasks = jump_tasks
+    if extensions.needs_jump_progress:
+        _install_flight_latch(jump_tasks)
     if extensions.success_event is not None:
         composer.tuning = replace(composer.tuning, success_event=float(extensions.success_event))
     if verify_native:

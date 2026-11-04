@@ -35,16 +35,22 @@ class RewardExtensions:
     in a requested jump; the success event can be raised from the native +1.
     Flight terms alone never reach a policy that has not left the ground, so
     ``jump_push`` (Fudan's takeoff_extend/encourage_jump) pays the achieved
-    fraction of the reference's upward speed while still supported, only in
-    the request's own push window, which a bobbing policy cannot farm.
+    fraction of the reference's upward speed while supported, only in the
+    request's own push window.
+
+    Native FLIGHT only means both wheel loads stayed <= 2 N for 10 ms, which a
+    fast leg retraction reaches without rising. Flight terms therefore pay
+    only in the request's first real flight: after real ascent and until the
+    first touchdown, which bounds them per request; repeated bouncing earns
+    nothing. See :class:`JumpProgress` and :func:`advance_flight_latch`.
     """
 
-    jump_flight: float = 0.        # per second in a jump's native FLIGHT phase
-    jump_lift: float = 0.          # per second and m/s of upward world velocity during FLIGHT
+    jump_flight: float = 0.        # per second in the request's first real flight (after real ascent)
+    jump_lift: float = 0.          # per second and m/s of upward world velocity under the same condition
     jump_lift_cap_m_s: float = 2.
-    jump_push: float = 0.          # per second at full reference upward speed before flight
+    jump_push: float = 0.          # per second at full reference upward speed while supported
     success_event: float | None = None
-    jump_missed: float = 0.        # per second in reference HOLD without physical takeoff
+    jump_missed: float = 0.        # per second in reference HOLD without real ascent
 
     def __post_init__(self):
         values = (self.jump_flight, self.jump_lift, self.jump_lift_cap_m_s, self.jump_push, self.jump_missed,
@@ -56,6 +62,60 @@ class RewardExtensions:
     def active(self) -> bool:
         return bool(self.jump_flight or self.jump_lift or self.jump_push or self.jump_missed
                     or self.success_event is not None)
+
+    @property
+    def needs_jump_progress(self) -> bool:
+        return bool(self.jump_flight or self.jump_lift or self.jump_missed)
+
+
+@dataclass(frozen=True)
+class JumpProgress:
+    """Per-row request state the jump extensions need beyond the native phase.
+
+    ``reference_stage`` is the reference clock stage (int64), held across one
+    policy interval. ``ascent_seen`` is the native per-request latch of real
+    ascent (upward COM speed > 0.15 m/s and rise > 1 cm). ``flight_closed``
+    marks that the request's first real flight has touched down (see
+    :func:`advance_flight_latch`); producers without that latch pass None and
+    then cannot pay flight terms on jump rows. All are read after the task
+    owner observed the physical tick.
+    """
+
+    reference_stage: Tensor
+    ascent_seen: Tensor
+    flight_closed: Tensor | None = None
+
+    def validate(self, mode: Tensor) -> None:
+        flags = (self.ascent_seen,) + (() if self.flight_closed is None else (self.flight_closed,))
+        if (self.reference_stage.shape != mode.shape or self.reference_stage.device != mode.device
+                or self.reference_stage.dtype != torch.long
+                or any(flag.shape != mode.shape or flag.device != mode.device or flag.dtype != torch.bool
+                       for flag in flags)):
+            raise ValueError('Jump progress needs matching int64 reference stages and boolean latch rows')
+
+    @staticmethod
+    def cat(items) -> JumpProgress | None:
+        items = tuple(items)
+        if all(item is None for item in items):
+            return None
+        if any(item is None for item in items) or len({item.flight_closed is None for item in items}) != 1:
+            raise ValueError('Jump progress coverage changes within a physical interval')
+        closed = (None if items[0].flight_closed is None
+                  else torch.cat([item.flight_closed for item in items]))
+        return JumpProgress(torch.cat([item.reference_stage for item in items]),
+                            torch.cat([item.ascent_seen for item in items]), closed)
+
+
+def advance_flight_latch(lifted: Tensor, closed: Tensor, *, active: Tensor, ascent_seen: Tensor,
+                         air_ticks: Tensor) -> tuple[Tensor, Tensor]:
+    """One physical tick of a request's first-real-flight latch.
+
+    ``lifted``: airborne for the native two ticks with real ascent (wheel
+    unloading alone sets native flight_seen). ``closed``: touched down after
+    that liftoff. The owner clears both whenever the physical request changes.
+    """
+    lifted = lifted | (active & ascent_seen & (air_ticks >= 2))
+    return lifted, closed | (lifted & (air_ticks == 0))
 
 
 @dataclass(frozen=True)
@@ -145,7 +205,7 @@ def gimbal_tracking_densities(reference, velocity_world):
 
 def physical_reward_densities(sample: RewardPhysics, reference: RewardReference,
                              history: RewardHistory, parameters: RewardParameters, *,
-                             jump_reference_stage: Tensor | None = None) -> RewardDensities:
+                             jump_progress: JumpProgress | None = None) -> RewardDensities:
     """Pure densities; integrate with the physical dt exactly once outside."""
     invalid = torch.zeros_like(reference.mode, dtype=torch.bool)
     failure_scale = torch.ones_like(sample.height_above_ground_m)
@@ -367,22 +427,23 @@ def physical_reward_densities(sample: RewardPhysics, reference: RewardReference,
                 for key, value in cost.items()}
     extensions = parameters.extensions
     missed_jump = torch.zeros_like(jump)
+    stage = ascended = closed = None
+    if extensions.needs_jump_progress:
+        if jump_progress is None:
+            if jump.any():
+                raise ValueError('Jump flight/missed rewards require the request progress (reference stage, ascent)')
+        else:
+            jump_progress.validate(reference.mode)
+            stage, ascended, closed = (jump_progress.reference_stage, jump_progress.ascent_seen,
+                                       jump_progress.flight_closed)
     if extensions.jump_missed:
         from transformer_rl.formal.tasks.jump import ReferenceStage
 
-        if jump_reference_stage is None:
-            if jump.any():
-                raise ValueError('Missed-jump reward requires the reference clock stage')
-        else:
-            if (jump_reference_stage.shape != reference.mode.shape
-                    or jump_reference_stage.device != reference.mode.device
-                    or jump_reference_stage.dtype != torch.long):
-                raise ValueError('Jump reference stages must be matching int64 rows')
-            # TAKEOFF persists until actual flight has been observed. A zero
-            # velocity target alone also occurs at compression start and apex;
-            # only the explicit end-of-reference HOLD certifies a missed push.
-            missed_jump = (jump & (phase == int(RewardPhase.TAKEOFF))
-                           & (jump_reference_stage == int(ReferenceStage.HOLD)))
+        if stage is not None:
+            # Only the explicit end-of-reference HOLD certifies a missed push;
+            # a zero velocity target also occurs at compression start and apex.
+            # Wheel unloading without rising (native flight_seen) is still missed.
+            missed_jump = jump & (stage == int(ReferenceStage.HOLD)) & ~ascended
         # A missed request must not keep earning locomotion tracking rewards.
         # Keep jump_attitude to encourage upright support while waiting,
         # instead of turning the entire HOLD interval into pure punishment.
@@ -390,16 +451,26 @@ def physical_reward_densities(sample: RewardPhysics, reference: RewardReference,
             positive[name] = torch.where(missed_jump, 0., positive[name])
         cost['jump_missed'] = extensions.jump_missed * missed_jump.to(v_up.dtype)
     if extensions.jump_flight or extensions.jump_lift:
-        # Not native terms, so the native availability filter never applies.
-        flying = (jump & (phase == int(RewardPhase.FLIGHT))).to(v_up.dtype)
+        # As SCUT's takeoff state machine, the flight window opens at the
+        # physical takeoff event (not the reference clock), so late real
+        # jumps still count, and closes at the first touchdown of the request.
+        flying = torch.zeros_like(jump)
+        if stage is not None:
+            if closed is None:
+                if jump.any():
+                    raise ValueError('Jump flight rewards require the first-flight latch of the request')
+            else:
+                flying = jump & (phase == int(RewardPhase.FLIGHT)) & ascended & ~closed
+        flying = flying.to(v_up.dtype)
         rise = sample.velocity_origin_world_m_s[:, 2].clamp(0, extensions.jump_lift_cap_m_s)
         positive['jump_flight'] = extensions.jump_flight * flying
         positive['jump_lift'] = extensions.jump_lift * flying * rise
     if extensions.jump_push:
-        # TAKEOFF is the native physical phase before verified flight; the
-        # reference speed is positive only in its extension/ballistic push.
+        # Supported (not airborne) while the reference demands upward speed,
+        # i.e. in its extension/ballistic push. Native TAKEOFF alone is not
+        # enough: early wheel unloading moves the native phase to LANDING.
         target = reference.jump_velocity_world_z_m_s
-        pushing = (jump & (phase == int(RewardPhase.TAKEOFF)) & (target > JUMP_PUSH_MIN_REFERENCE_M_S))
+        pushing = (jump & (phase != int(RewardPhase.FLIGHT)) & (target > JUMP_PUSH_MIN_REFERENCE_M_S))
         achieved = (sample.velocity_origin_world_m_s[:, 2] / target.clamp_min(JUMP_PUSH_MIN_REFERENCE_M_S)).clamp(0, 1)
         positive['jump_push'] = extensions.jump_push * pushing.to(v_up.dtype) * achieved
     p, c = torch.stack(tuple(positive.values())).sum(0), torch.stack(tuple(cost.values())).sum(0)

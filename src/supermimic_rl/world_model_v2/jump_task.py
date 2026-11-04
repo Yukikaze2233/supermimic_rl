@@ -250,6 +250,7 @@ class JumpInterval:
     success_request_id: Tensor
     success_credited: Tensor
     reference_stage: Tensor
+    ascent_seen: Tensor
 
 
 class JumpTask:
@@ -405,12 +406,13 @@ class JumpTask:
             gravity = physical.gravity_body
             tilt = torch.atan2(gravity[..., :2].norm(dim=-1), -gravity[..., 2])
             speed = physical.angular_velocity_body.norm(dim=-1)
-            phases = []
+            phases, ascents = [], []
             for tick in range(4):
                 LabCourseTasks.observe_physics(owner, wheel_support_load[:, tick], velocity_z[:, tick],
                     tilt[:, tick], physical.position[:, tick, 2], angular_speed_rad_s=speed[:, tick],
                     dt=self.config.physics_dt_s)
                 phases.append(owner.phase.clone())
+                ascents.append(owner.ascent_seen.clone())
             trigger = (None if state.trigger_clock is None else (state.trigger_clock, state.trigger_flags))
             following = JumpTaskState._pack(state.now_s, protocol, owner, trigger=trigger)
             phase = torch.stack(phases, -1)
@@ -420,4 +422,4 @@ class JumpTask:
         height = torch.where(landing, ground_z + command_height[:, None], curve.height_world_z_m[:, None])
         velocity = torch.where(landing, 0., curve.velocity_world_z_m_s[:, None])
         return JumpInterval(following, phase, height, velocity, owner.success_id.clone(), success,
-                            curve.clock_stage[:, None].expand(-1, 4))
+                            curve.clock_stage[:, None].expand(-1, 4), torch.stack(ascents, -1))
