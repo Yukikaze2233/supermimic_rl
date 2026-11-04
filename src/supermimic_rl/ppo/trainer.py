@@ -611,6 +611,9 @@ class PPOTrainer:
     def _apply_opened_gates(self) -> None:
         """Report mode: opened gates (not the coordinate) set the difficulty tied to them."""
         if self.course is not None and self.course.mode == "report":
+            if not getattr(self, "_course_gates_checked", False):
+                self.environment.check_course_gates([gate.key for gate in self.course.gates])
+                self._course_gates_checked = True
             self.environment.set_opened_course_gates(self.course.opened)
 
     def _raise_stage_action_std(self) -> str | None:

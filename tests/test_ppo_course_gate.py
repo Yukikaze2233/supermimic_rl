@@ -251,6 +251,9 @@ def test_report_mode_trainer_keeps_training_and_applies_opened_gates(tmp_path):
         def set_opened_course_gates(self, keys):
             self.opened = list(keys)
 
+        def check_course_gates(self, keys):
+            self.checked = list(keys)
+
     course = [{"stage": "jump", "window": 1, "timeout_updates": 1,
                "criteria": [{"metric": "rms/forward_error_m_s", "max": 1e9}]},
               {"stage": "terrain", "window": 1, "timeout_updates": 1,
@@ -264,3 +267,36 @@ def test_report_mode_trainer_keeps_training_and_applies_opened_gates(tmp_path):
     assert environment.opened == ["jump"]
     with pytest.raises(ValueError, match="never stops"):
         config(course_gates=course, course_gate_mode="report", stop_after_gate=True)
+
+
+def test_report_mode_ladder_needs_a_fresh_window_per_step_and_rewind_restarts_it():
+    ladder = [{"stage": "jump", "at_fraction": fraction, "window": 2, "timeout_updates": 1,
+               "criteria": [{"metric": "rms/height_error_m", "max": .01}]} for fraction in (.25, .5, .75)]
+    course = CourseGates(ladder, STARTS, mode="report")
+    good = {"rms/height_error_m": .001}
+    course.advance(good, 400)                      # far past every step at once
+    course.advance(good, 1)
+    assert course.opened == ["jump@0.25"]          # the next steps wait for windows at the new height
+    course.advance(good, 1)
+    assert course.opened == ["jump@0.25"]
+    course.advance(good, 1)
+    assert course.opened == ["jump@0.25", "jump@0.5"]
+    course.advance(good, 1)
+    course.advance(good, 1)
+    assert course.opened == ["jump@0.25", "jump@0.5", "jump@0.75"]
+    state = course.state_dict()
+    restored = CourseGates(ladder, STARTS, mode="report")
+    restored.load_state_dict(state)
+    assert restored.opened_at == course.opened_at and restored.records == course.records
+
+
+def test_report_mode_rejects_a_course_ladder_without_configured_gates():
+    from types import SimpleNamespace
+    from supermimic_rl.ppo.environment import CourseEnvironment
+
+    environment = object.__new__(CourseEnvironment)
+    environment.adapter = SimpleNamespace(curriculum=SimpleNamespace(
+        ladder_gate_keys=lambda: ("active_jump@0.25", "active_jump@0.5")))
+    environment.check_course_gates(["active_jump@0.25", "active_jump@0.5", "terrain"])
+    with pytest.raises(ValueError, match="active_jump@0.5"):
+        environment.check_course_gates(["active_jump@0.25", "active_jump@0.3"])

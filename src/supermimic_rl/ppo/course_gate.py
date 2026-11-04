@@ -137,6 +137,8 @@ class CourseGates:
         self._by_key = {gate.key: gate for gate in self.gates}
         self.coordinate, self.opened, self.held_updates = 0, [], 0
         self.waiting: dict[str, int] = {}   # report mode: updates since each reached gate first waited
+        self.records = 0                     # advance() calls, to place gate openings in the history
+        self.opened_at: dict[str, int] = {}  # report mode: record count when each gate opened
         self.history = deque(maxlen=max(gate.window for gate in self.gates) if self.gates else 1)
 
     def _position(self, gate: StageGate) -> int:
@@ -164,16 +166,20 @@ class CourseGates:
         for gate in self.gates:
             if gate.key in self.opened or self.coordinate < self._limit(gate):
                 continue
-            # Inside one stage the ladder opens in order (e.g. jump heights).
+            # Inside one stage the ladder opens in order (e.g. jump heights), and
+            # each step is judged only on a full window collected after the
+            # previous step opened, i.e. at the difficulty it unlocked.
             earlier = [other.key for other in self.gates if other.stage == gate.stage
                        and self._position(other) < self._position(gate)]
-            if not set(earlier) <= set(self.opened):
+            if not set(earlier) <= set(self.opened) or any(
+                    self.records - self.opened_at.get(key, 0) < gate.window for key in earlier):
                 continue
             passed, values = self._judge(gate)
             waited = self.waiting.get(gate.key, 0)
             status["gates"][gate.key] = {"values": values, "passed": passed, "waiting_updates": waited}
             if passed:
                 self.opened.append(gate.key)
+                self.opened_at[gate.key] = self.records
                 self.waiting.pop(gate.key, None)
             else:
                 self.waiting[gate.key] = waited + 1
@@ -185,6 +191,7 @@ class CourseGates:
     def advance(self, record: dict, transitions: int) -> dict:
         """Evaluate the waiting gate on records up to this one, then move the coordinate."""
         self.history.append(record)
+        self.records += 1
         if self.mode == "report":
             return self._advance_report(transitions)
         status = {"coordinate_before": self.coordinate}
@@ -232,12 +239,15 @@ class CourseGates:
         self.opened = [key for key in self.opened if self._position(self._by_key[key]) <= start]
         self.held_updates = 0
         self.waiting = {}
+        self.opened_at = {key: 0 for key in self.opened}
+        self.records = 0
         self.history.clear()
         return {**receipt, "opened": list(self.opened)}
 
     def state_dict(self) -> dict:
         return {"coordinate": self.coordinate, "opened": list(self.opened), "held_updates": self.held_updates,
-                "waiting": dict(self.waiting), "history": list(self.history)}
+                "waiting": dict(self.waiting), "history": list(self.history), "records": self.records,
+                "opened_at": dict(self.opened_at)}
 
     def load_state_dict(self, state: dict, *, restart_hold: bool = False) -> None:
         """Restore the coordinate and opened gates; optionally restart the waiting gate's clock.
@@ -251,5 +261,10 @@ class CourseGates:
         self.held_updates = 0 if restart_hold else int(state["held_updates"])
         self.waiting = {} if restart_hold else {key: int(value) for key, value in state.get("waiting", {}).items()}
         self.history.clear()
-        if not restart_hold:
+        if restart_hold:
+            # The old window is dropped, so earlier openings count as complete windows ago.
+            self.records, self.opened_at = 0, {key: -max(g.window for g in self.gates) for key in self.opened}
+        else:
             self.history.extend(state["history"])
+            self.records = int(state.get("records", len(state["history"])))
+            self.opened_at = {key: int(value) for key, value in state.get("opened_at", {}).items()}

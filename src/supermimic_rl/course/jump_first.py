@@ -82,13 +82,18 @@ class JumpFirstCurriculum(SuperMimicCurriculum):
     def set_opened_gates(self, keys) -> None:
         self.opened_gates = frozenset(keys)
 
+    def ladder_gate_keys(self) -> tuple[str, ...]:
+        """Performance gate keys (``stage@fraction``) of the jump height ladder, in order."""
+        return tuple(f'{self.config.jump_height_stage}@{fraction:g}'
+                     for fraction, _ in self.config.jump_height_gates)
+
     def jump_height_level(self) -> int | None:
         """Number of jump height gates opened in order, if performance drives the height."""
         if self.opened_gates is None or not self.config.jump_height_gates:
             return None
         level = 0
-        for fraction, _ in self.config.jump_height_gates:
-            if f'{self.config.jump_height_stage}@{fraction:g}' not in self.opened_gates:
+        for key in self.ladder_gate_keys():
+            if key not in self.opened_gates:
                 break
             level += 1
         return level

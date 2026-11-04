@@ -262,9 +262,10 @@ def test_reported_height_ladder_follows_opened_gates_not_the_coordinate_and_fade
     assert assist.level() == 1.
     curriculum.set_opened_gates(['active_jump', 'active_jump@0.25', 'active_jump@0.75'])  # 0.5 still closed
     assert curriculum.jump_height_level() == 1 and curriculum._effective_domain().jump_m[1] == .20
-    assert assist.level() == pytest.approx(.75)
+    assert assist.level() == pytest.approx(2 / 3)
     curriculum.set_opened_gates(['active_jump@0.25', 'active_jump@0.5', 'active_jump@0.75'])
-    assert curriculum._effective_domain().jump_m[1] == .40 and assist.level() == pytest.approx(.25)
+    assert curriculum._effective_domain().jump_m[1] == .40 and assist.level() == 0.
+    assert curriculum.ladder_gate_keys() == ('active_jump@0.25', 'active_jump@0.5', 'active_jump@0.75')
 
 
 @pytest.mark.parametrize('height_gates', [[(.25, .20), (.20, .40)], [(.25, .05), (.50, .40)],

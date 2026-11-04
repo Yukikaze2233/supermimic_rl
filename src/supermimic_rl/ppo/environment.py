@@ -130,6 +130,12 @@ class CourseEnvironment:
         """Performance gates opened by the trainer; the course derives gated difficulty from them."""
         self.adapter.curriculum.set_opened_gates(keys)
 
+    def check_course_gates(self, configured_keys) -> None:
+        """A difficulty ladder whose gates are not configured would silently stay at its first level."""
+        missing = set(getattr(self.adapter.curriculum, "ladder_gate_keys", tuple)()) - set(configured_keys)
+        if missing:
+            raise ValueError(f"Report-mode course gates miss the course's ladder gates: {sorted(missing)}")
+
     def course_stage_starts(self) -> dict[str, int]:
         """First real-transition coordinate of each native course stage."""
         curriculum = self.adapter.curriculum
