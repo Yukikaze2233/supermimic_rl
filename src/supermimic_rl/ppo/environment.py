@@ -126,6 +126,10 @@ class CourseEnvironment:
                  "command_yaw_rate_rad_s": command[:, 2], "actual_yaw_rate_rad_s": yaw_rate,
                  "command_height_m": command[:, 3], "actual_height_m": height})
 
+    def set_opened_course_gates(self, keys) -> None:
+        """Performance gates opened by the trainer; the course derives gated difficulty from them."""
+        self.adapter.curriculum.set_opened_gates(keys)
+
     def course_stage_starts(self) -> dict[str, int]:
         """First real-transition coordinate of each native course stage."""
         curriculum = self.adapter.curriculum
@@ -158,6 +162,11 @@ class CourseEnvironment:
         gauges = {"course/terrain/level_fraction": (
             sum(level * count for level, count in enumerate(levels)) / (rows * max(len(levels) - 1, 1))
             if rows else 0.)}
+        curriculum = self.adapter.curriculum
+        gauges["course/jump/height_cap_m"] = float(curriculum.command_context().domain.jump_m[1])
+        level = getattr(curriculum, "jump_height_level", lambda: None)()
+        if level is not None:
+            gauges["course/jump/height_level"] = float(level)
         assist = getattr(self.env, "supermimic_jump_assist", None)
         if assist is not None:
             assist_counters, assist_gauges = assist.metrics()

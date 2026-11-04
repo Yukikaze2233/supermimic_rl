@@ -111,11 +111,13 @@ def test_native_course_counters_and_stage_starts_are_read_without_policy_inputs(
     environment = object.__new__(CourseEnvironment)
     environment.env = SimpleNamespace(_terrain_course=SimpleNamespace(metrics=lambda: metrics))
     environment.adapter = SimpleNamespace(curriculum=SimpleNamespace(
-        stage_names=("a", "b", "c"), stage_budgets=(10, 20, 30)))
+        stage_names=("a", "b", "c"), stage_budgets=(10, 20, 30), jump_height_level=lambda: 1,
+        command_context=lambda: SimpleNamespace(domain=SimpleNamespace(jump_m=(.03, .2)))))
     counters, gauges = environment.course_progress()
     assert counters["course/jump/verified_success"] == 5 and counters["course/stair/authored_ended"] == 4
     assert counters["course/stair/authored_ended_complete"] == 2 and counters["course/recovery/births"] == 6
     assert counters["course/births/request"] == 4 and gauges["course/terrain/level_fraction"] == .5
+    assert gauges["course/jump/height_cap_m"] == .2 and gauges["course/jump/height_level"] == 1.
     assert environment.course_stage_starts() == {"a": 0, "b": 10, "c": 30}
 
 
@@ -218,3 +220,47 @@ def test_gates_inside_a_stage_hold_the_coordinate_at_their_fraction():
     with pytest.raises(ValueError, match="bounded stage"):
         CourseGates([{"stage": "terrain", "at_fraction": .5, "window": 1, "criteria": [
             {"metric": "rms/height_error_m", "max": .01}]}], STARTS)
+
+
+def test_report_mode_never_holds_or_stops_and_opens_a_stage_ladder_in_order():
+    course = CourseGates(gates(window=1) + [
+        {"stage": "jump", "at_fraction": .5, "window": 1, "timeout_updates": 1,
+         "criteria": [{"metric": "rms/height_error_m", "max": .01}]}], STARTS, mode="report")
+    status = course.advance({"rms/height_error_m": .02}, 120)
+    assert course.coordinate == 120 and status["gates"] == {}           # no gate reached yet
+    status = course.advance({"rms/height_error_m": .02}, 120)        # jump gate reached and passes
+    assert course.opened == ["jump"] and course.coordinate == 240
+    for _ in range(5):                                                # far past its timeout: no stop
+        status = course.advance({"rms/height_error_m": .02}, 120)
+    assert course.coordinate == 840 and course.opened == ["jump"]
+    assert status["gates"]["jump@0.5"]["passed"] is False and course.waiting["jump@0.5"] == 5
+    course.advance({"rms/height_error_m": .005}, 120)
+    assert course.opened == ["jump", "jump@0.5"] and course.waiting == {}
+    restored = CourseGates(gates(window=1), STARTS, mode="report")
+    with pytest.raises(ValueError, match="mode"):
+        CourseGates(gates(), STARTS, mode="skip")
+    state = CourseGates(gates(window=1), STARTS, mode="report").state_dict()
+    restored.load_state_dict({key: value for key, value in state.items() if key != "waiting"})
+    assert restored.waiting == {}
+
+
+def test_report_mode_trainer_keeps_training_and_applies_opened_gates(tmp_path):
+    class LadderEnvironment(GatedEnvironment):
+        opened = None
+
+        def set_opened_course_gates(self, keys):
+            self.opened = list(keys)
+
+    course = [{"stage": "jump", "window": 1, "timeout_updates": 1,
+               "criteria": [{"metric": "rms/forward_error_m_s", "max": 1e9}]},
+              {"stage": "terrain", "window": 1, "timeout_updates": 1,
+               "criteria": [{"metric": "rms/forward_error_m_s", "max": -1.}]}]
+    environment = LadderEnvironment()
+    trainer = PPOTrainer(environment, config(updates=12, steps_per_update=10, course_gates=course,
+                                             course_gate_mode="report"), tmp_path)
+    assert environment.opened == []
+    result = trainer.train()
+    assert result["status"] == "complete" and trainer.curriculum_transitions == 480
+    assert environment.opened == ["jump"]
+    with pytest.raises(ValueError, match="never stops"):
+        config(course_gates=course, course_gate_mode="report", stop_after_gate=True)
