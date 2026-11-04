@@ -245,7 +245,7 @@ def test_v5_height_caps_wait_for_unassisted_bin_gates_at_exact_integer_boundarie
         assert curriculum._effective_domain().jump_m[1] == expected_after
 
 
-def test_reported_height_ladder_follows_opened_gates_not_the_coordinate_and_fades_the_assist():
+def test_reported_height_ladder_follows_opened_gates_while_the_assist_fades_with_the_stage():
     from supermimic_rl.course.jump_assist import JumpAssist, JumpAssistConfig
     from support import REPO_ROOT
 
@@ -256,21 +256,21 @@ def test_reported_height_ladder_follows_opened_gates_not_the_coordinate_and_fade
     assist.curriculum, assist.config = curriculum, JumpAssistConfig(probability=1., decay='force')
     index = curriculum.stage_names.index('active_jump')
     assist.stage_start, assist.stage_budget = sum(curriculum.stage_budgets[:index]), curriculum.stage_budgets[index]
-    curriculum.set_opened_gates([])
-    assert assist.level() == 0.                      # no assist before its stage, even with the ladder
-    curriculum.opened_gates = None
     # Far past every height fraction and the assist stage: with reported gates
-    # the cap and the assist follow the opened ladder only.
+    # the cap follows the opened ladder, while the assist has faded with the stage.
     curriculum.set_progress(sum(curriculum.stage_budgets[:6]), 0)
     curriculum.set_opened_gates(['active_jump'])
     assert curriculum.jump_height_level() == 0 and curriculum._effective_domain().jump_m == (.03, .10)
-    assert assist.level() == 1.
+    assert assist.level() == 0.
     curriculum.set_opened_gates(['active_jump', 'active_jump@0.25', 'active_jump@0.75'])  # 0.5 still closed
     assert curriculum.jump_height_level() == 1 and curriculum._effective_domain().jump_m[1] == .20
-    assert assist.level() == pytest.approx(2 / 3)
     curriculum.set_opened_gates(['active_jump@0.25', 'active_jump@0.5', 'active_jump@0.75'])
-    assert curriculum._effective_domain().jump_m[1] == .40 and assist.level() == 0.
+    assert curriculum._effective_domain().jump_m[1] == .40
     assert curriculum.ladder_gate_keys() == ('active_jump@0.25', 'active_jump@0.5', 'active_jump@0.75')
+    assist.curriculum = make_course_curriculum(4, 'cpu', 7, json.loads((root / 'ppo-course-gated-v5.json').read_text()))
+    assist.curriculum.set_progress(assist.stage_start + assist.stage_budget // 4, 0)   # a quarter into the stage
+    assist.curriculum.set_opened_gates([])
+    assert assist.level() == pytest.approx(2 / 3)
 
 
 @pytest.mark.parametrize('height_gates', [[(.25, .20), (.20, .40)], [(.25, .05), (.50, .40)],

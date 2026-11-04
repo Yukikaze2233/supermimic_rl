@@ -143,7 +143,7 @@ def test_missed_jump_imagination_matches_native_ticks_and_retains_motion_gradien
     ascents = [torch.tensor([False, tick >= 2]) for tick in range(4)]
     tasks = SimpleNamespace(jump_reference=lambda: SimpleNamespace(clock_stage=stage), ascent_seen=ascents[0],
                             physical_id=torch.zeros(2, dtype=torch.long), air_ticks=torch.zeros(2, dtype=torch.long),
-                            observe_physics=lambda *args, **kwargs: None)
+                            landed_s=torch.zeros(2), observe_physics=lambda *args, **kwargs: None)
     install_shared_reward(native, extensions=extensions, jump_tasks=tasks)
     assembly.parameters = replace(assembly.parameters, extensions=extensions)
     ids, owned = torch.zeros(2, dtype=torch.long), torch.ones(2, dtype=torch.bool)

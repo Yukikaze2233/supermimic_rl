@@ -43,6 +43,12 @@ class RewardExtensions:
     only in the request's first real flight: after real ascent and until the
     first touchdown, which bounds them per request; repeated bouncing earns
     nothing. See :class:`JumpProgress` and :func:`advance_flight_latch`.
+
+    The native success needs 2 s of uninterrupted stable landing (contact,
+    quiet, near the start height, peak inside the target window). The single
+    success event gives a policy that never succeeded no gradient toward it, so
+    ``jump_settle`` pays while those exact conditions hold. That happens only
+    after a correct jump and lasts at most the 2 s before the request ends.
     """
 
     jump_flight: float = 0.        # per second in the request's first real flight (after real ascent)
@@ -51,21 +57,23 @@ class RewardExtensions:
     jump_push: float = 0.          # per second at full reference upward speed while supported
     success_event: float | None = None
     jump_missed: float = 0.        # per second in reference HOLD without real ascent
+    jump_settle: float = 0.        # per second while the native stable-landing conditions hold
 
     def __post_init__(self):
         values = (self.jump_flight, self.jump_lift, self.jump_lift_cap_m_s, self.jump_push, self.jump_missed,
+                  self.jump_settle,
                   1. if self.success_event is None else self.success_event)
         if any(type(value) not in (int, float) or not math.isfinite(value) or value < 0 for value in values):
             raise ValueError("Reward extensions must be finite and nonnegative")
 
     @property
     def active(self) -> bool:
-        return bool(self.jump_flight or self.jump_lift or self.jump_push or self.jump_missed
+        return bool(self.jump_flight or self.jump_lift or self.jump_push or self.jump_missed or self.jump_settle
                     or self.success_event is not None)
 
     @property
     def needs_jump_progress(self) -> bool:
-        return bool(self.jump_flight or self.jump_lift or self.jump_push or self.jump_missed)
+        return bool(self.jump_flight or self.jump_lift or self.jump_push or self.jump_missed or self.jump_settle)
 
 
 @dataclass(frozen=True)
@@ -84,9 +92,10 @@ class JumpProgress:
     reference_stage: Tensor
     ascent_seen: Tensor
     flight_closed: Tensor | None = None
+    stable: Tensor | None = None         # native stable-landing conditions hold (landed_s grows)
 
     def validate(self, mode: Tensor) -> None:
-        flags = (self.ascent_seen,) + (() if self.flight_closed is None else (self.flight_closed,))
+        flags = (self.ascent_seen,) + tuple(flag for flag in (self.flight_closed, self.stable) if flag is not None)
         if (self.reference_stage.shape != mode.shape or self.reference_stage.device != mode.device
                 or self.reference_stage.dtype != torch.long
                 or any(flag.shape != mode.shape or flag.device != mode.device or flag.dtype != torch.bool
@@ -98,12 +107,14 @@ class JumpProgress:
         items = tuple(items)
         if all(item is None for item in items):
             return None
-        if any(item is None for item in items) or len({item.flight_closed is None for item in items}) != 1:
+        if (any(item is None for item in items) or len({item.flight_closed is None for item in items}) != 1
+                or len({item.stable is None for item in items}) != 1):
             raise ValueError('Jump progress coverage changes within a physical interval')
-        closed = (None if items[0].flight_closed is None
-                  else torch.cat([item.flight_closed for item in items]))
+        optional = lambda name: (None if getattr(items[0], name) is None
+                                 else torch.cat([getattr(item, name) for item in items]))
         return JumpProgress(torch.cat([item.reference_stage for item in items]),
-                            torch.cat([item.ascent_seen for item in items]), closed)
+                            torch.cat([item.ascent_seen for item in items]),
+                            optional('flight_closed'), optional('stable'))
 
 
 def advance_flight_latch(request: Tensor, lifted: Tensor, closed: Tensor, *, current: Tensor,
@@ -430,15 +441,15 @@ def physical_reward_densities(sample: RewardPhysics, reference: RewardReference,
                 for key, value in cost.items()}
     extensions = parameters.extensions
     missed_jump = torch.zeros_like(jump)
-    stage = ascended = closed = None
+    stage = ascended = closed = stable = None
     if extensions.needs_jump_progress:
         if jump_progress is None:
             if jump.any():
                 raise ValueError('Jump flight/missed rewards require the request progress (reference stage, ascent)')
         else:
             jump_progress.validate(reference.mode)
-            stage, ascended, closed = (jump_progress.reference_stage, jump_progress.ascent_seen,
-                                       jump_progress.flight_closed)
+            stage, ascended, closed, stable = (jump_progress.reference_stage, jump_progress.ascent_seen,
+                                               jump_progress.flight_closed, jump_progress.stable)
     if extensions.jump_missed:
         from transformer_rl.formal.tasks.jump import ReferenceStage
 
@@ -481,12 +492,21 @@ def physical_reward_densities(sample: RewardPhysics, reference: RewardReference,
             pushing = pushing & ~closed   # no second push after the first real flight landed
         achieved = (sample.velocity_origin_world_m_s[:, 2] / target.clamp_min(JUMP_PUSH_MIN_REFERENCE_M_S)).clamp(0, 1)
         positive['jump_push'] = extensions.jump_push * pushing.to(v_up.dtype) * achieved
+    if extensions.jump_settle:
+        settled = torch.zeros_like(jump)
+        if stage is not None:
+            if stable is None:
+                if jump.any():
+                    raise ValueError('Jump settle rewards require the native stable-landing flag')
+            else:
+                settled = jump & stable
+        positive['jump_settle'] = extensions.jump_settle * settled.to(v_up.dtype)
     p, c = torch.stack(tuple(positive.values())).sum(0), torch.stack(tuple(cost.values())).sum(0)
     components = {**{'positive.' + key: value for key, value in positive.items()},
                   **{'cost.' + key: -value for key, value in cost.items()}}
     positive_bound = torch.where(gimbal_active, 11., 8.)
     positive_bound = (positive_bound + extensions.jump_flight + extensions.jump_lift * extensions.jump_lift_cap_m_s
-                      + extensions.jump_push)
+                      + extensions.jump_push + extensions.jump_settle)
     if rough_dash:
         # 10 centering + 20 zero torque + 10 directional wheel speed.
         positive_bound = positive_bound + 40 * rough_active

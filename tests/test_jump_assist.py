@@ -55,7 +55,7 @@ def test_level_fades_inside_the_assist_stage_only():
         JumpAssistConfig(probability=1.5)
 
 
-def test_selected_requests_get_capped_shortfall_force_until_real_liftoff_and_outcomes_are_split():
+def test_selected_requests_get_capped_shortfall_force_until_the_first_touchdown_and_outcomes_are_split():
     native = Native()
     assist = install_jump_assist(native, curriculum(100), {"probability": 1., "velocity_gain_per_s": 10.,
                                                            "max_weight_fraction": .5})
@@ -67,8 +67,8 @@ def test_selected_requests_get_capped_shortfall_force_until_real_liftoff_and_out
     native.tasks.stage[:] = torch.tensor([EXTENSION, BALLISTIC, HOLD])
     native._apply_action()
     force = native.wrenches[-1]["forces"][:, 0, 2]
-    # Row 0: 20 kg * 10/s * 1 m/s = 200 N, capped at 0.5 * 20 * 9.81; row 1: 20 * 10 * 0.2;
-    # row 2's reference is past its push window.
+    # Row 0 (extension): 20 kg * 10/s * (1 m/s launch - 0) = 200 N, capped at 0.5 * 20 * 9.81;
+    # row 1 (rising ballistic): 20 * 10 * (1 m/s reference - .8); row 2's reference is past its apex.
     torch.testing.assert_close(force, torch.tensor([98.1, 40., 0.]))
     assert native.wrenches[-1]["is_global"] and native.wrenches[-1]["body_ids"] == [0]
     # Native flight_seen from wheel unloading without rising keeps the assist on.
@@ -77,12 +77,12 @@ def test_selected_requests_get_capped_shortfall_force_until_real_liftoff_and_out
     native.tasks.observe_physics()         # the shared first-flight latch observes each tick
     native._apply_action()
     assert native.wrenches[-1]["forces"][0, 0, 2] > 0
-    native.tasks.ascent_seen[0] = True     # real liftoff ends this request's assist
+    native.tasks.ascent_seen[0] = True     # real liftoff: the reference still rises, keep closing the gap
     native.tasks.observe_physics()
     native._apply_action()
-    assert native.wrenches[-1]["forces"][0, 0, 2] == 0
+    assert native.wrenches[-1]["forces"][0, 0, 2] > 0
     assert native.tasks.supermimic_flight_latch.lifted[0]
-    native.tasks.air_ticks[0] = 0
+    native.tasks.air_ticks[0] = 0          # the first touchdown after real flight ends the assist
     native.tasks.observe_physics()
     native._apply_action()
     assert native.wrenches[-1]["forces"][0, 0, 2] == 0

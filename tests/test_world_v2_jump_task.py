@@ -405,6 +405,7 @@ def test_first_flight_latch_matches_the_native_owner_through_bounces_and_new_req
             command_height=owner.stream.current[:, 3], ground_z=torch.zeros(n, 4))
         same_state(result.state, native)
         torch.testing.assert_close(result.flight_closed, torch.stack(expected, -1), rtol=0, atol=0)
+        torch.testing.assert_close(result.stable[:, -1], owner.landed_s > 0, rtol=0, atol=0)
         closed_seen |= result.flight_closed.any(-1)
         state = advance(native, task, result.state, completed).state
         completed = estimate_at(native.time, n)

@@ -273,6 +273,7 @@ class JumpInterval:
     reference_stage: Tensor
     ascent_seen: Tensor
     flight_closed: Tensor | None = None   # per tick; None without a recorded first-flight latch
+    stable: Tensor | None = None          # per tick: native stable-landing conditions hold
 
 
 class JumpTask:
@@ -430,7 +431,7 @@ class JumpTask:
             gravity = physical.gravity_body
             tilt = torch.atan2(gravity[..., :2].norm(dim=-1), -gravity[..., 2])
             speed = physical.angular_velocity_body.norm(dim=-1)
-            phases, ascents, closed_ticks = [], [], []
+            phases, ascents, closed_ticks, stable_ticks = [], [], [], []
             latch = None if state.flight_latch is None else state._flight_latch_state()
             for tick in range(4):
                 LabCourseTasks.observe_physics(owner, wheel_support_load[:, tick], velocity_z[:, tick],
@@ -438,6 +439,7 @@ class JumpTask:
                     dt=self.config.physics_dt_s)
                 phases.append(owner.phase.clone())
                 ascents.append(owner.ascent_seen.clone())
+                stable_ticks.append(owner.landed_s > 0)
                 if latch is not None:
                     # The native FirstFlightLatch update after observe_physics.
                     latch = advance_flight_latch(*latch, current=owner.physical_id,
@@ -455,4 +457,4 @@ class JumpTask:
         velocity = torch.where(landing, 0., curve.velocity_world_z_m_s[:, None])
         return JumpInterval(following, phase, height, velocity, owner.success_id.clone(), success,
                             curve.clock_stage[:, None].expand(-1, 4), torch.stack(ascents, -1),
-                            torch.stack(closed_ticks, -1) if closed_ticks else None)
+                            torch.stack(closed_ticks, -1) if closed_ticks else None, torch.stack(stable_ticks, -1))

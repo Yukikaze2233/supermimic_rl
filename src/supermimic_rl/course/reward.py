@@ -36,7 +36,8 @@ class SharedRewardComposer(PhysicalRewardComposer):
             if window['steps'] == 0:
                 window['jump_reference_stage'] = tasks.jump_reference().clock_stage
             latch = tasks.supermimic_flight_latch
-            progress = JumpProgress(window['jump_reference_stage'], tasks.ascent_seen.clone(), latch.closed.clone())
+            progress = JumpProgress(window['jump_reference_stage'], tasks.ascent_seen.clone(), latch.closed.clone(),
+                                    tasks.landed_s > 0)
         densities = physical_reward_densities(
             sample, reference,
             RewardHistory(window['dq'], window['action_cost'], window['action2_cost'], self._action_count),

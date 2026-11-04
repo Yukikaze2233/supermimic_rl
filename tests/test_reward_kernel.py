@@ -326,7 +326,7 @@ def _task_owner(jump_reference):
     """The native jump task interface the shared reward reads (2 rows)."""
     return SimpleNamespace(jump_reference=jump_reference, ascent_seen=torch.zeros(2, dtype=torch.bool),
                            physical_id=torch.zeros(2, dtype=torch.long), air_ticks=torch.zeros(2, dtype=torch.long),
-                           observe_physics=lambda *args, **kwargs: None)
+                           landed_s=torch.zeros(2), observe_physics=lambda *args, **kwargs: None)
 
 
 def test_missed_jump_native_clock_is_sampled_once_per_interval_and_ascent_per_tick():
@@ -352,3 +352,19 @@ def test_missed_jump_native_clock_is_sampled_once_per_interval_and_ascent_per_ti
         torch.testing.assert_close(result.component_densities['cost.jump_missed'],
                                    torch.tensor([-1., -.5], dtype=torch.float64))
         assert len(reads) == interval + 1
+
+
+def test_settle_reward_pays_only_while_the_native_stable_landing_conditions_hold():
+    from supermimic_rl.reward_kernel import JumpProgress, RewardExtensions
+    from transformer_rl.formal.tasks.jump import ReferenceStage
+
+    extensions = RewardExtensions(jump_settle=2.)
+    stage, ascent = torch.full((2,), int(ReferenceStage.HOLD)), torch.ones(2, dtype=torch.bool)
+    progress = JumpProgress(stage, ascent, torch.ones(2, dtype=torch.bool), torch.tensor([True, False]))
+    _, landing = _jump_densities('jump_landing', extensions, progress)
+    torch.testing.assert_close(landing.positive['jump_settle'], torch.tensor([2., 0.]))
+    assert not landing.invalid.any()
+    _, ordinary = _jump_densities('ordinary', extensions)
+    assert ordinary.positive['jump_settle'].abs().sum() == 0
+    with pytest.raises(ValueError, match='stable-landing'):
+        _jump_densities('jump_landing', extensions, JumpProgress(stage, ascent, torch.ones(2, dtype=torch.bool)))

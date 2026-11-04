@@ -18,14 +18,15 @@
     "jump_lift": 2.0,
     "jump_push": 2.0,
     "success_event": 5.0,
-    "jump_missed": 1.0
+    "jump_missed": 1.0,
+    "jump_settle": 2.0
   },
   "jump_assist": {
     "probability": 1.0,
     "decay": "force",
     "fade_stage_fraction": 0.75,
     "velocity_gain_per_s": 10.0,
-    "max_weight_fraction": 0.8,
+    "max_weight_fraction": 1.5,
     "stage": "active_jump",
     "seed": 7,
     "assist_request_probability": 0.8

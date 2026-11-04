@@ -2,9 +2,14 @@
 
 A policy that has never left the ground never experiences flight, landing or
 the success event, so no reward reaches its takeoff. As in SCUT's jump_takeoff
-state machine, accepted jump requests receive an upward base force during the
-reference push window, until real liftoff (airborne after real ascent). The force closes the shortfall
-to the reference launch speed and is capped by weight. Two decays:
+state machine, accepted jump requests receive an upward base force while the
+reference rises: it closes the shortfall to the launch speed during the
+extension and to the reference ballistic speed afterwards, capped by weight,
+and ends at the reference apex or the request's first touchdown after real
+flight. Stopping at liftoff left 80% of assisted R8 jumps below the success
+window. As in SCUT, the assist fades with training progress through its
+stage, never with the policy's own success: a hidden, performance-held assist
+made R8 wait for it instead of pushing. Two decays:
 
 * ``probability``: a fading share of requests is fully assisted;
 * ``force`` (SCUT ``decay_mode: force``): the force scale fades, so the
@@ -93,18 +98,7 @@ class JumpAssist:
         return (self.curriculum.real_transitions - self.stage_start) / self.stage_budget
 
     def level(self) -> float:
-        """Selection chance (probability decay) or force scale (force decay).
-
-        With a performance jump height ladder the assist fades per opened
-        height level (1, 2/3, 1/3, 0 of ``probability`` for 3 gates), so the
-        full height range is trained unassisted, independent of the stage
-        coordinate; otherwise it fades with the coordinate inside the assist stage.
-        """
-        ladder = getattr(self.curriculum, 'jump_height_level', lambda: None)()
-        if ladder is not None:
-            if self._progress() < 0:
-                return 0.          # never before the assist stage
-            return self.config.probability * (1 - ladder / len(self.curriculum.config.jump_height_gates))
+        """Selection chance (probability decay) or force scale (force decay) at the current coordinate."""
         progress = self._progress()
         if not 0 <= progress < 1:
             return 0.
@@ -182,12 +176,15 @@ class JumpAssist:
         if self.level() <= 0:
             return None
         curve = tasks.jump_reference()
-        push = ((curve.clock_stage == EXTENSION)
-                | ((curve.clock_stage == BALLISTIC) & (curve.velocity_world_z_m_s > 0)))
-        window = self.selected & (tasks.physical_id >= 0) & ~self.lifted(tasks.physical_id.long()) & push
+        extension = curve.clock_stage == EXTENSION
+        rising = (curve.clock_stage == BALLISTIC) & (curve.velocity_world_z_m_s > 0)
+        request = tasks.physical_id.long()
+        landed = self.latch.closed & (self.latch.request == request)
+        window = self.selected & (request >= 0) & ~landed & (extension | rising)
         velocity_z = native._as_torch(native.robot.data.root_com_vel_w)[:, 2]
         mass = native._formal_reward.composer._mass_kg
-        shortfall = (curve.launch_velocity_m_s.to(velocity_z.dtype) - velocity_z).clamp_min(0)
+        target = torch.where(extension, curve.launch_velocity_m_s, curve.velocity_world_z_m_s).to(velocity_z.dtype)
+        shortfall = (target - velocity_z).clamp_min(0)
         limit = self.config.max_weight_fraction * mass * self.config.gravity_m_s2
         force = torch.minimum(mass * self.config.velocity_gain_per_s * shortfall, limit)
         if self.config.decay == 'force':
