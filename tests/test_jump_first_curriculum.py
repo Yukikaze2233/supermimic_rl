@@ -245,6 +245,28 @@ def test_v5_height_caps_wait_for_unassisted_bin_gates_at_exact_integer_boundarie
         assert curriculum._effective_domain().jump_m[1] == expected_after
 
 
+def test_reported_height_ladder_follows_opened_gates_not_the_coordinate_and_fades_the_assist():
+    from supermimic_rl.course.jump_assist import JumpAssist, JumpAssistConfig
+    from support import REPO_ROOT
+
+    root = REPO_ROOT / 'configs/gpufree'
+    curriculum = make_course_curriculum(4, 'cpu', 7, json.loads((root / 'ppo-course-gated-v5.json').read_text()))
+    assert curriculum.jump_height_level() is None
+    assist = object.__new__(JumpAssist)
+    assist.curriculum, assist.config = curriculum, JumpAssistConfig(probability=1., decay='force')
+    # Far past every height fraction and the assist stage: with reported gates
+    # the cap and the assist follow the opened ladder only.
+    curriculum.set_progress(sum(curriculum.stage_budgets[:6]), 0)
+    curriculum.set_opened_gates(['active_jump'])
+    assert curriculum.jump_height_level() == 0 and curriculum._effective_domain().jump_m == (.03, .10)
+    assert assist.level() == 1.
+    curriculum.set_opened_gates(['active_jump', 'active_jump@0.25', 'active_jump@0.75'])  # 0.5 still closed
+    assert curriculum.jump_height_level() == 1 and curriculum._effective_domain().jump_m[1] == .20
+    assert assist.level() == pytest.approx(.75)
+    curriculum.set_opened_gates(['active_jump@0.25', 'active_jump@0.5', 'active_jump@0.75'])
+    assert curriculum._effective_domain().jump_m[1] == .40 and assist.level() == pytest.approx(.25)
+
+
 @pytest.mark.parametrize('height_gates', [[(.25, .20), (.20, .40)], [(.25, .05), (.50, .40)],
                                          [(.25, .20)], [(1., .40)], [(.25, float('nan'))]])
 def test_invalid_discrete_height_schedule_is_rejected(height_gates):

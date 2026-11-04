@@ -74,6 +74,25 @@ class JumpFirstCurriculum(SuperMimicCurriculum):
             stage_weights=self.stage_weights, continuous=True)
         self.budget = self._budget(0)
 
+    # Keys of performance gates the trainer has opened (``stage@fraction``),
+    # or None when the jump height follows the coordinate. Not checkpointed
+    # here: the trainer restores its gates and re-applies them after resume.
+    opened_gates: frozenset[str] | None = None
+
+    def set_opened_gates(self, keys) -> None:
+        self.opened_gates = frozenset(keys)
+
+    def jump_height_level(self) -> int | None:
+        """Number of jump height gates opened in order, if performance drives the height."""
+        if self.opened_gates is None or not self.config.jump_height_gates:
+            return None
+        level = 0
+        for fraction, _ in self.config.jump_height_gates:
+            if f'{self.config.jump_height_stage}@{fraction:g}' not in self.opened_gates:
+                break
+            level += 1
+        return level
+
     def _budget(self, real_transitions):
         budget = _TransitionBudget(SimpleNamespace(
             stage_transition_budgets=self.stage_budgets,
@@ -103,10 +122,14 @@ class JumpFirstCurriculum(SuperMimicCurriculum):
             index = self.stage_names.index(self.config.jump_height_stage)
             start, budget = sum(self.stage_budgets[:index]), self.stage_budgets[index]
             upper = self.initial_domain.jump_m[1]
-            for fraction, cap in self.config.jump_height_gates:
+            level = self.jump_height_level()
+            for number, (fraction, cap) in enumerate(self.config.jump_height_gates):
                 # Match CourseGates' integer boundary exactly: its held
                 # coordinate is boundary - 1, even for a very large budget.
-                if self.real_transitions >= start + int(fraction * budget):
+                # With reported (non-holding) gates the opened ladder decides.
+                reached = (self.real_transitions >= start + int(fraction * budget) if level is None
+                           else number < level)
+                if reached:
                     upper = cap
             jump = replace(jump, jump_m=(self.initial_domain.jump_m[0], upper))
         return replace(command, height_m=height.height_m,

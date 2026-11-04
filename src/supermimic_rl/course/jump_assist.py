@@ -3,7 +3,7 @@
 A policy that has never left the ground never experiences flight, landing or
 the success event, so no reward reaches its takeoff. As in SCUT's jump_takeoff
 state machine, accepted jump requests receive an upward base force during the
-reference push window, until verified flight. The force closes the shortfall
+reference push window, until real liftoff (airborne after real ascent). The force closes the shortfall
 to the reference launch speed and is capped by weight. Two decays:
 
 * ``probability``: a fading share of requests is fully assisted;
@@ -31,9 +31,10 @@ EXTENSION, BALLISTIC = 1, 2
 # Outcomes of all requests and of unassisted requests per requested-rise bin [m].
 RISE_BIN_EDGES = (.10, .20, .30)
 RISE_BINS = tuple(f'{low:.2f}-{high:.2f}' for low, high in zip((.0, *RISE_BIN_EDGES), (*RISE_BIN_EDGES, .40)))
+# "liftoff": the ended request was airborne after real ascent (whether or not it then succeeded).
 COUNTERS = ('assisted_requests', 'assisted_ended', 'assisted_success', 'unassisted_ended', 'unassisted_success',
             *(f'{who}{kind}_rise_{name}' for who in ('', 'unassisted_') for name in RISE_BINS
-              for kind in ('ended', 'success')))
+              for kind in ('ended', 'success', 'liftoff')))
 DECAYS = ('probability', 'force')
 
 
@@ -76,6 +77,9 @@ class JumpAssist:
         self.selected = torch.zeros(native.num_envs, dtype=torch.bool, device=device)
         # A request counts as assisted only if assist impulse was actually delivered to it.
         self.impulse = torch.zeros(native.num_envs, device=device)
+        # Real liftoff: airborne for the native 2 ticks after real ascent. Native
+        # flight_seen (2 N wheel unloading) is reachable by retracting the legs.
+        self.lifted = torch.zeros(native.num_envs, dtype=torch.bool, device=device)
         self.rise = torch.zeros(native.num_envs, device=device)   # requested rise latched at acceptance
         self.edges = torch.tensor(RISE_BIN_EDGES, device=device)
         self.generator = torch.Generator(device=device).manual_seed(config.seed)
@@ -85,7 +89,17 @@ class JumpAssist:
         return (self.curriculum.real_transitions - self.stage_start) / self.stage_budget
 
     def level(self) -> float:
-        """Selection chance (probability decay) or force scale (force decay) at the current coordinate."""
+        """Selection chance (probability decay) or force scale (force decay).
+
+        With a performance jump height ladder the assist fades per opened
+        height level (1, 3/4, ... of ``probability`` for 3 gates) and stays
+        available while the stage coordinate moves on; otherwise it fades with
+        the coordinate inside the assist stage.
+        """
+        ladder = getattr(self.curriculum, 'jump_height_level', lambda: None)()
+        if ladder is not None:
+            steps = len(self.curriculum.config.jump_height_gates) + 1
+            return self.config.probability * (1 - ladder / steps)
         progress = self._progress()
         if not 0 <= progress < 1:
             return 0.
@@ -111,6 +125,7 @@ class JumpAssist:
         self._count('assisted_ended', ended & helped)
         self._count('unassisted_ended', ended & ~helped)
         self._count_by_rise('ended', ended, helped)
+        self._count_by_rise('liftoff', ended & self.lifted, helped)
         accepted = changed & (current >= 0)
         level = self.level()
         chance = self.config.assist_request_probability * (float(level > 0) if self.config.decay == 'force' else level)
@@ -121,6 +136,7 @@ class JumpAssist:
             draw = torch.rand(current.shape, device=current.device, generator=self.generator) < chance
         self.selected = torch.where(accepted, draw, self.selected & (current >= 0))
         self.impulse = torch.where(changed, 0., self.impulse)
+        self.lifted = self.lifted & ~changed
         self.rise = torch.where(accepted, tasks.active_rise, self.rise)
         self._count('assisted_requests', accepted & draw)
         self.request = current.clone()
@@ -144,12 +160,13 @@ class JumpAssist:
         native = self.native
         tasks = native._terrain_course.tasks
         self.track(tasks)
-        if not 0 <= self._progress() < 1:
+        self.lifted |= (tasks.physical_id >= 0) & tasks.ascent_seen & (tasks.air_ticks >= 2)
+        if self.level() <= 0:
             return None
         curve = tasks.jump_reference()
         push = ((curve.clock_stage == EXTENSION)
                 | ((curve.clock_stage == BALLISTIC) & (curve.velocity_world_z_m_s > 0)))
-        window = self.selected & (tasks.physical_id >= 0) & ~tasks.flight_seen & push
+        window = self.selected & (tasks.physical_id >= 0) & ~self.lifted & push
         velocity_z = native._as_torch(native.robot.data.root_com_vel_w)[:, 2]
         mass = native._formal_reward.composer._mass_kg
         shortfall = (curve.launch_velocity_m_s.to(velocity_z.dtype) - velocity_z).clamp_min(0)

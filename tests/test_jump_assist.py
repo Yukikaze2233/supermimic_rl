@@ -15,7 +15,8 @@ class Native:
     def __init__(self):
         self.tasks = SimpleNamespace(
             physical_id=torch.full((3,), -1), success_id=torch.full((3,), -1),
-            flight_seen=torch.zeros(3, dtype=torch.bool), stage=torch.full((3,), EXTENSION),
+            flight_seen=torch.zeros(3, dtype=torch.bool), ascent_seen=torch.zeros(3, dtype=torch.bool),
+            air_ticks=torch.zeros(3, dtype=torch.long), stage=torch.full((3,), EXTENSION),
             reference_vz=torch.ones(3), launch=torch.ones(3), active_rise=torch.tensor([.05, .25, .35]))
         self.tasks.jump_reference = lambda: SimpleNamespace(
             clock_stage=self.tasks.stage, velocity_world_z_m_s=self.tasks.reference_vz,
@@ -53,7 +54,7 @@ def test_level_fades_inside_the_assist_stage_only():
         JumpAssistConfig(probability=1.5)
 
 
-def test_selected_requests_get_capped_shortfall_force_until_flight_and_outcomes_are_split():
+def test_selected_requests_get_capped_shortfall_force_until_real_liftoff_and_outcomes_are_split():
     native = Native()
     assist = install_jump_assist(native, curriculum(100), {"probability": 1., "velocity_gain_per_s": 10.,
                                                            "max_weight_fraction": .5})
@@ -69,7 +70,15 @@ def test_selected_requests_get_capped_shortfall_force_until_flight_and_outcomes_
     # row 2's reference is past its push window.
     torch.testing.assert_close(force, torch.tensor([98.1, 40., 0.]))
     assert native.wrenches[-1]["is_global"] and native.wrenches[-1]["body_ids"] == [0]
+    # Native flight_seen from wheel unloading without rising keeps the assist on.
     native.tasks.flight_seen[0] = True
+    native.tasks.air_ticks[0] = 2
+    native._apply_action()
+    assert native.wrenches[-1]["forces"][0, 0, 2] > 0
+    native.tasks.ascent_seen[0] = True     # real liftoff ends this request's assist
+    native._apply_action()
+    assert native.wrenches[-1]["forces"][0, 0, 2] == 0
+    native.tasks.air_ticks[0] = 0
     native._apply_action()
     assert native.wrenches[-1]["forces"][0, 0, 2] == 0
     assist.curriculum.real_transitions = 299   # fade complete: new requests are unassisted
