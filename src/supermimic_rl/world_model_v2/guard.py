@@ -11,8 +11,11 @@ the window, whereas a mean would count one dip in ``window`` judgments.
 ``restore`` mode keeps the complete actor and the Adam states of its decoder and
 optional estimator, restores them after ``patience`` consecutive judgments more
 than ``drop_fraction`` below the best, and halves the actor learning rate on
-every restoration. ``report`` mode only reports the same judgment for review:
-it never restores and keeps the configured learning rate.
+every restoration, down to ``min_rate_fraction`` of the base rate; after
+``recover_after`` consecutive judgments within the tolerance one halving is
+undone. The window restarts after a restore, so the restored actor is judged
+on its own collections. ``report`` mode only reports the same judgment for
+review: it never restores and keeps the configured learning rate.
 """
 from __future__ import annotations
 
@@ -25,14 +28,17 @@ GUARD_MODES = ('restore', 'report')
 
 class NativeRegressionGuard:
     def __init__(self, drop_fraction: float, patience: int, base_learning_rate: float, *,
-                 window: int = 1, mode: str = 'restore'):
+                 window: int = 1, mode: str = 'restore', min_rate_fraction: float = 0., recover_after: int = 0):
         if (not 0 < drop_fraction < 1 or type(patience) is not int or patience < 1 or not base_learning_rate > 0
-                or type(window) is not int or window < 1 or mode not in GUARD_MODES):
+                or type(window) is not int or window < 1 or mode not in GUARD_MODES
+                or not 0 <= min_rate_fraction <= 1 or type(recover_after) is not int or recover_after < 0):
             raise ValueError('Guard needs a drop fraction in (0, 1), positive patience, learning rate and window, '
-                             f'and a mode in {GUARD_MODES}')
+                             f'a mode in {GUARD_MODES}, a rate floor in [0, 1] and nonnegative recovery')
         self.drop_fraction, self.patience, self.base_learning_rate = drop_fraction, patience, base_learning_rate
         self.window, self.mode = window, mode
+        self.min_rate_fraction, self.recover_after = min_rate_fraction, recover_after
         self.best_reward, self.best, self.bad_cycles, self.restorations = None, None, 0, 0
+        self.halvings = self.good_judgments = 0   # restorations stay the record; halvings can be undone
         self.recent = deque(maxlen=window)
 
     @staticmethod
@@ -48,7 +54,9 @@ class NativeRegressionGuard:
         return self.mode == 'restore'
 
     def learning_rate(self) -> float:
-        return self.base_learning_rate * (.5 ** self.restorations if self.restores else 1.)
+        if not self.restores:
+            return self.base_learning_rate
+        return self.base_learning_rate * max(.5 ** self.halvings, self.min_rate_fraction)
 
     def observe(self, reward: float | None, snapshot: dict | None, actor, optimizer, *,
                 estimator_optimizer=None) -> dict:
@@ -65,8 +73,9 @@ class NativeRegressionGuard:
             judged = statistics.median(self.recent)
             if self.best_reward is None or judged > self.best_reward:
                 self.best_reward, self.best, self.bad_cycles = judged, snapshot, 0
+                self._recover()
             elif judged < self.best_reward - self.drop_fraction * abs(self.best_reward):
-                self.bad_cycles += 1
+                self.bad_cycles, self.good_judgments = self.bad_cycles + 1, 0
                 if self.restores and self.bad_cycles >= self.patience:
                     actor.load_state_dict(self.best['actor'])
                     if estimator_optimizer is not None and 'estimator_optimizer' not in self.best:
@@ -83,9 +92,12 @@ class NativeRegressionGuard:
                         if estimator_optimizer is not None:
                             estimator_optimizer.load_state_dict(copy.deepcopy(self.best['estimator_optimizer']))
                     self.restorations += 1
+                    self.halvings += 1
                     self.bad_cycles, restored = 0, True
+                    self.recent.clear()
             else:
                 self.bad_cycles = 0
+                self._recover()
         for group in optimizer.param_groups:
             group['lr'] = self.learning_rate()
         return {'student_reward': reward, 'judged_student_reward': judged, 'best_student_reward': self.best_reward,
@@ -95,10 +107,15 @@ class NativeRegressionGuard:
                    {'actor_optimizer_legacy_reset': legacy_actor_reset,
                     'estimator_optimizer_legacy_reset': legacy_estimator_reset})}
 
+    def _recover(self) -> None:
+        self.good_judgments += 1
+        if self.recover_after and self.halvings and self.good_judgments >= self.recover_after:
+            self.halvings, self.good_judgments = self.halvings - 1, 0
+
     def state_dict(self) -> dict:
         return {'best_reward': self.best_reward, 'best': self.best, 'bad_cycles': self.bad_cycles,
                 'restorations': self.restorations, 'window': self.window, 'mode': self.mode,
-                'recent': list(self.recent)}
+                'recent': list(self.recent), 'halvings': self.halvings, 'good_judgments': self.good_judgments}
 
     def load_state_dict(self, state: dict) -> bool:
         """Restore; returns False when the judgment restarted because window or mode changed.
@@ -107,6 +124,8 @@ class NativeRegressionGuard:
         judgment starts afresh; past restorations stay counted for the record.
         """
         self.restorations = int(state['restorations'])
+        self.halvings = int(state.get('halvings', self.restorations))
+        self.good_judgments = int(state.get('good_judgments', 0))
         if (state.get('window', 1), state.get('mode', 'restore')) != (self.window, self.mode):
             return False
         self.best_reward, self.best = state['best_reward'], state['best']

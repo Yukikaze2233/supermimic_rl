@@ -212,3 +212,23 @@ def test_changed_window_or_mode_restarts_the_judgment_but_keeps_the_restoration_
     report = NativeRegressionGuard(.1, 1, 1e-3, window=3, mode='report')
     assert not report.load_state_dict(legacy)
     assert report.best_reward is None and report.restorations == 1 and report.learning_rate() == 1e-3
+
+
+def test_restore_restarts_the_window_and_the_rate_has_a_floor_and_recovers():
+    actor, optimizer = actor_and_optimizer()
+    guard = NativeRegressionGuard(.05, 1, 1e-3, window=3, min_rate_fraction=.25, recover_after=2)
+    observe = lambda reward: guard.observe(reward, guard.snapshot(actor, optimizer), actor, optimizer)
+    for reward in (.09, .09, .09):
+        observe(reward)
+    statuses = [observe(.01) for _ in range(2)]
+    assert statuses[-1]['restored'] and len(guard.recent) == 0
+    # Stale bad rewards are gone: the restored actor's first full window is judged afresh.
+    assert not any(observe(.09)['restored'] for _ in range(3))
+    for _ in range(3):                         # repeated real drops floor the rate at 1/4
+        for reward in (.01, .01, .01):
+            observe(reward)
+    assert guard.halvings >= 2 and guard.learning_rate() == pytest.approx(2.5e-4)
+    halvings = guard.halvings
+    for reward in (.09,) * 7:
+        observe(reward)
+    assert guard.halvings < halvings
