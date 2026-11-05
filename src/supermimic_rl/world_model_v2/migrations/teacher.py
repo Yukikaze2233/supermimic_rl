@@ -1,0 +1,48 @@
+"""Validate unchanged teacher weights against a new native evaluation."""
+import json
+from pathlib import Path
+
+import torch
+
+from ..teacher import PPO_TEACHER_FORMAT, file_sha256
+
+
+def _source(value):
+    result = json.loads(value)
+    for name in ('jump_takeoff', 'stair_label', 'jump_assist'):
+        result.setdefault(name, None)
+    return result
+
+
+def rebind_teacher_source(saved, source, target, source_path, target_path):
+    """Same evaluated PPO weights, with the new artifact's own qualification scope."""
+    before = saved['teacher_source']
+    if file_sha256(source_path) != before['teacher_artifact']['sha256']:
+        raise ValueError('Source teacher artifact differs from the saved checkpoint')
+    old, new = [torch.load(path, map_location='cpu', weights_only=True, mmap=True)
+                for path in (source_path, target_path)]
+    for payload, native in ((old, source), (new, target)):
+        metadata = payload['source']
+        report = metadata['qualification']['report']
+        if (payload.get('format') != PPO_TEACHER_FORMAT or metadata.get('format') != PPO_TEACHER_FORMAT
+                or not metadata.get('qualified_for')
+                or _source(json.dumps(metadata['native_source'])) != native
+                or _source(json.dumps(report['native_source'])) != native
+                or report.get('checkpoint_sha256') != metadata['initial_checkpoint']['sha256']
+                or report.get('transferred_source') is not None
+                or report.get('steps', 0) <= 0 or report.get('simulated_seconds', 0) <= 0):
+            raise ValueError('Teacher needs its own native evaluation on the pinned task source')
+    if old['source'] != {k: v for k, v in before.items() if k != 'teacher_artifact'}:
+        raise ValueError('Source teacher metadata differs from the online checkpoint')
+    if (any(old['source']['initial_checkpoint'][key] != new['source']['initial_checkpoint'][key]
+            for key in ('sha256', 'updates', 'transitions'))
+            or any(old['source'][key] != new['source'][key] for key in
+                   ('history_length', 'observation_dim', 'action_bounds', 'action_semantics',
+                    'history_semantics', 'estimate_semantics'))
+            or any(old.get(k) != new.get(k) for k in ('actor_hidden', 'estimator_hidden', 'mean_squash'))
+            or old['actor'].keys() != new['actor'].keys()
+            or any(not torch.equal(value, new['actor'][name]) for name, value in old['actor'].items())):
+        raise ValueError('Task handoff must retain exactly the same teacher weights')
+    return {**new['source'], 'teacher_artifact': {
+        'path': str(Path(target_path).resolve()), 'sha256': file_sha256(target_path)}}
+

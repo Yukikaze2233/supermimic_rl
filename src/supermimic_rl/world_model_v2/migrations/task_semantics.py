@@ -5,7 +5,6 @@ import hashlib
 import inspect
 import json
 import math
-from pathlib import Path
 
 import torch
 
@@ -20,7 +19,8 @@ from ..jump_task import (
 from ..motion_task import MOTION_TASK_DIM
 from ..online import OnlineConfig
 from ..records import MODEL_CONTRACT, RecordSpec
-from ..teacher import PPO_TEACHER_FORMAT, file_sha256
+from ..teacher import file_sha256
+from .teacher import rebind_teacher_source
 
 
 TASK_VALID_FLAGS = ('task_record_valid', 'stair_source_valid', 'jump_record_valid', 'recovery_record_valid')
@@ -107,39 +107,6 @@ def _course(saved, source, target, source_raw, target_raw, coordinate, num_envs,
         'source_checkpoint_defaults_materialized': {k: defaults[k] for k in sorted(missing)},
         'coordinate_is_capability_promotion': False}
     return {**saved['environment'], 'curriculum': state}, receipt
-
-
-def _teacher(saved, source, target, source_path, target_path):
-    """Same evaluated PPO weights, with the new artifact's own qualification scope."""
-    before = saved['teacher_source']
-    if file_sha256(source_path) != before['teacher_artifact']['sha256']:
-        raise ValueError('Source teacher artifact differs from the saved checkpoint')
-    old, new = [torch.load(path, map_location='cpu', weights_only=True, mmap=True)
-                for path in (source_path, target_path)]
-    for payload, native in ((old, source), (new, target)):
-        metadata = payload['source']
-        report = metadata['qualification']['report']
-        if (payload.get('format') != PPO_TEACHER_FORMAT or metadata.get('format') != PPO_TEACHER_FORMAT
-                or not metadata.get('qualified_for')
-                or _source(json.dumps(metadata['native_source'])) != native
-                or _source(json.dumps(report['native_source'])) != native
-                or report.get('checkpoint_sha256') != metadata['initial_checkpoint']['sha256']
-                or report.get('transferred_source') is not None
-                or report.get('steps', 0) <= 0 or report.get('simulated_seconds', 0) <= 0):
-            raise ValueError('Teacher needs its own native evaluation on the pinned task source')
-    if old['source'] != {k: v for k, v in before.items() if k != 'teacher_artifact'}:
-        raise ValueError('Source teacher metadata differs from the online checkpoint')
-    if (any(old['source']['initial_checkpoint'][key] != new['source']['initial_checkpoint'][key]
-            for key in ('sha256', 'updates', 'transitions'))
-            or any(old['source'][key] != new['source'][key] for key in
-                   ('history_length', 'observation_dim', 'action_bounds', 'action_semantics',
-                    'history_semantics', 'estimate_semantics'))
-            or any(old.get(k) != new.get(k) for k in ('actor_hidden', 'estimator_hidden', 'mean_squash'))
-            or old['actor'].keys() != new['actor'].keys()
-            or any(not torch.equal(value, new['actor'][name]) for name, value in old['actor'].items())):
-        raise ValueError('Task handoff must retain exactly the same teacher weights')
-    return {**new['source'], 'teacher_artifact': {
-        'path': str(Path(target_path).resolve()), 'sha256': file_sha256(target_path)}}
 
 
 def upgrade_task_semantics(saved, dataset, reference, *, source_runtime_raw, target_runtime_raw,
@@ -256,7 +223,7 @@ def upgrade_task_semantics(saved, dataset, reference, *, source_runtime_raw, tar
         raise ValueError('Target dataset needs valid owned native task starts with known gate history')
     environment, course_receipt = _course(saved, source, target, source_course_raw, target_course_raw,
                                           course_coordinate, dataset['replay']['num_envs'], sampler_device)
-    teacher_source = _teacher(saved, source, target, source_teacher_path, target_teacher_path)
+    teacher_source = rebind_teacher_source(saved, source, target, source_teacher_path, target_teacher_path)
     base = Critic.feature_size(schema.goal_dim, storage['sim_context'].shape[-1], task_dim=MOTION_TASK_DIM,
                                terrain=True, stairs=True, jumps=True, recovery=True)
     if saved['learner']['critic']['net.0.weight'].shape[1] != base:
