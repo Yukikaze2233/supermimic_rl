@@ -253,8 +253,8 @@ def test_jump_push_pays_reference_upward_speed_only_before_the_first_real_landin
 
 @pytest.mark.parametrize('case', ['jump_takeoff', 'jump_flight', 'jump_landing', 'ordinary', 'recovery'])
 @pytest.mark.parametrize('stage_name', ['COMPRESSION', 'EXTENSION', 'BALLISTIC', 'HOLD'])
-@pytest.mark.parametrize('ascended', [False, True])
-def test_missed_jump_removes_tracking_only_after_reference_has_finished(case, stage_name, ascended):
+@pytest.mark.parametrize('motion', ['none', 'supported_ascent', 'real_flight'])
+def test_missed_jump_removes_tracking_only_after_reference_has_finished(case, stage_name, motion):
     from transformer_rl.formal.tasks.jump import ReferenceStage
     from supermimic_rl.reward_kernel import JumpProgress, RewardExtensions
 
@@ -270,10 +270,11 @@ def test_missed_jump_removes_tracking_only_after_reference_has_finished(case, st
     # Zero vertical speed also occurs before takeoff; it is not a missed jump.
     stages = torch.tensor([int(getattr(ReferenceStage, stage_name)), int(ReferenceStage.COMPRESSION)])
     original = physical_reward_densities(physics, reference, history, base)
-    progress = JumpProgress(stages, torch.tensor([ascended, False]))
+    progress = JumpProgress(stages, torch.tensor([motion != 'none', False]),
+                            flight_started=torch.tensor([motion == 'real_flight', False]))
     result = physical_reward_densities(physics, reference, history, parameters, jump_progress=progress)
     # Any jump phase counts, including native FLIGHT/LANDING from wheel unloading without rising.
-    missed = torch.tensor([case.startswith('jump') and stage_name == 'HOLD' and not ascended, False])
+    missed = torch.tensor([case.startswith('jump') and stage_name == 'HOLD' and motion != 'real_flight', False])
     torch.testing.assert_close(result.gates['jump_missed'], missed)
     torch.testing.assert_close(result.cost['jump_missed'], missed.float())
     for name, value in original.positive.items():
@@ -288,7 +289,8 @@ def test_missed_jump_removes_tracking_only_after_reference_has_finished(case, st
     assert not result.invalid.any()
 
 
-def test_missed_jump_stable_hold_retains_attitude_without_tracking_profit():
+@pytest.mark.parametrize('ascended', [False, True])
+def test_missed_jump_stable_hold_retains_attitude_without_tracking_profit(ascended):
     from transformer_rl.formal.tasks.jump import ReferenceStage
     from supermimic_rl.reward_kernel import JumpProgress, RewardExtensions
 
@@ -311,7 +313,8 @@ def test_missed_jump_stable_hold_retains_attitude_without_tracking_profit():
     original = physical_reward_densities(physics, reference, history, base)
     result = physical_reward_densities(physics, reference, history,
         replace(base, extensions=RewardExtensions(jump_missed=1.)),
-        jump_progress=JumpProgress(torch.full((2,), int(ReferenceStage.HOLD)), torch.zeros(2, dtype=torch.bool)))
+        jump_progress=JumpProgress(torch.full((2,), int(ReferenceStage.HOLD)),
+            torch.full((2,), ascended), flight_started=torch.zeros(2, dtype=torch.bool)))
 
     assert (original.positive['forward'] > 0).all() and (original.positive['yaw'] > 0).all()
     for name in ('forward', 'yaw', 'height', 'jump_vertical'):
@@ -321,6 +324,21 @@ def test_missed_jump_stable_hold_retains_attitude_without_tracking_profit():
     torch.testing.assert_close(result.total, torch.zeros_like(result.total), atol=0, rtol=0)
     assert not result.invalid.any()
 
+    # A completed first flight still earns tracking during landing/HOLD.
+    after_flight = physical_reward_densities(physics, reference, history,
+        replace(base, extensions=RewardExtensions(jump_missed=1.)),
+        jump_progress=JumpProgress(torch.full((2,), int(ReferenceStage.HOLD)),
+            torch.ones(2, dtype=torch.bool), flight_closed=torch.ones(2, dtype=torch.bool),
+            flight_started=torch.ones(2, dtype=torch.bool)))
+    assert not after_flight.cost['jump_missed'].any()
+    torch.testing.assert_close(after_flight.total, original.total, atol=0, rtol=0)
+
+    with pytest.raises(ValueError, match='first-real-flight latch'):
+        physical_reward_densities(physics, reference, history,
+            replace(base, extensions=RewardExtensions(jump_missed=1.)),
+            jump_progress=JumpProgress(torch.full((2,), int(ReferenceStage.HOLD)),
+                                       torch.ones(2, dtype=torch.bool)))
+
 
 def _task_owner(jump_reference):
     """The native jump task interface the shared reward reads (2 rows)."""
@@ -329,7 +347,7 @@ def _task_owner(jump_reference):
                            landed_s=torch.zeros(2), observe_physics=lambda *args, **kwargs: None)
 
 
-def test_missed_jump_native_clock_is_sampled_once_per_interval_and_ascent_per_tick():
+def test_missed_jump_native_clock_is_sampled_once_per_interval_and_liftoff_per_tick():
     from transformer_rl.formal.tasks.jump import ReferenceStage
     from supermimic_rl.reward_kernel import RewardExtensions
 
@@ -343,10 +361,13 @@ def test_missed_jump_native_clock_is_sampled_once_per_interval_and_ascent_per_ti
     tasks = _task_owner(jump_reference)
     install_shared_reward(composer, extensions=RewardExtensions(jump_missed=1.), jump_tasks=tasks)
     for interval in range(2):
+        tasks.physical_id.fill_(interval)
         begin(composer, reference, torch.zeros(2, 6))
         for tick in range(1, 5):
-            # Row 1 really ascends from tick 3; the task owner updates the latch each substep.
-            tasks.ascent_seen = torch.tensor([False, tick >= 3])
+            # Both rows rise, but only row 1 actually leaves support on tick 3.
+            tasks.ascent_seen = torch.tensor([True, tick >= 3])
+            tasks.air_ticks = torch.tensor([0, 2 if tick >= 3 else 0])
+            tasks.observe_physics()
             composer.observe(sample(composer, tick), reference)
         result = finish(composer)
         torch.testing.assert_close(result.component_densities['cost.jump_missed'],

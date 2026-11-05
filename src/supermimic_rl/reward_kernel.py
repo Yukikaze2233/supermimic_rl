@@ -46,6 +46,11 @@ class RewardExtensions:
     first touchdown, which bounds them per request; repeated bouncing earns
     nothing. See :class:`JumpProgress` and :func:`advance_flight_latch`.
 
+    Once the reference reaches HOLD, ``jump_missed`` removes tracking profit
+    until real liftoff. A supported rise alone does not complete takeoff.
+    Compression and extension retain their shaping rewards, and a late real
+    jump can still earn flight and landing rewards within the request window.
+
     The native success needs 2 s of uninterrupted stable landing (contact,
     quiet, near the start height, peak inside the target window). The single
     success event gives a policy that never succeeded no gradient toward it, so
@@ -65,7 +70,7 @@ class RewardExtensions:
     jump_lift_cap_m_s: float = 2.
     jump_push: float = 0.          # per second at full reference upward speed while supported
     success_event: float | None = None
-    jump_missed: float = 0.        # per second in reference HOLD without real ascent
+    jump_missed: float = 0.        # per second in reference HOLD without real liftoff
     jump_settle: float = 0.        # per second at a 2 s native stable-landing streak (25% at its start)
     jump_landing_rate: float = 0.  # per second and (rad/s)^2 of body angular speed above 0.4 rad/s after a real landing
 
@@ -93,7 +98,9 @@ class JumpProgress:
 
     ``reference_stage`` is the reference clock stage (int64), held across one
     policy interval. ``ascent_seen`` is the native per-request latch of real
-    ascent (upward COM speed > 0.15 m/s and rise > 1 cm). ``flight_closed``
+    ascent (upward COM speed > 0.15 m/s and rise > 1 cm). ``flight_started``
+    additionally requires the native two airborne ticks: extending a supported
+    leg can satisfy ascent alone. ``flight_closed``
     marks that the request's first real flight has touched down (see
     :func:`advance_flight_latch`); producers without that latch pass None and
     then cannot pay flight terms on jump rows. All are read after the task
@@ -104,9 +111,11 @@ class JumpProgress:
     ascent_seen: Tensor
     flight_closed: Tensor | None = None
     landed_s: Tensor | None = None       # native uninterrupted stable-landing time [s]; > 0 while stable
+    flight_started: Tensor | None = None # first-real-flight latch, retained after touchdown
 
     def validate(self, mode: Tensor) -> None:
-        flags = (self.ascent_seen,) + (() if self.flight_closed is None else (self.flight_closed,))
+        flags = tuple(flag for flag in (self.ascent_seen, self.flight_closed, self.flight_started)
+                      if flag is not None)
         if (self.reference_stage.shape != mode.shape or self.reference_stage.device != mode.device
                 or self.reference_stage.dtype != torch.long
                 or any(flag.shape != mode.shape or flag.device != mode.device or flag.dtype != torch.bool
@@ -121,13 +130,14 @@ class JumpProgress:
         if all(item is None for item in items):
             return None
         if (any(item is None for item in items) or len({item.flight_closed is None for item in items}) != 1
-                or len({item.landed_s is None for item in items}) != 1):
+                or len({item.landed_s is None for item in items}) != 1
+                or len({item.flight_started is None for item in items}) != 1):
             raise ValueError('Jump progress coverage changes within a physical interval')
         optional = lambda name: (None if getattr(items[0], name) is None
                                  else torch.cat([getattr(item, name) for item in items]))
         return JumpProgress(torch.cat([item.reference_stage for item in items]),
                             torch.cat([item.ascent_seen for item in items]),
-                            optional('flight_closed'), optional('landed_s'))
+                            optional('flight_closed'), optional('landed_s'), optional('flight_started'))
 
 
 def advance_flight_latch(request: Tensor, lifted: Tensor, closed: Tensor, *, current: Tensor,
@@ -469,8 +479,14 @@ def physical_reward_densities(sample: RewardPhysics, reference: RewardReference,
         if stage is not None:
             # Only the explicit end-of-reference HOLD certifies a missed push;
             # a zero velocity target also occurs at compression start and apex.
-            # Wheel unloading without rising (native flight_seen) is still missed.
-            missed_jump = jump & (stage == int(ReferenceStage.HOLD)) & ~ascended
+            # Neither supported extension nor unloading without ascent is a
+            # jump. Use the same real-flight latch as the flight rewards.
+            started = jump_progress.flight_started
+            if started is None:
+                if jump.any():
+                    raise ValueError('Missed jump reward requires the first-real-flight latch')
+            else:
+                missed_jump = jump & (stage == int(ReferenceStage.HOLD)) & ~started
         # A missed request must not keep earning locomotion tracking rewards.
         # Keep jump_attitude to encourage upright support while waiting,
         # instead of turning the entire HOLD interval into pure punishment.

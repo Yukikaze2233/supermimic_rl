@@ -139,8 +139,9 @@ def test_missed_jump_imagination_matches_native_ticks_and_retains_motion_gradien
     native, assembly, geometry, start, legs, memory = setup('legacy')
     extensions = RewardExtensions(jump_missed=1.)
     stage = torch.full((2,), int(ReferenceStage.HOLD))
-    # Row 1 rises for real from tick 2 on; row 0 never ascends.
-    ascents = [torch.tensor([False, tick >= 2]) for tick in range(4)]
+    # Row 0 rises while supported. Only row 1 achieves real liftoff from tick 2.
+    ascents = [torch.tensor([True, tick >= 2]) for tick in range(4)]
+    flights = [torch.tensor([False, tick >= 2]) for tick in range(4)]
     tasks = SimpleNamespace(jump_reference=lambda: SimpleNamespace(clock_stage=stage), ascent_seen=ascents[0],
                             physical_id=torch.zeros(2, dtype=torch.long), air_ticks=torch.zeros(2, dtype=torch.long),
                             landed_s=torch.zeros(2), observe_physics=lambda *args, **kwargs: None)
@@ -162,7 +163,7 @@ def test_missed_jump_imagination_matches_native_ticks_and_retains_motion_gradien
         samples.append(RewardTick(endpoint, geometry(endpoint), torch.zeros(2), torch.zeros(2, 2),
             torch.zeros(2, 21), torch.zeros(2, 2), torch.zeros(2, 3), owned, ~owned, reference,
             native._time + (tick + 1) * .005, ids, ids, owned,
-            jump_progress=JumpProgress(stage, ascents[tick])))
+            jump_progress=JumpProgress(stage, ascents[tick], flight_started=flights[tick])))
     queue = torch.zeros(2, 3, 2)
     result = assembly.integrate(start, tuple(samples), action, memory, queue, legs,
                                 torch.zeros(2, 6), torch.ones(2, 6))
@@ -170,6 +171,8 @@ def test_missed_jump_imagination_matches_native_ticks_and_retains_motion_gradien
     previous, support = start, memory.support
     for index, tick in enumerate(samples):
         tasks.ascent_seen = ascents[index]
+        tasks.air_ticks = flights[index].long() * 2
+        tasks.observe_physics()
         speed = previous.joint_velocity[:, 4:6]
         queue = assembly.wheels.push(queue, assembly.wheels.motor_input(
             assembly.wheels.target(action), speed, torch.ones(2, 2)))
@@ -186,7 +189,7 @@ def test_missed_jump_imagination_matches_native_ticks_and_retains_motion_gradien
                                torch.tensor([-.02, -.01], dtype=torch.float64))
     for name in ('positive.forward', 'positive.yaw'):
         assert result.components[name][0] == 0
-        assert result.components[name][1] > 0  # This row ascends for real on tick 3.
+        assert result.components[name][1] > 0  # This row achieves real liftoff on tick 3.
     assert (result.components['positive.jump_attitude'] > 0).all()
     loss = sum(result.components.values()).sum()
     gradients = torch.autograd.grad(loss, tuple(tick.state.velocity for tick in samples))

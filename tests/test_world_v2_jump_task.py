@@ -395,16 +395,18 @@ def test_first_flight_latch_matches_the_native_owner_through_bounces_and_new_req
             physical.velocity[0, :, 2] = .4
         if 11 <= step < 15:
             force[1] = 0.
-        expected = []
+        expected, expected_lifted = [], []
         for tick in range(4):
             owner.observe_physics(force[:, tick], physical.velocity[:, tick, 2], torch.zeros(n),
                 physical.position[:, tick, 2], angular_speed_rad_s=torch.zeros(n), dt=.005)
             expected.append(latch.closed.clone())
+            expected_lifted.append(latch.lifted.clone())
         result = task.observe_interval(state, physical=physical, wheel_support_load=force,
             base_com_offset=torch.zeros(n, 3), base_mode=owner.base_mode,
             command_height=owner.stream.current[:, 3], ground_z=torch.zeros(n, 4))
         same_state(result.state, native)
         torch.testing.assert_close(result.flight_closed, torch.stack(expected, -1), rtol=0, atol=0)
+        torch.testing.assert_close(result.flight_started, torch.stack(expected_lifted, -1), rtol=0, atol=0)
         torch.testing.assert_close(result.landed_s[:, -1], owner.landed_s, rtol=0, atol=0)
         closed_seen |= result.flight_closed.any(-1)
         state = advance(native, task, result.state, completed).state

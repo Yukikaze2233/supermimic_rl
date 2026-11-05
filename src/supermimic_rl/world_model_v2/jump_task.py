@@ -274,6 +274,7 @@ class JumpInterval:
     ascent_seen: Tensor
     flight_closed: Tensor | None = None   # per tick; None without a recorded first-flight latch
     landed_s: Tensor | None = None        # per tick: native uninterrupted stable-landing time [s]
+    flight_started: Tensor | None = None  # per tick: first-real-flight latch, including after landing
 
 
 class JumpTask:
@@ -431,7 +432,7 @@ class JumpTask:
             gravity = physical.gravity_body
             tilt = torch.atan2(gravity[..., :2].norm(dim=-1), -gravity[..., 2])
             speed = physical.angular_velocity_body.norm(dim=-1)
-            phases, ascents, closed_ticks, stable_ticks = [], [], [], []
+            phases, ascents, closed_ticks, stable_ticks, lifted_ticks = [], [], [], [], []
             latch = None if state.flight_latch is None else state._flight_latch_state()
             for tick in range(4):
                 LabCourseTasks.observe_physics(owner, wheel_support_load[:, tick], velocity_z[:, tick],
@@ -444,6 +445,7 @@ class JumpTask:
                     # The native FirstFlightLatch update after observe_physics.
                     latch = advance_flight_latch(*latch, current=owner.physical_id,
                                                  ascent_seen=owner.ascent_seen, air_ticks=owner.air_ticks)
+                    lifted_ticks.append(latch[1].clone())
                     closed_ticks.append(latch[2].clone())
             trigger = (None if state.trigger_clock is None else (state.trigger_clock, state.trigger_flags))
             flight_latch = None if latch is None else torch.stack(
@@ -457,4 +459,5 @@ class JumpTask:
         velocity = torch.where(landing, 0., curve.velocity_world_z_m_s[:, None])
         return JumpInterval(following, phase, height, velocity, owner.success_id.clone(), success,
                             curve.clock_stage[:, None].expand(-1, 4), torch.stack(ascents, -1),
-                            torch.stack(closed_ticks, -1) if closed_ticks else None, torch.stack(stable_ticks, -1))
+                            torch.stack(closed_ticks, -1) if closed_ticks else None, torch.stack(stable_ticks, -1),
+                            torch.stack(lifted_ticks, -1) if lifted_ticks else None)
