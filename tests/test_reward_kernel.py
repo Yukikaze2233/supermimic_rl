@@ -370,3 +370,25 @@ def test_settle_reward_grows_with_the_native_stable_landing_streak():
     assert ordinary.positive['jump_settle'].abs().sum() == 0
     with pytest.raises(ValueError, match='stable-landing time'):
         _jump_densities('jump_landing', extensions, JumpProgress(stage, ascent, closed))
+
+
+def test_landing_rate_cost_applies_only_after_the_first_real_touchdown():
+    from supermimic_rl.reward_kernel import JumpProgress, RewardExtensions
+    from transformer_rl.formal.tasks.jump import ReferenceStage
+
+    extensions = RewardExtensions(jump_landing_rate=2.)
+    stage, ascent = torch.full((2,), int(ReferenceStage.HOLD)), torch.ones(2, dtype=torch.bool)
+    composer, reference = setup('jump_landing')
+    install_shared_reward(composer, extensions=extensions, jump_tasks=_task_owner(lambda: None))
+    begin(composer, reference, torch.zeros(2, 6))
+    window = composer._window
+    history = RewardHistory(window['dq'], window['action_cost'], window['action2_cost'], composer._action_count)
+    physics = replace(sample(composer, 1), angular_velocity_body_rad_s=torch.tensor([[.6, .8, 3.], [.3, 0., 0.]]))
+    progress = JumpProgress(stage, ascent, torch.tensor([True, True]))
+    result = physical_reward_densities(physics, reference, history, RewardParameters.from_composer(composer),
+                                       jump_progress=progress)
+    # Row 0: roll/pitch rate 1.0 rad/s (yaw ignored) -> 2 * (1.0 - 0.4)^2; row 1 below the free band.
+    torch.testing.assert_close(result.cost['jump_landing_rate'], torch.tensor([2. * .36, 0.]))
+    before = physical_reward_densities(physics, reference, history, RewardParameters.from_composer(composer),
+                                       jump_progress=JumpProgress(stage, ascent, torch.tensor([False, False])))
+    assert before.cost['jump_landing_rate'].abs().sum() == 0

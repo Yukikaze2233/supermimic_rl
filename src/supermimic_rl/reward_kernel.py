@@ -22,6 +22,7 @@ from transformer_rl.formal.tasks.gimbal_course import GimbalCourse
 
 JUMP_PUSH_MIN_REFERENCE_M_S = .1
 JUMP_SETTLE_STREAK_S = 2.     # the native physical success needs this uninterrupted stable landing
+JUMP_LANDING_RATE_FREE_RAD_S = .4   # inside the native quiet limit of 0.5 rad/s
 NATIVE_SOURCE_SHA256 = 'b03282693376a8af082d8433badfcba917270394113aaf2bec271289f7decdd8'
 
 
@@ -52,7 +53,10 @@ class RewardExtensions:
     after a correct jump and lasts at most the 2 s before the request ends.
     It grows with the native streak (``landed_s``) from 25% to 100% at 2 s:
     R8b met every condition on 79% of those ticks but never for 2 s in a row,
-    so a per-tick reward alone did not value the unbroken streak.
+    so a per-tick reward alone did not value the unbroken streak. The streaks
+    were broken mostly by roll/pitch wobble while balancing after the landing
+    (rate > 0.5 rad/s on ~10% of those ticks); ``jump_landing_rate`` costs the
+    roll/pitch rate above 0.4 rad/s from the first real touchdown on.
     """
 
     jump_flight: float = 0.        # per second in the request's first real flight (after real ascent)
@@ -62,10 +66,11 @@ class RewardExtensions:
     success_event: float | None = None
     jump_missed: float = 0.        # per second in reference HOLD without real ascent
     jump_settle: float = 0.        # per second at a 2 s native stable-landing streak (25% at its start)
+    jump_landing_rate: float = 0.  # per second and (rad/s)^2 of roll/pitch rate above 0.4 rad/s after a real landing
 
     def __post_init__(self):
         values = (self.jump_flight, self.jump_lift, self.jump_lift_cap_m_s, self.jump_push, self.jump_missed,
-                  self.jump_settle,
+                  self.jump_settle, self.jump_landing_rate,
                   1. if self.success_event is None else self.success_event)
         if any(type(value) not in (int, float) or not math.isfinite(value) or value < 0 for value in values):
             raise ValueError("Reward extensions must be finite and nonnegative")
@@ -73,11 +78,12 @@ class RewardExtensions:
     @property
     def active(self) -> bool:
         return bool(self.jump_flight or self.jump_lift or self.jump_push or self.jump_missed or self.jump_settle
-                    or self.success_event is not None)
+                    or self.jump_landing_rate or self.success_event is not None)
 
     @property
     def needs_jump_progress(self) -> bool:
-        return bool(self.jump_flight or self.jump_lift or self.jump_push or self.jump_missed or self.jump_settle)
+        return bool(self.jump_flight or self.jump_lift or self.jump_push or self.jump_missed or self.jump_settle
+                    or self.jump_landing_rate)
 
 
 @dataclass(frozen=True)
@@ -508,6 +514,16 @@ def physical_reward_densities(sample: RewardPhysics, reference: RewardReference,
                 streak = (landed.to(v_up.dtype) / JUMP_SETTLE_STREAK_S).clamp(0, 1)
                 settled = torch.where(jump & (landed > 0), .25 + .75 * streak, 0.)
         positive['jump_settle'] = extensions.jump_settle * settled
+    if extensions.jump_landing_rate:
+        landed_after_flight = torch.zeros_like(jump)
+        if stage is not None:
+            if closed is None:
+                if jump.any():
+                    raise ValueError('Jump landing-rate costs require the first-flight latch of the request')
+            else:
+                landed_after_flight = jump & closed & (phase != int(RewardPhase.FLIGHT))
+        excess = (sample.angular_velocity_body_rad_s[:, :2].norm(dim=-1) - JUMP_LANDING_RATE_FREE_RAD_S).clamp_min(0)
+        cost['jump_landing_rate'] = extensions.jump_landing_rate * landed_after_flight.to(v_up.dtype) * excess.square()
     p, c = torch.stack(tuple(positive.values())).sum(0), torch.stack(tuple(cost.values())).sum(0)
     components = {**{'positive.' + key: value for key, value in positive.items()},
                   **{'cost.' + key: -value for key, value in cost.items()}}

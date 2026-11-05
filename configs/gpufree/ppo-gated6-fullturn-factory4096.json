@@ -19,7 +19,8 @@
     "jump_push": 2.0,
     "success_event": 5.0,
     "jump_missed": 1.0,
-    "jump_settle": 2.0
+    "jump_settle": 2.0,
+    "jump_landing_rate": 4.0
   },
   "jump_assist": {
     "probability": 1.0,
