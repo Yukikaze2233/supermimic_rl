@@ -383,11 +383,12 @@ def test_landing_rate_cost_applies_only_after_the_first_real_touchdown():
     begin(composer, reference, torch.zeros(2, 6))
     window = composer._window
     history = RewardHistory(window['dq'], window['action_cost'], window['action2_cost'], composer._action_count)
-    physics = replace(sample(composer, 1), angular_velocity_body_rad_s=torch.tensor([[.6, .8, 3.], [.3, 0., 0.]]))
+    physics = replace(sample(composer, 1), angular_velocity_body_rad_s=torch.tensor([[0., .6, .8], [.3, 0., 0.]]))
     progress = JumpProgress(stage, ascent, torch.tensor([True, True]))
     result = physical_reward_densities(physics, reference, history, RewardParameters.from_composer(composer),
                                        jump_progress=progress)
-    # Row 0: roll/pitch rate 1.0 rad/s (yaw ignored) -> 2 * (1.0 - 0.4)^2; row 1 below the free band.
+    # Row 0: angular speed 1.0 rad/s (pitch and yaw, as the native quiet test) -> 2 * (1.0 - 0.4)^2;
+    # row 1 is inside the free band.
     torch.testing.assert_close(result.cost['jump_landing_rate'], torch.tensor([2. * .36, 0.]))
     before = physical_reward_densities(physics, reference, history, RewardParameters.from_composer(composer),
                                        jump_progress=JumpProgress(stage, ascent, torch.tensor([False, False])))

@@ -54,9 +54,10 @@ class RewardExtensions:
     It grows with the native streak (``landed_s``) from 25% to 100% at 2 s:
     R8b met every condition on 79% of those ticks but never for 2 s in a row,
     so a per-tick reward alone did not value the unbroken streak. The streaks
-    were broken mostly by roll/pitch wobble while balancing after the landing
-    (rate > 0.5 rad/s on ~10% of those ticks); ``jump_landing_rate`` costs the
-    roll/pitch rate above 0.4 rad/s from the first real touchdown on.
+    were broken by angular wobble while balancing after the landing; costing
+    roll/pitch alone moved the wobble into yaw. ``jump_landing_rate`` costs the
+    same quantity the native quiet test bounds by 0.5 rad/s, the body angular
+    speed, above 0.4 rad/s from the first real touchdown on.
     """
 
     jump_flight: float = 0.        # per second in the request's first real flight (after real ascent)
@@ -66,7 +67,7 @@ class RewardExtensions:
     success_event: float | None = None
     jump_missed: float = 0.        # per second in reference HOLD without real ascent
     jump_settle: float = 0.        # per second at a 2 s native stable-landing streak (25% at its start)
-    jump_landing_rate: float = 0.  # per second and (rad/s)^2 of roll/pitch rate above 0.4 rad/s after a real landing
+    jump_landing_rate: float = 0.  # per second and (rad/s)^2 of body angular speed above 0.4 rad/s after a real landing
 
     def __post_init__(self):
         values = (self.jump_flight, self.jump_lift, self.jump_lift_cap_m_s, self.jump_push, self.jump_missed,
@@ -522,7 +523,7 @@ def physical_reward_densities(sample: RewardPhysics, reference: RewardReference,
                     raise ValueError('Jump landing-rate costs require the first-flight latch of the request')
             else:
                 landed_after_flight = jump & closed & (phase != int(RewardPhase.FLIGHT))
-        excess = (sample.angular_velocity_body_rad_s[:, :2].norm(dim=-1) - JUMP_LANDING_RATE_FREE_RAD_S).clamp_min(0)
+        excess = (sample.angular_velocity_body_rad_s.norm(dim=-1) - JUMP_LANDING_RATE_FREE_RAD_S).clamp_min(0)
         cost['jump_landing_rate'] = extensions.jump_landing_rate * landed_after_flight.to(v_up.dtype) * excess.square()
     p, c = torch.stack(tuple(positive.values())).sum(0), torch.stack(tuple(cost.values())).sum(0)
     components = {**{'positive.' + key: value for key, value in positive.items()},
