@@ -112,6 +112,17 @@ python scripts/report_world_v2_data.py --online-checkpoint <online>/training/res
 
 离线续拟合可用 `fit_world_v2.py --online-checkpoint <resume.pt> --contact-event-fraction <fraction>` 增加接触事件窗口的采样比例，默认值为 0。事件定义沿用原生两轮支撑载荷 ≤2 N、连续两个 5 ms 子步，包含跨控制步的连续事件；合法窗口和训练/留出环境划分保持不变。其余窗口均匀采样，只有均匀部分更新归一化统计，整个 batch 使用原损失；采样比例需要根据留出集运动与接触指标验证。
 
+用新采集的原生数据接续已有运动模型时，使用显式入口：
+
+```sh
+python scripts/fit_world_v2.py <new-native>/replay.pt \
+  --initial-online-checkpoint <frozen-online.pt> \
+  --linkage <matching-linkage.json> --terrain-atlas <matching-atlas.json> \
+  --device cuda:0 --output <new-fit.json>
+```
+
+该入口只继承运动网络、归一化状态及 Adam，保留模型结构与学习率，不读取原在线 replay，也不更新 Actor/Critic。新数据必须匹配模型 schema；训练/留出环境按新数据划分，不能宣称沿用了原在线留出集。输出保存模型来源及新数据 SHA256。后续通过 `--resume <new-fit.checkpoint.pt>` 恢复独立的模型、Adam、采样 RNG 和新数据划分，无需原在线 checkpoint；数据内容不得被替换。新模型必须检查接触事件和原有能力保留情况，离线拟合完成不代表已接入在线学生。
+
 `--wheel-contact-weight <weight>` 可额外单独归约双轮连续载荷的归一化 MSE，默认 0 保持原损失。该项沿用每个子步的输出尺度与误差下限，按两轮、四个子步及拟合时域取均值；总损失为 `state + ticks + weight * wheel_contact`。候选值 1 表示额外组的系数为 1，叠加原有 56 维 ticks 损失后，双轮通道相对原项的权重为 29 倍；它是待验证的训练系数，不是物理参数。使用相同留出集同时检查运动与接触事件，离线配置和日志会保存权重及分项损失。续训继承已存权重，旧 checkpoint 缺省为 0；改变权重需从明确的在线源另建离线实验。在线训练默认不启用该项。
 
 检查离线续拟合的模型时，在配对报告命令中增加 `--world-checkpoint <fit>.checkpoint.pt`。报告校验原始配对身份和训练/留出环境列表，记录新权重 SHA256，并报告原始接触预测；旧在线模型标定的滤波阈值不会沿用到新权重。
