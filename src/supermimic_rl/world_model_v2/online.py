@@ -354,9 +354,11 @@ class OnlineTrainer:
             # The resumed Adam carries the rate of the saved guard state; apply this guard's rate.
             for group in self.learner.optimizers['actor'].param_groups:
                 group['lr'] = self.guard.learning_rate()
-            # Native resume resets the full population physically. Reuse the
-            # existing startup observation budget without restarting learning.
-            if config.policy_start_cycle:
+            # Cold births can trigger a premature restore, but report-only
+            # monitoring must keep observing them for human review. In that
+            # mode an absolute task warmup endpoint must not become a new
+            # hundreds-of-cycles blind period after every handoff.
+            if config.policy_start_cycle and self.guard.restores:
                 self.guard_cold_cycles_remaining = config.policy_start_cycle
                 self.guard_cold_previous_bad_cycles = self.guard.bad_cycles
                 self.guard.bad_cycles = 0
