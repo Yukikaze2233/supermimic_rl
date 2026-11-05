@@ -95,11 +95,14 @@ def test_request_heading_wrapper_preserves_other_native_commands_rng_and_handoff
                  torch.ones(256), course.command_context())
     left, right = native.sample(*arguments, left_rng), modified.sample(*arguments, right_rng)
     for item in fields(left):
-        if item.name != 'heading_enabled':
+        if item.name not in ('heading_enabled', 'command'):
             assert torch.equal(getattr(left, item.name), getattr(right, item.name))
     request = family == int(TaskFamily.REQUEST)
     assert torch.equal(left.heading_enabled[~request], right.heading_enabled[~request])
     assert not right.heading_enabled[request].any()
+    assert torch.equal(left.command[~request], right.command[~request])
+    assert torch.equal(left.command[request][:, [0, 1, 3]], right.command[request][:, [0, 1, 3]])
+    assert right.command[request, 2].count_nonzero() == 0          # jumps never carry a yaw rate
     assert torch.equal(left_rng.get_state(), right_rng.get_state())
     for left_value, right_value in zip(native.handoff(32, left_rng, 'cpu'),
                                        modified.handoff(32, right_rng, 'cpu')):

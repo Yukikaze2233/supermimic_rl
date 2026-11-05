@@ -340,6 +340,9 @@ class SuperMimicCurriculum(FormalTaskCurriculum):
                 moving = (ordinal % 2 == 1) & (scale > 0)
                 command[rows, :3] *= scale
                 command[rows[~moving], :3] = 0
+                # Moving jumps go straight: the native success needs a quiet body
+                # angular speed (<= 0.5 rad/s), which a yaw command would prevent.
+                command[rows, 2] = 0
                 motion_rows = rows[moving]
                 if len(motion_rows):
                     domain = self._effective_domain()

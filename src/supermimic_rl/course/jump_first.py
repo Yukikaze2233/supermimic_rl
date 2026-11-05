@@ -8,6 +8,7 @@ from __future__ import annotations
 from dataclasses import replace
 from types import SimpleNamespace
 
+import torch
 from transformer_rl.formal.tasks.command_pool import CommandPool
 from transformer_rl.formal.tasks.curriculum import TaskFamily, interpolate_domain
 
@@ -19,12 +20,21 @@ JUMP_FIRST_STAGE_NAMES = tuple(STAGE_NAMES[index] for index in STAGE_ORDER)
 
 
 class JumpFirstCommandPool(CommandPool):
-    """Keep the requested jump yaw instead of overriding it with random heading."""
+    """Jump requests keep their forward speed but never a yaw rate or a random heading.
+
+    The native jump success needs 2 s of stable landing with a body angular
+    speed of at most 0.5 rad/s, which no turning command can meet: in R8 the
+    yaw part of the stable-landing test started failing when moving jumps
+    (with the segment's yaw rate) entered the course. The evaluated moving
+    jumps also command no yaw.
+    """
 
     def sample(self, family, *args, **kwargs):
         draw = super().sample(family, *args, **kwargs)
-        return replace(draw, heading_enabled=(
-            draw.heading_enabled & (family != int(TaskFamily.REQUEST))))
+        request = family == int(TaskFamily.REQUEST)
+        command = draw.command.clone()
+        command[:, 2] = torch.where(request, 0., command[:, 2])
+        return replace(draw, command=command, heading_enabled=draw.heading_enabled & ~request)
 
 
 def install_jump_first_command_pool(tasks, curriculum):
@@ -35,7 +45,7 @@ def install_jump_first_command_pool(tasks, curriculum):
         raise ValueError('Jump-first course requires the native command pool')
     tasks.command_pool = JumpFirstCommandPool(tasks.command_pool.config)
     return {'schedule': SCHEDULE, 'request_heading_override': False,
-            'native_handoff_preserved': True,
+            'native_handoff_preserved': True, 'request_yaw_rate': 0.,
             'early_jump_domain': list(curriculum.initial_domain.jump_m)}
 
 
