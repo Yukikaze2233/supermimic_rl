@@ -40,7 +40,8 @@ def load_student_actor(path: str | Path, device: str | torch.device = "cpu") -> 
     # Bounds are a saved buffer; build with the saved value so the load is exact.
     bounds = tuple(saved["actor"]["action_bounds"].tolist())
     actor = EstimatorActor(estimator_hidden=config.estimator_hidden, actor_hidden=config.actor_hidden,
-                           frame_dim=config.actor_frame_dim, action_bounds=bounds).to(device)
+                           frame_dim=config.actor_frame_dim, action_bounds=bounds,
+                           chassis_command_contract=config.chassis_command_contract).to(device)
     actor.load_state_dict(saved["actor"])
     return actor.eval(), saved
 
@@ -56,7 +57,7 @@ def ppo_actor_from_student(student: EstimatorActor,
         raise ValueError("Only the 5x35 chassis student matches the PPO actor interface")
     bounds = tuple(student.action_bounds.tolist()) if action_bounds is None else tuple(action_bounds)
     actor = TeacherActor(_hidden(student.decoder), _hidden(student.estimator), mean_squash="tanh",
-                         action_bounds=bounds)
+                         action_bounds=bounds, chassis_command_contract=student.chassis_command_contract)
     actor.estimator.network.load_state_dict(student.estimator.state_dict())
     actor.network.load_state_dict(student.decoder.state_dict())
     with torch.no_grad():
@@ -88,6 +89,7 @@ def actor_init_payload(student_path: str | Path, action_bounds: tuple[float, ...
     return {"format": ACTOR_INIT_FORMAT, "actor": actor.state_dict(),
             "actor_hidden": list(_hidden(student.decoder)), "estimator_hidden": list(_hidden(student.estimator)),
             "mean_squash": "tanh",
+            "chassis_command_contract": student.chassis_command_contract,
             "action_bounds": (student.action_bounds.tolist() if action_bounds is None
                               else [float(value) for value in action_bounds]),
             "source": {"kind": "v2_chassis_student", "path": str(path), "sha256": digest,
@@ -125,5 +127,7 @@ def initialize_student_from_ppo(student: EstimatorActor, path: Path, expected_sh
     if difference > EQUIVALENCE_TOLERANCE:
         raise ValueError(f"Initialized student differs from the PPO actor by {difference}")
     return {"path": str(path), "sha256": digest, "max_abs_action_difference": difference,
+            "source_command_contract": actor.chassis_command_contract,
+            "student_command_contract": student.chassis_command_contract,
             "action_std": actor.log_std.detach().exp().tolist(),
-            "scope": "student weights only; world model, critic and optimizers start fresh"}
+            "scope": "student weights only; equivalence on already prepared 35D; world model, critic and optimizers start fresh"}

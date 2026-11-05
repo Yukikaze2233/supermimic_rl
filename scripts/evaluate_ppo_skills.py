@@ -39,11 +39,12 @@ class NativeHistoryActor:
         return self
 
     def _history(self):
-        from supermimic_rl.ppo.policy import FRAME_DIM, HISTORY_LENGTH
+        from supermimic_rl.ppo.policy import HISTORY_LENGTH
+        from supermimic_rl.chassis_observation import chassis_frame
 
         native = self.environment.adapter.env
         frames = native.obs_buf["policy"].reshape(self.environment.num_envs, HISTORY_LENGTH, NATIVE_FRAME_DIM)
-        return frames[..., :FRAME_DIM]
+        return chassis_frame(frames, self.actor.chassis_command_contract)
 
     def __call__(self, history):
         native = self._history()

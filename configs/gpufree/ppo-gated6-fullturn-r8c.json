@@ -3,6 +3,7 @@
   "checkpoint_interval": 100,
   "steps_per_update": 24,
   "mean_squash": "tanh",
+  "chassis_command_contract": "gimbal_target_heading_v1",
   "action_bounds": [
     12.566370614359172,
     12.566370614359172,

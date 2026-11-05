@@ -16,6 +16,7 @@ import time
 import torch
 
 from ..contracts import StateSchema
+from ..chassis_observation import COMMAND_CONTRACTS, HEADING_COMMANDS, LEGACY_COMMANDS
 from ..formal_observation import known_horizon
 from ..runtime import atomic_save
 from .collection import Collector
@@ -76,6 +77,7 @@ class OnlineConfig:
     model_hidden: tuple[int, ...] = (2048, 2048, 2048)
     actor_hidden: tuple[int, ...] = (512, 256, 128)
     actor_frame_dim: int = 45
+    chassis_command_contract: str = LEGACY_COMMANDS
     estimator_hidden: tuple[int, ...] = (128, 64)
     critic_hidden: tuple[int, ...] = (256, 128)
     learning: LearningConfig = field(default_factory=LearningConfig)
@@ -117,6 +119,9 @@ class OnlineConfig:
             raise ValueError('Replay device must be learner or cpu')
         if type(self.actor_frame_dim) is not int or self.actor_frame_dim not in (35, 45):
             raise ValueError('Actor frame dimension must be 35 or 45')
+        if (self.chassis_command_contract not in COMMAND_CONTRACTS
+                or self.actor_frame_dim != 35 and self.chassis_command_contract != LEGACY_COMMANDS):
+            raise ValueError('Projected chassis commands require the 35D actor')
         for name in ('cycles', 'collection_steps', 'replay_steps', 'model_updates', 'model_batch_size',
                      'fit_horizon', 'actor_updates', 'imagination_batch_size', 'imagination_microbatch_size',
                      'checkpoint_interval', 'replay_checkpoint_interval', 'validation_horizon', 'validation_batch_size'):
@@ -242,7 +247,7 @@ class OnlineTrainer:
             estimator_hidden=config.estimator_hidden, critic_hidden=config.critic_hidden, record_tasks=config.record_tasks,
             terrain=terrain, stair_task=stair_task, stair_source=stair_source, jump_task=jump_task,
             recovery_task=recovery_task,
-            actor_frame_dim=config.actor_frame_dim)
+            actor_frame_dim=config.actor_frame_dim, chassis_command_contract=config.chassis_command_contract)
         self.teacher_source = teacher_source
         self.actor_initialization = None
         self.course_progression = None
@@ -317,6 +322,10 @@ class OnlineTrainer:
             initial_fraction=config.teacher_fraction, hold_updates=config.teacher_hold_updates,
             fade_updates=config.teacher_fade_updates)
         self.resume_migrations = list(saved.get('resume_migrations', [])) if saved is not None else []
+        if getattr(self, 'chassis_commands_activated', False):
+            self.resume_migrations.append({'chassis_command_contract': config.chassis_command_contract,
+                'learner_replay_rng_preserved': True, 'additional_warmup_cycles': 0,
+                'scope': 'project raw formal45 commands on read; dynamics, rewards and replay are unchanged'})
         if getattr(self, 'course_progression_activated', False):
             self.resume_migrations.append({'course_progression_activated': asdict(config.course_progression),
                 'learner_replay_rng_preserved': True, 'additional_warmup_cycles': 0,
@@ -401,6 +410,10 @@ class OnlineTrainer:
                 or saved['schema_fingerprint'] != self.env.schema.fingerprint):
             raise ValueError('Online checkpoint contract differs')
         configuration, requested = asdict(OnlineConfig.from_dict(saved['config'])), asdict(self.config)
+        before, after = configuration.pop('chassis_command_contract'), requested.pop('chassis_command_contract')
+        self.chassis_commands_activated = before != after
+        if self.chassis_commands_activated and (before, after) != (LEGACY_COMMANDS, HEADING_COMMANDS):
+            raise ValueError('Resume only activates the versioned chassis command projection')
         old_progression, new_progression = configuration.pop('course_progression'), requested.pop('course_progression')
         self.course_progression_activated = old_progression != new_progression
         if self.course_progression_activated:

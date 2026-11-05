@@ -61,6 +61,7 @@
   "course_coordinate": 196608000,
   "policy_start_cycle": 20,
   "actor_frame_dim": 35,
+  "chassis_command_contract": "gimbal_target_heading_v1",
   "initial_actor": "/root/gpufree-data/supermimic_rl_claude_c09/outputs/eval/r5-008974.pt",
   "initial_actor_sha256": "5d2f9f56427a98d2fec751d717df5a3db8348323e61aca94530b2e6e1bcc327b",
   "critic_warmup": true,

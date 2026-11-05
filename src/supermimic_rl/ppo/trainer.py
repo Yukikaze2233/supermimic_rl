@@ -28,6 +28,7 @@ from torch import nn
 from torch.nn import functional as F
 
 from ..contracts import ACTION_BOUNDS
+from ..chassis_observation import COMMAND_CONTRACTS, HEADING_COMMANDS, LEGACY_COMMANDS
 from .course_gate import GATE_MODES, CourseGates, GateTimeout, StageGate
 from .policy import MEAN_SQUASHES, Critic, TeacherActor
 from .rollout import Rollout, gae
@@ -62,6 +63,7 @@ class PPOConfig:
     curriculum_transition_offset: int = 0
     curriculum_transition_cap: int | None = None
     mean_squash: str = "tanh"
+    chassis_command_contract: str = LEGACY_COMMANDS
     # Fresh runs may start from an actor-initialization artifact; its SHA256 is required.
     initial_actor: str | None = None
     initial_actor_sha256: str | None = None
@@ -104,6 +106,8 @@ class PPOConfig:
             raise ValueError("curriculum_transition_cap must be a nonnegative integer or null")
         if self.mean_squash not in MEAN_SQUASHES:
             raise ValueError(f"mean_squash must be one of {MEAN_SQUASHES}")
+        if self.chassis_command_contract not in COMMAND_CONTRACTS:
+            raise ValueError("Unknown chassis command contract")
         if (self.initial_actor is None) != (self.initial_actor_sha256 is None):
             raise ValueError("initial_actor and initial_actor_sha256 must be given together")
         if type(self.actor_freeze_updates) is not int or self.actor_freeze_updates < 0:
@@ -274,6 +278,8 @@ class PPOTrainer:
     def __init__(self, environment, config: PPOConfig, output: Path, *, resume: Path | None = None):
         self.environment, self.config, self.output = environment, config, Path(output)
         self.device = environment.device
+        if hasattr(environment, "set_chassis_command_contract"):
+            environment.set_chassis_command_contract(config.chassis_command_contract)
         torch.manual_seed(config.seed)
         self.observation = environment.reset()
         critic_dim = self.observation.critic.shape[-1]
@@ -282,8 +288,10 @@ class PPOTrainer:
                                                             torch.tensor(config.action_bounds)):
             raise ValueError(f"PPO action_bounds {config.action_bounds} differ from the native {native_bounds}")
         self.actor = TeacherActor(config.actor_hidden, config.estimator_hidden, config.initial_std,
-                                  mean_squash=config.mean_squash, action_bounds=config.action_bounds).to(self.device)
+                                  mean_squash=config.mean_squash, action_bounds=config.action_bounds,
+                                  chassis_command_contract=config.chassis_command_contract).to(self.device)
         self.initialization = None
+        self.resume_migrations = []
         if config.initial_actor is not None and resume is None:
             self.initialization = self._load_initial_actor(Path(config.initial_actor), config.initial_actor_sha256)
         self.imitation_teacher = None
@@ -651,6 +659,7 @@ class PPOTrainer:
         payload = {"format": CHECKPOINT_FORMAT, "config": asdict(self.config), "actor": self.actor.state_dict(),
                    "critic": self.critic.state_dict(), "updates": self.updates, "transitions": self.transitions,
                    "initialization": self.initialization,
+                   "resume_migrations": self.resume_migrations,
                    "course_gates": None if self.course is None else self.course.state_dict(),
                    "stage_action_std_applied": list(self.stage_action_std_applied)}
         if not light:
@@ -674,6 +683,14 @@ class PPOTrainer:
         if payload.get("format") != CHECKPOINT_FORMAT or "optimizer" not in payload:
             raise ValueError("Resume requires a full PPO teacher checkpoint")
         saved = PPOConfig.from_dict(payload["config"])
+        before, after = saved.chassis_command_contract, self.config.chassis_command_contract
+        if before != after and (before, after) != (LEGACY_COMMANDS, HEADING_COMMANDS):
+            raise ValueError("Resume only activates the versioned chassis command projection")
+        self.resume_migrations = list(payload.get("resume_migrations", []))
+        if before != after:
+            self.resume_migrations.append({"chassis_command_contract": after,
+                "resumed_update": payload["updates"], "learner_rng_preserved": True,
+                "scope": "input command projection; no network, reward or optimizer reset"})
         for name in ("steps_per_update", "actor_hidden", "estimator_hidden", "critic_hidden", "mean_squash",
                      "action_bounds"):
             if getattr(saved, name) != getattr(self.config, name):
@@ -716,7 +733,8 @@ def load_actor(path: Path, device="cpu") -> TeacherActor:
         raise ValueError("Not a PPO teacher checkpoint or actor-initialization artifact")
     config = PPOConfig.from_dict(payload["config"])
     actor = TeacherActor(config.actor_hidden, config.estimator_hidden, config.initial_std,
-                         mean_squash=config.mean_squash, action_bounds=config.action_bounds).to(device)
+                         mean_squash=config.mean_squash, action_bounds=config.action_bounds,
+                         chassis_command_contract=config.chassis_command_contract).to(device)
     actor.load_state_dict(payload["actor"])
     return actor.eval()
 
@@ -726,6 +744,7 @@ def artifact_actor(payload: dict) -> TeacherActor:
     # Artifacts written before configurable bounds used the legacy contract.
     bounds = tuple(payload.get("action_bounds", ACTION_BOUNDS))
     actor = TeacherActor(tuple(payload["actor_hidden"]), tuple(payload["estimator_hidden"]),
-                         mean_squash=payload["mean_squash"], action_bounds=bounds)
+                         mean_squash=payload["mean_squash"], action_bounds=bounds,
+                         chassis_command_contract=payload.get("chassis_command_contract", LEGACY_COMMANDS))
     actor.load_state_dict(payload["actor"])
     return actor

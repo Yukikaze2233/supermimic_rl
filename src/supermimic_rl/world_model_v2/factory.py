@@ -2,6 +2,7 @@
 import json
 
 from ..contracts import action_bounds_from_source
+from ..chassis_observation import LEGACY_COMMANDS
 from .execution import WheelExecution
 from .features import MotionInputs
 from .geometry import RewardGeometry
@@ -17,7 +18,8 @@ from .motion_task import MOTION_TASK_DIM
 def make_learner(schema, runtime, config, *, linkage_path, asset_directory, identified_bundle, device,
                  model_hidden=(2048, 2048, 2048), actor_hidden=(512, 256, 128),
                  estimator_hidden=(128, 64), critic_hidden=(256, 128), record_tasks=False,
-                 terrain=None, stair_task=None, stair_source=None, jump_task=None, recovery_task=None, actor_frame_dim=45):
+                 terrain=None, stair_task=None, stair_source=None, jump_task=None, recovery_task=None, actor_frame_dim=45,
+                 chassis_command_contract=LEGACY_COMMANDS):
     # Native task dependencies become available after the pinned course factory
     # has installed its upstream path; importing the package alone needs no Isaac.
     from .imagined_reward import OrdinaryFlatReward, TerrainLocomotionReward
@@ -28,7 +30,8 @@ def make_learner(schema, runtime, config, *, linkage_path, asset_directory, iden
     model = WorldModelV2(MotionInputs(linkage), WheelExecution.from_bundle(identified_bundle, dt),
                          hidden=tuple(model_hidden), physics_dt_s=dt, terrain=terrain).to(device)
     actor = EstimatorActor(estimator_hidden=tuple(estimator_hidden), actor_hidden=tuple(actor_hidden),
-                           frame_dim=actor_frame_dim, action_bounds=action_bounds_from_source(source)).to(device)
+                           frame_dim=actor_frame_dim, action_bounds=action_bounds_from_source(source),
+                           chassis_command_contract=chassis_command_contract).to(device)
     task_dim = MOTION_TASK_DIM if record_tasks else 0
     routes = {'terrain': terrain is not None, 'stairs': stair_source is not None, 'jumps': jump_task is not None,
               'recovery': recovery_task is not None,

@@ -14,7 +14,8 @@ from dataclasses import dataclass
 import torch
 from torch import Tensor
 
-from .policy import FRAME_DIM, HISTORY_LENGTH
+from .policy import HISTORY_LENGTH
+from ..chassis_observation import COMMAND_CONTRACTS, LEGACY_COMMANDS, chassis_frame
 
 NATIVE_FRAME_DIM = 42
 WHEEL_CONTACT_N = 2.
@@ -49,6 +50,12 @@ class CourseEnvironment:
         self._health = getattr(adapter, "_health")
         self._label = torch.zeros(self.num_envs, 5, device=self.device)
         self._label_valid = torch.zeros(self.num_envs, dtype=torch.bool, device=self.device)
+        self.chassis_command_contract = LEGACY_COMMANDS
+
+    def set_chassis_command_contract(self, contract: str) -> None:
+        if contract not in COMMAND_CONTRACTS:
+            raise ValueError("Unknown chassis command contract")
+        self.chassis_command_contract = contract
 
     @property
     def action_bounds(self) -> tuple[float, ...]:
@@ -57,7 +64,7 @@ class CourseEnvironment:
 
     def _observation(self) -> Observation:
         frames = self.env.obs_buf["policy"].reshape(self.num_envs, HISTORY_LENGTH, NATIVE_FRAME_DIM)
-        return Observation(frames[..., :FRAME_DIM].clone(), self.env.obs_buf["critic"].clone(),
+        return Observation(chassis_frame(frames, self.chassis_command_contract).clone(), self.env.obs_buf["critic"].clone(),
                            self._label.clone(), self._label_valid.clone())
 
     def reset(self) -> Observation:

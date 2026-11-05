@@ -1,7 +1,7 @@
 """Deployable history MLP with a supervised velocity/contact estimator.
 
-The legacy actor consumes formal45; the chassis-only actor consumes its first
-35 channels. Replay and the world model retain all recorded gimbal channels.
+The legacy actor consumes formal45; the chassis actor consumes 35 channels with
+versioned command preprocessing. Replay retains all recorded gimbal channels.
 During BPTT estimator weights are constants, while the derivative with respect
 to imagined chassis observations stays in the graph.
 """
@@ -14,6 +14,9 @@ import torch
 from torch import Tensor, nn
 
 from ..contracts import ACTION_BOUNDS
+from ..chassis_observation import (
+    COMMAND_CONTRACTS, LEGACY_COMMANDS, annotate_onnx_commands, chassis_frame,
+)
 
 FRAME_DIM = 45
 CHASSIS_FRAME_DIM = 35
@@ -32,11 +35,16 @@ def elu_mlp(inputs: int, hidden: tuple[int, ...], outputs: int) -> nn.Sequential
 class EstimatorActor(nn.Module):
     def __init__(self, history_length: int = 5, estimator_hidden: tuple[int, ...] = (128, 64),
                  actor_hidden: tuple[int, ...] = (512, 256, 128), *, frame_dim: int = FRAME_DIM,
-                 action_bounds: tuple[float, ...] = ACTION_BOUNDS):
+                 action_bounds: tuple[float, ...] = ACTION_BOUNDS,
+                 chassis_command_contract: str = LEGACY_COMMANDS):
         super().__init__()
         if type(frame_dim) is not int or frame_dim not in (CHASSIS_FRAME_DIM, FRAME_DIM):
             raise ValueError('Actor frame dimension must be 35 (chassis) or 45 (legacy gimbal)')
         self.history_length, self.frame_dim = history_length, frame_dim
+        if (chassis_command_contract not in COMMAND_CONTRACTS
+                or frame_dim != CHASSIS_FRAME_DIM and chassis_command_contract != LEGACY_COMMANDS):
+            raise ValueError("Projected chassis commands require the 35D actor")
+        self.chassis_command_contract = chassis_command_contract
         flat = history_length * frame_dim
         self.estimator = elu_mlp(flat, estimator_hidden, ESTIMATE_DIM)
         self.decoder = elu_mlp(flat + ESTIMATE_DIM, actor_hidden, 6)
@@ -49,7 +57,9 @@ class EstimatorActor(nn.Module):
                 or history.shape[-1] not in (self.frame_dim, FRAME_DIM)):
             raise ValueError(f'Actor requires chronological [batch, {self.history_length}, '
                              f'{self.frame_dim}] frames, or recorded formal45')
-        return history[..., :self.frame_dim].flatten(-2)
+        frames = (chassis_frame(history, self.chassis_command_contract)
+                  if self.frame_dim == CHASSIS_FRAME_DIM else history)
+        return frames.flatten(-2)
 
     def estimate(self, history: Tensor) -> Tensor:
         return self.estimator(self._flat(history))
@@ -81,4 +91,6 @@ def export_onnx(actor: EstimatorActor, path: Path) -> Path:
     example = torch.zeros(1, actor.history_length, actor.frame_dim)
     torch.onnx.export(deployment, example, str(path), input_names=["history"], output_names=["action"],
                       opset_version=17, dynamo=False)
+    if actor.frame_dim == CHASSIS_FRAME_DIM:
+        annotate_onnx_commands(path, actor.chassis_command_contract)
     return path
