@@ -12,6 +12,7 @@ import torch
 from supermimic_rl.course import factory as course_factory
 from supermimic_rl.adapters.packed import PackedEnvironment
 from supermimic_rl.world_model_v2 import teacher
+from supermimic_rl.world_model_v2.replay import CompactReplay
 
 
 @pytest.mark.parametrize('failure', [None, 'teacher', 'collect'])
@@ -85,12 +86,20 @@ def test_entry_sets_course_then_resets_then_loads_teacher_and_persists_errors_be
             assert configuration['course_coordinate'] == 52428800
             for name in ('terrain', 'tasks', 'stairs', 'stair_source', 'jumps', 'recovery'):
                 assert configuration['record_' + name] == record_recovery
-            self.replay = SimpleNamespace(state_dict=lambda: {'fixture': True})
+            self.environment = env
+            self.record_stair_source = self.record_jumps = self.record_recovery = record_recovery
+            self.replay = CompactReplay({'frame': (35,)}, 2, 1, 'cpu')
 
         def collect(self, steps, **callbacks):
             events.append('collect')
             if failure == 'collect':
                 raise RuntimeError('collection entry collect')
+            boundary = {name: torch.ones(2, dtype=torch.bool) for name in
+                        ('valid', 'policy_owned', 'end_policy_owned')}
+            boundary.update({name: torch.zeros(2, dtype=torch.bool) for name in ('terminated', 'truncated')})
+            boundary.update({name: torch.zeros(2, dtype=torch.int64) for name in
+                             ('start_episode_id', 'end_episode_id', 'start_control_epoch', 'end_control_epoch')})
+            self.replay.add({'frame': torch.zeros(2, 35)}, boundary)
             if record_recovery:
                 callbacks['on_source_rng'](0, torch.Generator().get_state())
             return {'transitions': 2}

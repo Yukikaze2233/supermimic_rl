@@ -73,6 +73,8 @@ def main():
     parser.add_argument("--factory-config", type=Path, required=True)
     parser.add_argument("--checkpoint", type=Path, required=True)
     parser.add_argument("--steps", type=int, default=1000)
+    parser.add_argument("--record-dataset", action="store_true",
+                        help="Save this evaluation's complete compact V2 replay for world-model training")
     parser.add_argument("--action-sampling", choices=("deterministic", "ppo-gaussian"), default="deterministic")
     parser.add_argument("--sampling-seed", type=int, default=0,
                         help="Independent action RNG seed for --action-sampling ppo-gaussian")
@@ -116,7 +118,10 @@ def main():
             policy = NativeHistoryActor(actor, environment, action_sampling=args.action_sampling,
                                         sampling_seed=args.sampling_seed)
             with torch.no_grad():
-                report = evaluate_native(environment, policy, args.steps, on_progress=progress)
+                report = evaluate_native(environment, policy, args.steps, on_progress=progress,
+                    record_dataset=output / "replay.pt" if args.record_dataset else None,
+                    recording_source={"kind": "own_ppo_native_evaluation", "checkpoint": str(args.checkpoint.resolve()),
+                        "checkpoint_sha256": digest, "action_sampling": policy.sampling_report()})
             if file_sha256(args.checkpoint) != digest:
                 raise ValueError("Checkpoint changed during evaluation")
             report.update(checkpoint=str(args.checkpoint.resolve()), checkpoint_sha256=digest,
