@@ -418,7 +418,7 @@ class JumpTask:
         """
         from transformer_rl.formal.lab_env.course_tasks import LabCourseTasks
         from transformer_rl.formal.tasks.reward import RewardPhase
-        from ..reward_kernel import advance_flight_latch
+        from ..reward_kernel import advance_flight_latch, jump_tracking_targets
 
         n = len(state.ids)
         if physical.position.shape != (n, 4, 3) or wheel_support_load.shape != (n, 4, 2):
@@ -454,9 +454,10 @@ class JumpTask:
             phase = torch.stack(phases, -1)
             success = (owner.success_id >= 0) & (owner.success_id > state.ids[:, 6])
         curve = self.reference(state)
-        landing = (phase == int(RewardPhase.LANDING)) | (phase == int(RewardPhase.SETTLING))
-        height = torch.where(landing, ground_z + command_height[:, None], curve.height_world_z_m[:, None])
-        velocity = torch.where(landing, 0., curve.velocity_world_z_m_s[:, None])
+        height, velocity = jump_tracking_targets(
+            phase, curve.height_world_z_m[:, None], curve.velocity_world_z_m_s[:, None],
+            ground_z + command_height[:, None],
+            first_flight_closed=torch.stack(closed_ticks, -1) if closed_ticks else None)
         return JumpInterval(following, phase, height, velocity, owner.success_id.clone(), success,
                             curve.clock_stage[:, None].expand(-1, 4), torch.stack(ascents, -1),
                             torch.stack(closed_ticks, -1) if closed_ticks else None, torch.stack(stable_ticks, -1),

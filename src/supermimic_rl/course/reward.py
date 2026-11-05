@@ -10,7 +10,8 @@ from types import MethodType
 import torch
 from transformer_rl.formal.tasks.reward import PhysicalRewardComposer, RewardPhysics, RewardReference
 from ..reward_kernel import (NATIVE_SOURCE_SHA256, JumpProgress, RewardExtensions, RewardHistory,
-                             RewardParameters, advance_flight_latch, physical_reward_densities)
+                             RewardParameters, advance_flight_latch, jump_tracking_targets,
+                             physical_reward_densities)
 
 
 class SharedRewardComposer(PhysicalRewardComposer):
@@ -34,7 +35,8 @@ class SharedRewardComposer(PhysicalRewardComposer):
             # at every substep (after the task owner observed this substep).
             tasks = self.supermimic_jump_tasks
             if window['steps'] == 0:
-                window['jump_reference_stage'] = tasks.jump_reference().clock_stage
+                curve = window.get('jump_tracking_curve')
+                window['jump_reference_stage'] = (tasks.jump_reference() if curve is None else curve).clock_stage
             latch = tasks.supermimic_flight_latch
             progress = JumpProgress(window['jump_reference_stage'], tasks.ascent_seen.clone(), latch.closed.clone(),
                                     tasks.landed_s.clone(), latch.lifted.clone())
@@ -117,6 +119,37 @@ def install_flight_latch(tasks) -> FirstFlightLatch:
     tasks.observe_physics = observe_and_latch
     tasks.supermimic_flight_latch = latch
     return latch
+
+
+def install_jump_tracking_reference(native) -> None:
+    """Correct the reference before native reward sampling and trace observers.
+
+    Physics, the request protocol and its original contact phase stay with the
+    native task. Only the reward's decision to switch to standing targets uses
+    the existing first-real-flight evidence, shared with imagination.
+    """
+    from transformer_rl.formal.control.observation import CommandMode
+
+    tasks, reward = native._terrain_course.tasks, native._formal_reward
+    observe = reward.observe
+
+    def observe_with_tracking_reference(sample, state, **kwargs):
+        # The visible clock is constant for the four physical ticks. Share its
+        # curve with the composer instead of adding four reference evaluations.
+        window = reward.composer._window
+        if 'jump_tracking_curve' not in window:
+            window['jump_tracking_curve'] = tasks.jump_reference()
+        curve = window['jump_tracking_curve']
+        height, velocity = jump_tracking_targets(
+            kwargs['phase'], curve.height_world_z_m, curve.velocity_world_z_m_s,
+            kwargs['jump_height_world_z_m'],
+            first_flight_closed=tasks.supermimic_flight_latch.closed)
+        jump = kwargs['mode'] == int(CommandMode.JUMP)
+        kwargs['jump_height_world_z_m'] = torch.where(jump, height, kwargs['jump_height_world_z_m'])
+        kwargs['jump_velocity_world_z_m_s'] = torch.where(jump, velocity, kwargs['jump_velocity_world_z_m_s'])
+        return observe(sample, state, **kwargs)
+
+    reward.observe = observe_with_tracking_reference
 
 
 def install_shared_reward(composer, *, verify_native=False, extensions: RewardExtensions = RewardExtensions(),

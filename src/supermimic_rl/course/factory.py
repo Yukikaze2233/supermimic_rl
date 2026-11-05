@@ -112,7 +112,7 @@ def create_course(configuration):
         from .action_contract import install_action_bounds
 
         action_contract = install_action_bounds(native, runtime["task"]["action_bounds"])
-        from .reward import install_shared_reward
+        from .reward import install_jump_tracking_reference, install_shared_reward
 
         from ..reward_kernel import RewardExtensions
 
@@ -133,6 +133,9 @@ def create_course(configuration):
             from .jump_takeoff import install_jump_takeoff
 
             jump_takeoff_receipt = install_jump_takeoff(native, configuration["jump_takeoff"])
+        if native._formal_reward.composer.supermimic_reward_extensions.needs_jump_progress:
+            install_jump_tracking_reference(native)
+            reward_kernel_receipt['jump_tracking_reference'] = 'first_real_flight_landing_v1'
         if configuration.get("tof_stair_label", False):
             from .stair_label import install_tof_stair_label
 

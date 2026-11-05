@@ -48,6 +48,14 @@ base COM 的世界 z 速度；`com_velocity()` 根据已有 COM 偏移计算
 落地参考中的当前地面与命令高度也保留连续梯度。物理成功必须满足原生腾空、上升、峰高、
 支持起点与稳定落地条件，不能由请求时钟或预测的奖励网络制造。
 
+开启共享跳跃扩展时，高度／速度参考只有在首次真实腾空后接地才切到落地目标。
+压缩时两轮短暂卸载并重新接触仍可能使原生接触 phase 变成 `LANDING`，但不能因此
+把尚未执行的蹬伸目标清零。原生采样入口和 `JumpTask.observe_interval()` 共用
+`jump_tracking_targets()`，使用已有 first-flight latch；请求协议、接触 phase、
+Actor 输入、力矩限制和成功判据不变。未开启 latch 的原生对齐测试保留旧行为。
+采集来源中的 `reward_kernel.jump_tracking_reference=first_real_flight_landing_v1`
+标识这一奖励变化，旧来源的 checkpoint/replay 不得直接冒充新来源恢复。
+
 ## 可选 Critic 特征
 
 `state.critic_features(physical, motion, config)` 返回 `JUMP_FEATURE_DIM=32`：

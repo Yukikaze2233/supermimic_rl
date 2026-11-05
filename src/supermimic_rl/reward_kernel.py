@@ -155,6 +155,21 @@ def advance_flight_latch(request: Tensor, lifted: Tensor, closed: Tensor, *, cur
     return current.clone(), lifted, closed
 
 
+def jump_tracking_targets(phase: Tensor, curve_height: Tensor, curve_velocity: Tensor,
+                          landing_height: Tensor, *, first_flight_closed: Tensor | None = None):
+    """Use landing targets only after a real flight has touched down.
+
+    The native contact phase also calls a brief compression unload followed by
+    recontact LANDING. That event must not erase the remaining upward target.
+    Producers without the optional real-flight latch retain native semantics.
+    """
+    landing = (phase == int(RewardPhase.LANDING)) | (phase == int(RewardPhase.SETTLING))
+    if first_flight_closed is not None:
+        landing = landing & first_flight_closed
+    return (torch.where(landing, landing_height, curve_height),
+            torch.where(landing, 0., curve_velocity))
+
+
 @dataclass(frozen=True)
 class RewardParameters:
     tuning: RewardTuning

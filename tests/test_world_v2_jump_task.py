@@ -414,3 +414,58 @@ def test_first_flight_latch_matches_the_native_owner_through_bounces_and_new_req
     assert closed_seen.tolist() == [True, False]
     legacy = {key: value for key, value in state.record().items() if key != 'jump_flight_latch'}
     assert JumpTaskState.decode(legacy).flight_latch is None
+
+
+def test_compression_unload_preserves_push_reference_in_native_and_imagination():
+    from supermimic_rl.course.reward import install_flight_latch, install_jump_tracking_reference
+    from transformer_rl.formal.tasks.jump import JumpReferenceProgram
+
+    n, native = 4, native_jumps(4)
+    owner = native._terrain_course.tasks
+    owner.family[3] = int(TaskFamily.HEIGHT)
+    owner.reference = JumpReferenceProgram(replace(owner.reference.config,
+        compression_depth_max_m=.10, compression_duration_s=.30, nominal_extension_duration_s=.20))
+    latch = install_flight_latch(owner)
+    task = JumpTask(JumpTaskConfig.capture(native))
+    advance(native, task, JumpTaskState.capture(native), estimate_at(native.time, n))
+    owner.request_clock[:3] = .40
+    state = JumpTaskState.capture(native)
+    physical = physical_ticks(n, z=.22)
+    force = torch.full((n, 4, 2), 20.)
+    # Row 0 unloads while crouched; row 1 genuinely flies and lands; row 2
+    # stays supported; row 3 is ordinary locomotion. Recontact is tick 3.
+    force[:2, :2] = 0.
+    physical.position[1, :2, 2] = .38
+    physical.velocity[1, :2, 2] = .4
+    physical.position[1, 2:, 2] = .32
+    captured = []
+    native._formal_reward = SimpleNamespace(
+        composer=SimpleNamespace(_window={}),
+        observe=lambda sample, observed_state, **kwargs: captured.append(kwargs))
+    install_jump_tracking_reference(native)
+    mode = torch.tensor([int(CommandMode.JUMP)] * 3 + [int(CommandMode.NORMAL)])
+    for tick in range(4):
+        owner.observe_physics(force[:, tick], physical.velocity[:, tick, 2], torch.zeros(n),
+            physical.position[:, tick, 2], angular_speed_rad_s=torch.zeros(n), dt=.005)
+        curve = owner.jump_reference()
+        landing = owner.phase == int(RewardPhase.LANDING)
+        raw_height = torch.where(landing, owner.stream.current[:, 3], curve.height_world_z_m)
+        raw_speed = torch.where(landing, 0., curve.velocity_world_z_m_s)
+        raw_height[3], raw_speed[3] = 4.5, 9.  # Ordinary unused fields stay byte-for-byte unchanged.
+        native._formal_reward.observe(None, None, phase=owner.phase.clone(), mode=mode,
+            jump_height_world_z_m=raw_height, jump_velocity_world_z_m_s=raw_speed)
+    result = task.observe_interval(state, physical=physical, wheel_support_load=force,
+        base_com_offset=torch.zeros(n, 3), base_mode=owner.base_mode,
+        command_height=owner.stream.current[:, 3], ground_z=torch.zeros(n, 4))
+    same_state(result.state, native)
+    assert owner.phase[:2].tolist() == [int(RewardPhase.LANDING)] * 2
+    assert latch.closed.tolist() == [False, True, False, False]
+    native_height = torch.stack([row['jump_height_world_z_m'] for row in captured], -1)
+    native_speed = torch.stack([row['jump_velocity_world_z_m_s'] for row in captured], -1)
+    torch.testing.assert_close(result.height_world_z_m[:3], native_height[:3], rtol=0, atol=0)
+    torch.testing.assert_close(result.velocity_world_z_m_s[:3], native_speed[:3], rtol=0, atol=0)
+    assert native_speed[0].min() > .1  # False landing cannot turn off the push target.
+    torch.testing.assert_close(native_speed[0], native_speed[2], rtol=0, atol=0)
+    torch.testing.assert_close(native_speed[1, 2:], torch.zeros(2), rtol=0, atol=0)
+    torch.testing.assert_close(native_height[1, 2:], torch.full((2,), .32), rtol=0, atol=0)
+    assert native_height[3].eq(4.5).all() and native_speed[3].eq(9.).all()
