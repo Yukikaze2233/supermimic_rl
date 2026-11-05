@@ -30,6 +30,8 @@ SUPERMIMIC_SCRIPT=scripts/<script>.py bash scripts/run_gpufree.sh <script argume
 
 ## PPO 教师
 
+当前连续训练使用 `course_gate_mode="report"`、`stop_after_gate=false`：记录课程表现，普通失败和未达标继续学习。跳跃高度阶梯仍按各高度档的实际表现控制难度。不要把下文可选的逐门槛停训编排用于这条连续训练线。
+
 ```bash
 # 训练（新运行或 --resume 完整 checkpoint）
 SUPERMIMIC_SCRIPT=scripts/train_ppo.py bash scripts/run_gpufree.sh train \
@@ -37,7 +39,7 @@ SUPERMIMIC_SCRIPT=scripts/train_ppo.py bash scripts/run_gpufree.sh train \
   --config configs/gpufree/ppo-gated4-fullturn-resume-r5.json \
   --resume <checkpoint.pt> --output <output>
 
-# 27 场景分技能评价（factory 需含 evaluation 段；评价永不安装跳跃助力）
+# 分技能评价（factory 含 evaluation 段、desynchronize_episodes=false；无跳跃助力）
 SUPERMIMIC_SCRIPT=scripts/evaluate_ppo_skills.py bash scripts/run_gpufree.sh \
   --factory-config configs/gpufree/ppo-gated3-fullturn-skills64.json \
   --checkpoint <checkpoint.pt> --steps 1000 --output <output>
@@ -71,9 +73,11 @@ python scripts/run_ppo_gated_course.py \
   --resume <full-checkpoint.pt> --output <new-course-output>
 ```
 
-正式编排要求 `stop_after_gate=true`：通过门槛立即保存不可变 checkpoint，退出该 Isaac 进程，完成 64×1000 无助力的 27 场景评价后才续训。已要求技能缺少物理成功时返回 `diagnostic_required`，进程失败时保留待评价 checkpoint；`--continue-run` 只恢复中断的编排，不跳过技能失败。固定评价没有 200/300 mm 跳跃案例，这两档仍看训练中的无助力计数。`budget_complete` 仅表示预算结束，完整能力仍须审阅各场景结果。
+上述可选的历史编排要求 `stop_after_gate=true`：通过门槛立即保存不可变 checkpoint，退出该 Isaac 进程，完成 64×1000 无助力的 27 场景评价后才续训。已要求技能缺少物理成功时返回 `diagnostic_required`，进程失败时保留待评价 checkpoint；`--continue-run` 只恢复中断的编排，不跳过技能失败。它不适用于当前 `report` 连续训练。固定评价没有 200/300 mm 跳跃案例，这两档仍看训练中的无助力计数。`budget_complete` 仅表示预算结束，完整能力仍须审阅各场景结果。
 
 ## SuperMimic（世界模型 V2）
+
+当前在线学生使用 `guard_mode="report"`，回报监控只供评审，不回滚策略或降低学习率；恢复后在原有策略预热结束的前提下立即恢复统计。`course_coordinate` 是固定课程采样位置：若保持该值，增加 cycles 不会自动获得后续台阶/地形数据，也不等于完成完整课程。
 
 ```bash
 # 1. 教师导出（含原生评价证据）
