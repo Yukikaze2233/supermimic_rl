@@ -18,12 +18,13 @@ from torch import Tensor
 from ..replay import BOUNDARY_FIELDS, eligible_windows
 from .stair_task import STAIR_RECORD_DTYPES
 from .stair_source import TOF_RECORD_DTYPES
-from .jump_task import JUMP_RECORD_DTYPES, JUMP_TRIGGER_RECORD_DTYPES
+from .jump_task import JUMP_FLIGHT_LATCH_RECORD_DTYPES, JUMP_RECORD_DTYPES, JUMP_TRIGGER_RECORD_DTYPES
 from .recovery_task import RECOVERY_RECORD_DTYPES
 from .physical import INCREMENT_DIM
 
 _NATIVE_RECORD_DTYPES = {**STAIR_RECORD_DTYPES, **TOF_RECORD_DTYPES, **JUMP_RECORD_DTYPES,
-                         **JUMP_TRIGGER_RECORD_DTYPES, **RECOVERY_RECORD_DTYPES}
+                         **JUMP_TRIGGER_RECORD_DTYPES, **JUMP_FLIGHT_LATCH_RECORD_DTYPES,
+                         **RECOVERY_RECORD_DTYPES}
 
 _BOOL_FIELDS = ("valid", "terminated", "truncated", "policy_owned", "end_policy_owned")
 _ID_FIELDS = ("start_episode_id", "end_episode_id", "start_control_epoch", "end_control_epoch")

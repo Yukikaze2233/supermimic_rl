@@ -8,6 +8,7 @@ from __future__ import annotations
 from dataclasses import replace
 from types import SimpleNamespace
 
+import torch
 from transformer_rl.formal.tasks.command_pool import CommandPool
 from transformer_rl.formal.tasks.curriculum import TaskFamily, interpolate_domain
 
@@ -19,12 +20,21 @@ JUMP_FIRST_STAGE_NAMES = tuple(STAGE_NAMES[index] for index in STAGE_ORDER)
 
 
 class JumpFirstCommandPool(CommandPool):
-    """Keep the requested jump yaw instead of overriding it with random heading."""
+    """Jump requests keep their forward speed but never a yaw rate or a random heading.
+
+    The native jump success needs 2 s of stable landing with a body angular
+    speed of at most 0.5 rad/s, which no turning command can meet: in R8 the
+    yaw part of the stable-landing test started failing when moving jumps
+    (with the segment's yaw rate) entered the course. The evaluated moving
+    jumps also command no yaw.
+    """
 
     def sample(self, family, *args, **kwargs):
         draw = super().sample(family, *args, **kwargs)
-        return replace(draw, heading_enabled=(
-            draw.heading_enabled & (family != int(TaskFamily.REQUEST))))
+        request = family == int(TaskFamily.REQUEST)
+        command = draw.command.clone()
+        command[:, 2] = torch.where(request, 0., command[:, 2])
+        return replace(draw, command=command, heading_enabled=draw.heading_enabled & ~request)
 
 
 def install_jump_first_command_pool(tasks, curriculum):
@@ -35,7 +45,7 @@ def install_jump_first_command_pool(tasks, curriculum):
         raise ValueError('Jump-first course requires the native command pool')
     tasks.command_pool = JumpFirstCommandPool(tasks.command_pool.config)
     return {'schedule': SCHEDULE, 'request_heading_override': False,
-            'native_handoff_preserved': True,
+            'native_handoff_preserved': True, 'request_yaw_rate': 0.,
             'early_jump_domain': list(curriculum.initial_domain.jump_m)}
 
 
@@ -74,6 +84,30 @@ class JumpFirstCurriculum(SuperMimicCurriculum):
             stage_weights=self.stage_weights, continuous=True)
         self.budget = self._budget(0)
 
+    # Keys of performance gates the trainer has opened (``stage@fraction``),
+    # or None when the jump height follows the coordinate. Not checkpointed
+    # here: the trainer restores its gates and re-applies them after resume.
+    opened_gates: frozenset[str] | None = None
+
+    def set_opened_gates(self, keys) -> None:
+        self.opened_gates = frozenset(keys)
+
+    def ladder_gate_keys(self) -> tuple[str, ...]:
+        """Performance gate keys (``stage@fraction``) of the jump height ladder, in order."""
+        return tuple(f'{self.config.jump_height_stage}@{fraction:g}'
+                     for fraction, _ in self.config.jump_height_gates)
+
+    def jump_height_level(self) -> int | None:
+        """Number of jump height gates opened in order, if performance drives the height."""
+        if self.opened_gates is None or not self.config.jump_height_gates:
+            return None
+        level = 0
+        for key in self.ladder_gate_keys():
+            if key not in self.opened_gates:
+                break
+            level += 1
+        return level
+
     def _budget(self, real_transitions):
         budget = _TransitionBudget(SimpleNamespace(
             stage_transition_budgets=self.stage_budgets,
@@ -103,10 +137,14 @@ class JumpFirstCurriculum(SuperMimicCurriculum):
             index = self.stage_names.index(self.config.jump_height_stage)
             start, budget = sum(self.stage_budgets[:index]), self.stage_budgets[index]
             upper = self.initial_domain.jump_m[1]
-            for fraction, cap in self.config.jump_height_gates:
+            level = self.jump_height_level()
+            for number, (fraction, cap) in enumerate(self.config.jump_height_gates):
                 # Match CourseGates' integer boundary exactly: its held
                 # coordinate is boundary - 1, even for a very large budget.
-                if self.real_transitions >= start + int(fraction * budget):
+                # With reported (non-holding) gates the opened ladder decides.
+                reached = (self.real_transitions >= start + int(fraction * budget) if level is None
+                           else number < level)
+                if reached:
                     upper = cap
             jump = replace(jump, jump_m=(self.initial_domain.jump_m[0], upper))
         return replace(command, height_m=height.height_m,

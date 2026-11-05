@@ -1,0 +1,238 @@
+{
+  "updates": 60000,
+  "checkpoint_interval": 100,
+  "steps_per_update": 24,
+  "mean_squash": "tanh",
+  "action_bounds": [
+    12.566370614359172,
+    12.566370614359172,
+    12.566370614359172,
+    12.566370614359172,
+    9.0,
+    9.0
+  ],
+  "initial_std": 0.2,
+  "estimator_learning_rate": 0.0001,
+  "seed": 7,
+  "course_gate_mode": "report",
+  "course_gate_resume": "restart_hold",
+  "stop_after_gate": false,
+  "course_rewind_stage": "active_jump",
+  "course_rewind_tag": "r8",
+  "stage_action_std": {
+    "active_jump": [
+      0.3,
+      0.3,
+      0.3,
+      0.3,
+      0.05,
+      0.05
+    ]
+  },
+  "course_gates": [
+    {
+      "stage": "active_jump",
+      "window": 20,
+      "timeout_updates": 1500,
+      "criteria": [
+        {
+          "metric": "terminations",
+          "max": 20
+        },
+        {
+          "metric": "rms/height_error_m",
+          "max": 0.03
+        },
+        {
+          "metric": "tracking_diagnostics.velocity_height_gate.mean",
+          "min": 0.9
+        },
+        {
+          "metric": "rms/tilt_rad",
+          "max": 0.06
+        },
+        {
+          "metric": "rms/forward_error_m_s",
+          "max": 0.4
+        },
+        {
+          "metric": "rms/yaw_rate_error_rad_s",
+          "max": 0.6
+        }
+      ]
+    },
+    {
+      "stage": "active_jump",
+      "at_fraction": 0.25,
+      "window": 50,
+      "timeout_updates": 1500,
+      "criteria": [
+        {
+          "metric": "terminations",
+          "max": 20
+        },
+        {
+          "numerator": [
+            "course/jump_assist/unassisted_success_rise_0.00-0.10"
+          ],
+          "denominator": [
+            "course/jump_assist/unassisted_ended_rise_0.00-0.10"
+          ],
+          "min": 0.4,
+          "min_count": 200
+        }
+      ]
+    },
+    {
+      "stage": "active_jump",
+      "at_fraction": 0.5,
+      "window": 50,
+      "timeout_updates": 1500,
+      "criteria": [
+        {
+          "metric": "terminations",
+          "max": 20
+        },
+        {
+          "numerator": [
+            "course/jump_assist/unassisted_success_rise_0.10-0.20"
+          ],
+          "denominator": [
+            "course/jump_assist/unassisted_ended_rise_0.10-0.20"
+          ],
+          "min": 0.3,
+          "min_count": 200
+        }
+      ]
+    },
+    {
+      "stage": "active_jump",
+      "at_fraction": 0.75,
+      "window": 50,
+      "timeout_updates": 1500,
+      "criteria": [
+        {
+          "metric": "terminations",
+          "max": 20
+        },
+        {
+          "numerator": [
+            "course/jump_assist/unassisted_success_rise_0.20-0.30"
+          ],
+          "denominator": [
+            "course/jump_assist/unassisted_ended_rise_0.20-0.30"
+          ],
+          "min": 0.2,
+          "min_count": 200
+        }
+      ]
+    },
+    {
+      "stage": "dynamic_commands",
+      "window": 50,
+      "timeout_updates": 3000,
+      "criteria": [
+        {
+          "metric": "terminations",
+          "max": 20
+        },
+        {
+          "numerator": [
+            "course/jump_assist/unassisted_success"
+          ],
+          "denominator": [
+            "course/jump_assist/unassisted_ended"
+          ],
+          "min": 0.4,
+          "min_count": 200
+        },
+        {
+          "numerator": [
+            "course/jump_assist/unassisted_success_rise_0.30-0.40"
+          ],
+          "denominator": [
+            "course/jump_assist/unassisted_ended_rise_0.30-0.40"
+          ],
+          "min": 0.1,
+          "min_count": 50
+        },
+        {
+          "metric": "rms/height_error_m",
+          "max": 0.035
+        }
+      ]
+    },
+    {
+      "stage": "terrain_foundation",
+      "window": 50,
+      "timeout_updates": 3000,
+      "criteria": [
+        {
+          "metric": "terminations",
+          "max": 20
+        },
+        {
+          "metric": "rms/forward_error_m_s",
+          "max": 0.45
+        },
+        {
+          "metric": "rms/yaw_rate_error_rad_s",
+          "max": 0.5
+        },
+        {
+          "metric": "tracking_diagnostics.velocity_height_gate.mean",
+          "min": 0.9
+        }
+      ]
+    },
+    {
+      "stage": "authored_steps",
+      "window": 50,
+      "timeout_updates": 4000,
+      "criteria": [
+        {
+          "metric": "terminations",
+          "max": 50
+        },
+        {
+          "metric": "course/terrain/level_fraction",
+          "min": 0.5
+        }
+      ]
+    },
+    {
+      "stage": "full_recovery",
+      "window": 100,
+      "timeout_updates": 4000,
+      "criteria": [
+        {
+          "numerator": [
+            "course/stair/authored_ended_complete"
+          ],
+          "denominator": [
+            "course/stair/authored_ended"
+          ],
+          "min": 0.3,
+          "min_count": 50
+        }
+      ]
+    },
+    {
+      "stage": "combined_dr",
+      "window": 100,
+      "timeout_updates": 4000,
+      "criteria": [
+        {
+          "numerator": [
+            "course/recovery/verified_physical_successes"
+          ],
+          "denominator": [
+            "course/recovery/births"
+          ],
+          "min": 0.5,
+          "min_count": 100
+        }
+      ]
+    }
+  ]
+}

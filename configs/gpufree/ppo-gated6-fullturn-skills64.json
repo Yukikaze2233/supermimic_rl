@@ -1,0 +1,31 @@
+{
+  "upstream_root": "/root/gpufree-data/supermimic_sources/transformer_rl-41e8280",
+  "expected_commit": "41e8280ea87f686b51be78dc3eb208f95bf0da71",
+  "runtime_json": "/root/gpufree-data/supermimic_rl_claude_c16/configs/gpufree/runtime-physx64-16-fullturn-knee40-107-tof.json",
+  "runtime_sha256": "754a6d91d8208be5ae272ab6cab778ef00c8ea7982f5d6d63f6925d13cd4e56d",
+  "course_json": "/root/gpufree-data/supermimic_rl_claude_c16/configs/gpufree/ppo-course-gated-v5.json",
+  "course_sha256": "3b53c28cbd4cd60584d3303dbf201328687ebb0cdc908409c15d5fec8b689369",
+  "asset_directory": "/root/gpufree-data/supermimic_rl/assets/full_vehicle_v2p0p1_source_audited_v2_knee40_107",
+  "asset_manifest_sha256": "08bf7e001db99f21ee1e91133bf32fd7567b1db8c75fc31c908608ae85dcc1f8",
+  "identified_bundle": "/root/gpufree-data/supermimic_rl/configs/identified/20261031",
+  "num_envs": 64,
+  "device": "cuda:0",
+  "seed": 7,
+  "record_substeps": false,
+  "substep_audit": false,
+  "reward_extensions": {
+    "jump_flight": 4.0,
+    "jump_lift": 2.0,
+    "jump_push": 2.0,
+    "success_event": 5.0,
+    "jump_missed": 1.0,
+    "jump_settle": 2.0,
+    "jump_landing_rate": 4.0
+  },
+  "evaluation": {
+    "evaluation_stage": "combined_dr",
+    "seed": 7
+  },
+  "jump_takeoff": {},
+  "tof_stair_label": true
+}

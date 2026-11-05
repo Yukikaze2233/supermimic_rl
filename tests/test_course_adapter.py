@@ -213,3 +213,33 @@ def test_course_snapshot_rejects_bounded_yaw_before_circular_memory_loss(periodi
     adapter.env._gimbal.controller.config.joint_limits_rad = ((-1., 1.), (-.6, .7))
     with pytest.raises(ValueError, match="unlimited yaw"):
         adapter._capture_snapshot(terminal=False)
+
+
+def test_cold_reset_can_stagger_first_time_limits_reproducibly(monkeypatch):
+    from supermimic_rl.adapters.isaac import IsaacAdapter
+    from supermimic_rl.course.adapter import CourseAdapter
+
+    monkeypatch.setattr(IsaacAdapter, "reset", lambda self: "snapshot")
+
+    def adapter(desynchronize):
+        result = object.__new__(CourseAdapter)
+        result.num_envs, result._desynchronize = 512, desynchronize
+        result._desync_generator = torch.Generator().manual_seed(7)
+        result.env = SimpleNamespace(max_episode_length=1500,
+                                     episode_length_buf=torch.zeros(512, dtype=torch.long))
+        return result
+
+    first, second, plain = adapter(True), adapter(True), adapter(False)
+    assert first.reset() == "snapshot" and plain.reset() == "snapshot"
+    offsets = first.env.episode_length_buf
+    assert offsets.min() >= 0 and offsets.max() < 1500 and offsets.unique().numel() > 300
+    second.reset()
+    assert torch.equal(offsets, second.env.episode_length_buf)
+    assert not plain.env.episode_length_buf.any()
+
+
+def test_staggered_episodes_do_not_change_the_world_model_schema_source():
+    from supermimic_rl.cli import _native_schema_source
+
+    base = {"upstream_commit": "x", "curriculum": {"a": 1}}
+    assert _native_schema_source({**base, "desynchronize_episodes": True}) == _native_schema_source(base)

@@ -95,11 +95,14 @@ def test_request_heading_wrapper_preserves_other_native_commands_rng_and_handoff
                  torch.ones(256), course.command_context())
     left, right = native.sample(*arguments, left_rng), modified.sample(*arguments, right_rng)
     for item in fields(left):
-        if item.name != 'heading_enabled':
+        if item.name not in ('heading_enabled', 'command'):
             assert torch.equal(getattr(left, item.name), getattr(right, item.name))
     request = family == int(TaskFamily.REQUEST)
     assert torch.equal(left.heading_enabled[~request], right.heading_enabled[~request])
     assert not right.heading_enabled[request].any()
+    assert torch.equal(left.command[~request], right.command[~request])
+    assert torch.equal(left.command[request][:, [0, 1, 3]], right.command[request][:, [0, 1, 3]])
+    assert right.command[request, 2].count_nonzero() == 0          # jumps never carry a yaw rate
     assert torch.equal(left_rng.get_state(), right_rng.get_state())
     for left_value, right_value in zip(native.handoff(32, left_rng, 'cpu'),
                                        modified.handoff(32, right_rng, 'cpu')):
@@ -243,6 +246,34 @@ def test_v5_height_caps_wait_for_unassisted_bin_gates_at_exact_integer_boundarie
         assert status['gate_passed'] and gates.coordinate == gates._position(gate)
         curriculum.set_progress(gates.coordinate, 0)
         assert curriculum._effective_domain().jump_m[1] == expected_after
+
+
+def test_reported_height_ladder_follows_opened_gates_while_the_assist_fades_with_the_stage():
+    from supermimic_rl.course.jump_assist import JumpAssist, JumpAssistConfig
+    from support import REPO_ROOT
+
+    root = REPO_ROOT / 'configs/gpufree'
+    curriculum = make_course_curriculum(4, 'cpu', 7, json.loads((root / 'ppo-course-gated-v5.json').read_text()))
+    assert curriculum.jump_height_level() is None
+    assist = object.__new__(JumpAssist)
+    assist.curriculum, assist.config = curriculum, JumpAssistConfig(probability=1., decay='force')
+    index = curriculum.stage_names.index('active_jump')
+    assist.stage_start, assist.stage_budget = sum(curriculum.stage_budgets[:index]), curriculum.stage_budgets[index]
+    # Far past every height fraction and the assist stage: with reported gates
+    # the cap follows the opened ladder, while the assist has faded with the stage.
+    curriculum.set_progress(sum(curriculum.stage_budgets[:6]), 0)
+    curriculum.set_opened_gates(['active_jump'])
+    assert curriculum.jump_height_level() == 0 and curriculum._effective_domain().jump_m == (.03, .10)
+    assert assist.level() == 0.
+    curriculum.set_opened_gates(['active_jump', 'active_jump@0.25', 'active_jump@0.75'])  # 0.5 still closed
+    assert curriculum.jump_height_level() == 1 and curriculum._effective_domain().jump_m[1] == .20
+    curriculum.set_opened_gates(['active_jump@0.25', 'active_jump@0.5', 'active_jump@0.75'])
+    assert curriculum._effective_domain().jump_m[1] == .40
+    assert curriculum.ladder_gate_keys() == ('active_jump@0.25', 'active_jump@0.5', 'active_jump@0.75')
+    assist.curriculum = make_course_curriculum(4, 'cpu', 7, json.loads((root / 'ppo-course-gated-v5.json').read_text()))
+    assist.curriculum.set_progress(assist.stage_start + assist.stage_budget // 4, 0)   # a quarter into the stage
+    assist.curriculum.set_opened_gates([])
+    assert assist.level() == pytest.approx(2 / 3)
 
 
 @pytest.mark.parametrize('height_gates', [[(.25, .20), (.20, .40)], [(.25, .05), (.50, .40)],

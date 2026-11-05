@@ -2,9 +2,14 @@
 
 A policy that has never left the ground never experiences flight, landing or
 the success event, so no reward reaches its takeoff. As in SCUT's jump_takeoff
-state machine, accepted jump requests receive an upward base force during the
-reference push window, until verified flight. The force closes the shortfall
-to the reference launch speed and is capped by weight. Two decays:
+state machine, accepted jump requests receive an upward base force while the
+reference rises: it closes the shortfall to the launch speed during the
+extension and to the reference ballistic speed afterwards, capped by weight,
+and ends at the reference apex or the request's first touchdown after real
+flight. Stopping at liftoff left 80% of assisted R8 jumps below the success
+window. As in SCUT, the assist fades with training progress through its
+stage, never with the policy's own success: a hidden, performance-held assist
+made R8 wait for it instead of pushing. Two decays:
 
 * ``probability``: a fading share of requests is fully assisted;
 * ``force`` (SCUT ``decay_mode: force``): the force scale fades, so the
@@ -31,9 +36,19 @@ EXTENSION, BALLISTIC = 1, 2
 # Outcomes of all requests and of unassisted requests per requested-rise bin [m].
 RISE_BIN_EDGES = (.10, .20, .30)
 RISE_BINS = tuple(f'{low:.2f}-{high:.2f}' for low, high in zip((.0, *RISE_BIN_EDGES), (*RISE_BIN_EDGES, .40)))
+# "liftoff": the ended request was airborne after real ascent (whether or not it then succeeded).
+# "peak_low/peak_ok/peak_high": its peak rise against the native success window
+# |peak - requested| <= min(3 cm, requested / 2), counted when it ended.
+OUTCOMES = ('ended', 'success', 'liftoff', 'peak_low', 'peak_ok', 'peak_high')
+# Grounded physical ticks after a real jump whose peak is inside the window,
+# and how many of them meet each native stable-landing condition; plus ended
+# requests by their longest uninterrupted stable streak (success needs 2 s).
+SETTLE = ('settle_ticks', 'settle_contact', 'settle_vertical_speed', 'settle_tilt', 'settle_angular_speed',
+          'settle_roll_pitch_rate', 'settle_yaw_rate', 'settle_height', 'settle_all',
+          'streak_0.5s', 'streak_1.0s', 'streak_1.5s')
 COUNTERS = ('assisted_requests', 'assisted_ended', 'assisted_success', 'unassisted_ended', 'unassisted_success',
             *(f'{who}{kind}_rise_{name}' for who in ('', 'unassisted_') for name in RISE_BINS
-              for kind in ('ended', 'success')))
+              for kind in OUTCOMES), *SETTLE)
 DECAYS = ('probability', 'force')
 
 
@@ -64,7 +79,7 @@ class JumpAssistConfig:
 class JumpAssist:
     """Selection, force and outcome accounting; counters stay on device until ``metrics``."""
 
-    def __init__(self, native, curriculum, config: JumpAssistConfig):
+    def __init__(self, native, curriculum, config: JumpAssistConfig, latch):
         if config.stage not in curriculum.stage_names:
             raise ValueError('Jump assist stage is not part of the native course: ' + config.stage)
         self.native, self.curriculum, self.config = native, curriculum, config
@@ -76,7 +91,12 @@ class JumpAssist:
         self.selected = torch.zeros(native.num_envs, dtype=torch.bool, device=device)
         # A request counts as assisted only if assist impulse was actually delivered to it.
         self.impulse = torch.zeros(native.num_envs, device=device)
+        # Real liftoff (airborne for the native 2 ticks after real ascent) comes
+        # from the per-tick first-flight latch the shared reward also reads.
+        # Native flight_seen (2 N wheel unloading) is reachable by retracting the legs.
+        self.latch = latch
         self.rise = torch.zeros(native.num_envs, device=device)   # requested rise latched at acceptance
+        self.streak = torch.zeros(native.num_envs, device=device)   # longest native landed_s of the request
         self.edges = torch.tensor(RISE_BIN_EDGES, device=device)
         self.generator = torch.Generator(device=device).manual_seed(config.seed)
         self.counts = torch.zeros(len(COUNTERS), dtype=torch.long, device=device)
@@ -102,15 +122,34 @@ class JumpAssist:
             self._count(f'{kind}_rise_{name}', in_bin)
             self._count(f'unassisted_{kind}_rise_{name}', in_bin & ~helped)
 
-    def track(self, tasks):
-        """Attribute request endings and select newly accepted requests (idempotent)."""
+    def lifted(self, request):
+        """Real liftoff seen for ``request`` (rows whose latch still belongs to it)."""
+        return self.latch.lifted & (self.latch.request == request) & (request >= 0)
+
+    def track(self, tasks, lifted=None):
+        """Attribute request endings and select newly accepted requests (idempotent).
+
+        ``lifted`` is the ended requests' liftoff when the latch has already
+        moved on to the next request (after an observe_physics call).
+        """
         current = tasks.physical_id.long()
         changed = current != self.request
         ended = changed & (self.request >= 0)
         helped = self.impulse > 0
+        lifted = self.lifted(self.request) if lifted is None else lifted
         self._count('assisted_ended', ended & helped)
         self._count('unassisted_ended', ended & ~helped)
         self._count_by_rise('ended', ended, helped)
+        self._count_by_rise('liftoff', ended & lifted, helped)
+        # The peak still belongs to the ended request (it resets only at the next acceptance).
+        error = tasks.peak_rise - self.rise
+        tolerance = torch.minimum(torch.full_like(self.rise, .03), self.rise * .5) + 1e-6
+        self._count_by_rise('peak_low', ended & (error < -tolerance), helped)
+        self._count_by_rise('peak_ok', ended & (error.abs() <= tolerance), helped)
+        self._count_by_rise('peak_high', ended & (error > tolerance), helped)
+        for seconds in (.5, 1., 1.5):
+            self._count(f'streak_{seconds:.1f}s', ended & (self.streak >= seconds - 1e-6))
+        self.streak = torch.where(changed, 0., self.streak)
         accepted = changed & (current >= 0)
         level = self.level()
         chance = self.config.assist_request_probability * (float(level > 0) if self.config.decay == 'force' else level)
@@ -125,7 +164,31 @@ class JumpAssist:
         self._count('assisted_requests', accepted & draw)
         self.request = current.clone()
 
-    def record_success(self, before, tasks):
+    def observe_settling(self, tasks, force, velocity_z, tilt, world_height, angular_speed, angular_velocity_body):
+        """Per grounded tick after a correct real jump, which native stable-landing conditions hold.
+
+        The native quiet test bounds the norm of the body angular velocity; its
+        roll/pitch and yaw parts are also counted, against the same 0.5 rad/s.
+        """
+        active = tasks.physical_id >= 0
+        self.streak = torch.where(active, torch.maximum(self.streak, tasks.landed_s), self.streak)
+        tolerance = torch.minimum(torch.full_like(tasks.active_rise, .03), tasks.active_rise * .5) + 1e-6
+        base = (active & tasks.flight_seen & tasks.ascent_seen & tasks.supported_start
+                & ~(force <= 2).all(-1) & ((tasks.peak_rise - tasks.active_rise).abs() <= tolerance))
+        conditions = {'settle_contact': (force >= 5).all(-1), 'settle_vertical_speed': velocity_z.abs() <= .15,
+                      'settle_tilt': tilt <= .25, 'settle_angular_speed': angular_speed <= .5,
+                      'settle_roll_pitch_rate': angular_velocity_body[:, :2].norm(dim=-1) <= .5,
+                      'settle_yaw_rate': angular_velocity_body[:, 2].abs() <= .5,
+                      'settle_height': (world_height - tasks.ground_anchor - tasks.latched_height).abs() <= .05}
+        self._count('settle_ticks', base)
+        every = base
+        for name, holds in conditions.items():
+            self._count(name, base & holds)
+            if name not in ('settle_roll_pitch_rate', 'settle_yaw_rate'):   # parts of the angular speed
+                every = every & holds
+        self._count('settle_all', every)
+
+    def record_success(self, before, tasks, lifted_before):
         """Count successes decided by one native ``observe_physics`` call.
 
         The native task clears ``success_id`` at the next policy step and at
@@ -137,22 +200,25 @@ class JumpAssist:
         self._count('assisted_success', success & helped)
         self._count('unassisted_success', success & ~helped)
         self._count_by_rise('success', success, helped)
-        self.track(tasks)
+        self.track(tasks, lifted_before)
 
     def force_z(self):
         """Upward world force [N] per environment for this substep; None outside the assist stage."""
         native = self.native
         tasks = native._terrain_course.tasks
         self.track(tasks)
-        if not 0 <= self._progress() < 1:
+        if self.level() <= 0:
             return None
         curve = tasks.jump_reference()
-        push = ((curve.clock_stage == EXTENSION)
-                | ((curve.clock_stage == BALLISTIC) & (curve.velocity_world_z_m_s > 0)))
-        window = self.selected & (tasks.physical_id >= 0) & ~tasks.flight_seen & push
+        extension = curve.clock_stage == EXTENSION
+        rising = (curve.clock_stage == BALLISTIC) & (curve.velocity_world_z_m_s > 0)
+        request = tasks.physical_id.long()
+        landed = self.latch.closed & (self.latch.request == request)
+        window = self.selected & (request >= 0) & ~landed & (extension | rising)
         velocity_z = native._as_torch(native.robot.data.root_com_vel_w)[:, 2]
         mass = native._formal_reward.composer._mass_kg
-        shortfall = (curve.launch_velocity_m_s.to(velocity_z.dtype) - velocity_z).clamp_min(0)
+        target = torch.where(extension, curve.launch_velocity_m_s, curve.velocity_world_z_m_s).to(velocity_z.dtype)
+        shortfall = (target - velocity_z).clamp_min(0)
         limit = self.config.max_weight_fraction * mass * self.config.gravity_m_s2
         force = torch.minimum(mass * self.config.velocity_gain_per_s * shortfall, limit)
         if self.config.decay == 'force':
@@ -176,7 +242,11 @@ class JumpAssist:
 
 def install_jump_assist(native, curriculum, configuration: dict) -> JumpAssist:
     """Add the assist wrench after the native per-substep action/spring/DR wrenches."""
-    assist = JumpAssist(native, curriculum, JumpAssistConfig(**configuration))
+    from .reward import install_flight_latch
+
+    tasks = native._terrain_course.tasks
+    latch = getattr(tasks, 'supermimic_flight_latch', None) or install_flight_latch(tasks)
+    assist = JumpAssist(native, curriculum, JumpAssistConfig(**configuration), latch)
     original = native._apply_action
     base = [native._base_body_index]
 
@@ -189,13 +259,18 @@ def install_jump_assist(native, curriculum, configuration: dict) -> JumpAssist:
             native.robot.instantaneous_wrench_composer.add_forces_and_torques_index(
                 forces=forces, torques=torch.zeros_like(forces), body_ids=base, is_global=True)
 
-    tasks = native._terrain_course.tasks
     observe_physics = tasks.observe_physics
 
-    def observe_and_count(*args, **kwargs):
+    def observe_and_count(force, velocity_z, tilt, world_height, **kwargs):
         before = tasks.physical_id.long().clone()
-        result = observe_physics(*args, **kwargs)
-        assist.record_success(before, tasks)
+        lifted = assist.lifted(before)
+        result = observe_physics(force, velocity_z, tilt, world_height, **kwargs)
+        # The native state of this substep, whose norm is the quiet test's angular speed.
+        assist.observe_settling(tasks, force, velocity_z, tilt, world_height, kwargs['angular_speed_rad_s'],
+                                native._last_state.angular_velocity_body_rad_s)
+        # The latch was updated inside (and may have moved to a new request).
+        lifted = lifted | assist.lifted(before)
+        assist.record_success(before, tasks, lifted)
         return result
 
     native._apply_action = apply_action

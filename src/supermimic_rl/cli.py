@@ -68,6 +68,8 @@ def _native_schema_source(provenance):
         provenance = {key: value for key, value in provenance.items() if key != "numerical_isolation"}
     if provenance.get("course_schedule", False) is None:
         provenance = {key: value for key, value in provenance.items() if key != "course_schedule"}
+    # Staggered first time limits schedule resets; they do not change the dynamics of recorded data.
+    provenance = {key: value for key, value in provenance.items() if key != "desynchronize_episodes"}
     # The legacy bound is already implied by every earlier runtime pin; only a
     # changed action contract becomes part of the identity.
     if provenance.get("action_bounds") == list(ACTION_BOUNDS):

@@ -28,12 +28,17 @@ from .replay import CompactReplay
 from .stair_source import StairScenario, StairSourceState
 from .stair_task import StairTaskState
 from .terrain import AtlasTerrain
-from .jump_task import JumpTaskConfig, JumpTaskState, JumpTask, JUMP_RECORD_FIELDS, JUMP_TRIGGER_RECORD_FIELDS
+from .jump_task import (JumpTaskConfig, JumpTaskState, JumpTask, JUMP_FLIGHT_LATCH_RECORD_FIELDS,
+                        JUMP_RECORD_FIELDS, JUMP_TRIGGER_RECORD_FIELDS)
 from .recovery_task import RecoveryTaskConfig, RecoveryTask, RECOVERY_RECORD_FIELDS
-from .guard import NativeRegressionGuard
+from .guard import NativeRegressionGuard, validate_guard_settings
 from .validation import calibrate_contact_floor, validate
 
 CHECKPOINT_FORMAT = 'supermimic-online-v2'
+
+
+GUARD_SETTINGS = ('guard_drop_fraction', 'guard_patience', 'guard_window', 'guard_mode',
+                  'guard_min_rate_fraction', 'guard_recover_after')
 
 
 @dataclass(frozen=True)
@@ -87,6 +92,12 @@ class OnlineConfig:
     # native returns can. 0 disables it.
     guard_drop_fraction: float = 0.
     guard_patience: int = 2
+    # Collections averaged per judgment, and "restore" or review-only "report" (see guard.py).
+    guard_window: int = 1
+    guard_mode: str = 'restore'
+    # Restore mode: lowest actor rate as a base fraction, and good judgments that undo one halving.
+    guard_min_rate_fraction: float = 0.
+    guard_recover_after: int = 0
 
     @classmethod
     def from_dict(cls, value):
@@ -125,8 +136,10 @@ class OnlineConfig:
             raise ValueError('Recovery collection requires the complete jump and stair arbitration producer')
         if (self.initial_actor is None) != (self.initial_actor_sha256 is None):
             raise ValueError('initial_actor and initial_actor_sha256 must be given together')
-        if not 0 <= self.guard_drop_fraction < 1 or type(self.guard_patience) is not int or self.guard_patience < 1:
-            raise ValueError('Guard needs a drop fraction in [0, 1) and a positive integer patience')
+        validate_guard_settings(drop_fraction=self.guard_drop_fraction, patience=self.guard_patience,
+                                window=self.guard_window, mode=self.guard_mode,
+                                min_rate_fraction=self.guard_min_rate_fraction,
+                                recover_after=self.guard_recover_after)
         if self.learning.anchor_coefficient and self.initial_actor is None:
             raise ValueError('The teacher anchor needs the PPO initial_actor it is centered on')
         if self.initial_actor is not None and self.actor_frame_dim != 35:
@@ -159,7 +172,8 @@ def policy_start_candidates(replay, config, env_ids, policy_dt_s):
                     raise ValueError('Jump imagination requires complete native records; old rows are not inferred')
                 ordinary &= data['jump_record_valid'][slots, env, 0] > .5
                 jump = JumpTaskState.decode({name: data[name][slots, env] for name in
-                                            (*JUMP_RECORD_FIELDS, *JUMP_TRIGGER_RECORD_FIELDS) if name in data})
+                                            (*JUMP_RECORD_FIELDS, *JUMP_TRIGGER_RECORD_FIELDS,
+                                             *JUMP_FLIGHT_LATCH_RECORD_FIELDS) if name in data})
                 if jump.trigger_flags is not None:
                     ordinary &= jump.trigger_flags[:, 0]
             if config.record_recovery:
@@ -282,7 +296,8 @@ class OnlineTrainer:
             record_terrain=config.record_stair_source, record_stairs=config.record_stair_source,
             record_stair_source=config.record_stair_source, record_jumps=config.record_jumps,
             record_recovery=config.record_recovery,
-            record_jump_trigger=jump_task is not None and jump_task.config.trigger is not None)
+            record_jump_trigger=jump_task is not None and jump_task.config.trigger is not None,
+            record_jump_flight_latch=jump_task is not None and jump_task.config.flight_latch)
         if any(name not in replay.data or tuple(replay.data[name].shape[2:]) != shape for name, shape in expected.items()):
             raise ValueError('Online replay field layout differs from the current compact contract')
         self.mixing = MixedDecision(environment, self.learner.actor, teacher_decision, seed=config.seed + 2,
@@ -321,13 +336,24 @@ class OnlineTrainer:
     def _initialize_guard(self, saved):
         config = self.config
         self.guard = (NativeRegressionGuard(config.guard_drop_fraction, config.guard_patience,
-                                            config.learning.actor_learning_rate)
+                                            config.learning.actor_learning_rate, window=config.guard_window,
+                                            mode=config.guard_mode, min_rate_fraction=config.guard_min_rate_fraction,
+                                            recover_after=config.guard_recover_after)
                       if config.guard_drop_fraction else None)
         self.guard_cold_cycles_remaining = 0
         self.guard_cold_previous_bad_cycles = None
+        if getattr(self, 'guard_settings_changed', None):
+            self.resume_migrations.append({'guard_settings_changed': self.guard_settings_changed})
+        if saved is not None and self.guard is None:
+            # A rate lowered by an earlier guard must not outlive the guard.
+            for group in self.learner.optimizers['actor'].param_groups:
+                group['lr'] = config.learning.actor_learning_rate
         if saved is not None and self.guard is not None:
-            if saved.get('guard') is not None:
-                self.guard.load_state_dict(saved['guard'])
+            if saved.get('guard') is not None and not self.guard.load_state_dict(saved['guard']):
+                self.resume_migrations.append('guard judgment restarted under a new window/mode')
+            # The resumed Adam carries the rate of the saved guard state; apply this guard's rate.
+            for group in self.learner.optimizers['actor'].param_groups:
+                group['lr'] = self.guard.learning_rate()
             # Native resume resets the full population physically. Reuse the
             # existing startup observation budget without restarting learning.
             if config.policy_start_cycle:
@@ -340,10 +366,16 @@ class OnlineTrainer:
                 or saved['schema_fingerprint'] != self.env.schema.fingerprint):
             raise ValueError('Online checkpoint contract differs')
         configuration, requested = asdict(OnlineConfig.from_dict(saved['config'])), asdict(self.config)
-        configuration.pop('cycles')
-        requested.pop('cycles')
+        # The cycle budget and the guard's supervision settings may change on
+        # resume; the guard does not change the gradient recipe it supervises.
+        changed = {}
+        for name in ('cycles', *GUARD_SETTINGS):
+            before, after = configuration.pop(name), requested.pop(name)
+            if name != 'cycles' and before != after:
+                changed[name] = [before, after]
         if configuration != requested or self.config.cycles <= saved['cycle']:
-            raise ValueError('Resume may extend the cycle budget, not change the training recipe')
+            raise ValueError('Resume may extend the cycle budget or change guard supervision, not the training recipe')
+        self.guard_settings_changed = changed
         if saved.get('teacher_source') != self.teacher_source:
             raise ValueError('Resume teacher source differs')
         if json.dumps(saved.get('stair_scenario'), sort_keys=True) != json.dumps(self.stair_scenario, sort_keys=True):
@@ -484,7 +516,8 @@ class OnlineTrainer:
             guard_deferred = self.guard is not None and self.guard_cold_cycles_remaining > 0
             guarded = self.guard is not None and cycle > cfg.policy_start_cycle and not guard_deferred
             snapshot = (self.guard.snapshot(learner.actor, learner.optimizers['actor'],
-                        estimator_optimizer=learner.optimizers['estimator']) if guarded else None)
+                        estimator_optimizer=learner.optimizers['estimator'])
+                        if guarded and self.guard.restores else None)
             collection = self.collector.collect(cfg.collection_steps, actor_updates=learner.updates['actor'])
             guard = (self.guard.observe(collection.get('student_reward_mean'), snapshot, learner.actor,
                         learner.optimizers['actor'], estimator_optimizer=learner.optimizers['estimator'])

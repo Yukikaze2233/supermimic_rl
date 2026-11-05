@@ -28,7 +28,7 @@ from torch import nn
 from torch.nn import functional as F
 
 from ..contracts import ACTION_BOUNDS
-from .course_gate import CourseGates, GateTimeout, StageGate
+from .course_gate import GATE_MODES, CourseGates, GateTimeout, StageGate
 from .policy import MEAN_SQUASHES, Critic, TeacherActor
 from .rollout import Rollout, gae
 
@@ -80,6 +80,10 @@ class PPOConfig:
     # "restart_hold" restarts the waiting gate's timeout on resume, e.g. after a
     # course change; coordinate and opened gates are kept. "continue" keeps it.
     course_gate_resume: str = "continue"
+    # "hold" waits at each closed gate and stops at its timeout; "report" never
+    # waits or stops: gates are judged and logged for review, and opened jump
+    # height gates set the jump difficulty (see course_gate.CourseGates).
+    course_gate_mode: str = "hold"
     # Hand control to the native evaluation orchestrator at each newly opened gate.
     stop_after_gate: bool = False
     # Repeat a stage after a fix: on resume from a checkpoint written without
@@ -121,6 +125,8 @@ class PPOConfig:
             StageGate(**gate)
         if self.course_gate_resume not in ("continue", "restart_hold"):
             raise ValueError("course_gate_resume must be continue or restart_hold")
+        if self.course_gate_mode not in GATE_MODES or self.course_gate_mode == "report" and self.stop_after_gate:
+            raise ValueError(f"course_gate_mode must be one of {GATE_MODES}; report mode never stops at a gate")
         if type(self.stop_after_gate) is not bool or self.stop_after_gate and not self.course_gates:
             raise ValueError("stop_after_gate requires a boolean and a gated course")
         if self.course_rewind_stage is not None and not self.course_gates:
@@ -294,14 +300,20 @@ class PPOTrainer:
         self.updates = self.transitions = 0
         self.stage_action_std_applied: list[str] = []
         self.course = (CourseGates(config.course_gates, environment.course_stage_starts(),
-                                   config.curriculum_transition_cap) if config.course_gates else None)
+                                   config.curriculum_transition_cap, mode=config.course_gate_mode)
+                       if config.course_gates else None)
+        self._apply_opened_gates()
         # Native skill counters are cumulative since the cold physical setup.
         self._course_counters = (environment.course_progress()[0]
                                  if hasattr(environment, "course_progress") else None)
         self._normalization_samples = None
         self.statistics = EpisodeStatistics(environment.num_envs, self.device)
+        if resume is None and self.course is not None and self.course.mode == "report":
+            # The discovery reset sampled births before the opened gates were applied.
+            self.observation = environment.reset()
         if resume is not None:
             self.load(resume)
+            self._apply_opened_gates()
             # The first reset above only discovers observation dimensions.
             # Resume starts fresh episodes at the restored/rewound course,
             # otherwise every gate audit would silently restart flat births.
@@ -557,6 +569,7 @@ class PPOTrainer:
                     except GateTimeout as error:
                         timeout = str(error)
                         record["course"] = {"timeout": timeout}
+                    self._apply_opened_gates()
                 log.write(json.dumps(record) + "\n")
                 log.flush()
                 gate_passed = config.stop_after_gate and record.get("course", {}).get("gate_passed", False)
@@ -597,6 +610,14 @@ class PPOTrainer:
         finally:
             log.close()
         return {"status": "complete", "updates": self.updates, "transitions": self.transitions}
+
+    def _apply_opened_gates(self) -> None:
+        """Report mode: opened gates (not the coordinate) set the difficulty tied to them."""
+        if self.course is not None and self.course.mode == "report":
+            if not getattr(self, "_course_gates_checked", False):
+                self.environment.check_course_gates([gate.key for gate in self.course.gates])
+                self._course_gates_checked = True
+            self.environment.set_opened_course_gates(self.course.opened)
 
     def _raise_stage_action_std(self) -> str | None:
         """Raise action-std floors once when the course coordinate is inside a configured stage."""

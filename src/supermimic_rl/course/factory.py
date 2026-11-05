@@ -159,6 +159,7 @@ def create_course(configuration):
             "jump_takeoff": jump_takeoff_receipt,
             "stair_label": stair_label_receipt,
             "jump_assist": jump_assist_receipt,
+            "desynchronize_episodes": configuration.get("desynchronize_episodes", False),
             "reward_kernel": reward_kernel_receipt,
             "reward_config": asdict(native._formal_reward.config),
             "terrain_support_config": asdict(native._terrain_course.support_reference.config),
@@ -183,7 +184,9 @@ def create_course(configuration):
                              evaluation_configuration=configuration.get("evaluation"),
                              record_substeps=configuration.get("record_substeps", False),
                              substep_audit=configuration.get("substep_audit", False),
-                             profile_steps=configuration.get("profile_steps", False))
+                             profile_steps=configuration.get("profile_steps", False),
+                             desynchronize_episodes=configuration.get("desynchronize_episodes", False),
+                             seed=configuration.get("seed", 7))
     except BaseException as error:
         build_scope.close()
         failure = {"type": type(error).__name__, "message": str(error), "traceback": traceback.format_exc()}

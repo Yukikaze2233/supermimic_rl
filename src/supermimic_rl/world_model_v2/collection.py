@@ -13,7 +13,8 @@ from .replay import CompactReplay
 from .motion_task import MotionTask
 from .stair_task import STAIR_RECORD_FIELDS, StairTaskState
 from .stair_source import TOF_RECORD_FIELDS, StairSourceState
-from .jump_task import JUMP_RECORD_FIELDS, JUMP_TRIGGER_RECORD_FIELDS, JumpTaskState
+from .jump_task import (JUMP_FLIGHT_LATCH_RECORD_FIELDS, JUMP_RECORD_FIELDS, JUMP_TRIGGER_RECORD_FIELDS,
+                        JumpTaskState)
 from .recovery_task import RECOVERY_RECORD_FIELDS, RecoveryTaskState
 
 
@@ -64,6 +65,10 @@ class Collector:
         record_trigger = record_jumps and getattr(environment.adapter.env, 'supermimic_jump_trigger', None) is not None
         if replay is not None and any((name in replay.data) != record_trigger for name in JUMP_TRIGGER_RECORD_FIELDS):
             raise ValueError('Collector jump trigger differs from replay; migrate the legacy history explicitly')
+        record_latch = record_jumps and hasattr(
+            getattr(getattr(environment.adapter.env, '_terrain_course', None), 'tasks', None), 'supermimic_flight_latch')
+        if replay is not None and any((name in replay.data) != record_latch for name in JUMP_FLIGHT_LATCH_RECORD_FIELDS):
+            raise ValueError('Collector first-flight latch differs from replay; migrate the legacy history explicitly')
         if record_recovery and not record_jumps:
             raise ValueError('Recovery collection requires complete jump and stair arbitration state')
         if replay is not None and any((name in replay.data) != record_recovery

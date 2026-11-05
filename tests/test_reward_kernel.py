@@ -140,31 +140,72 @@ def test_reward_gradients_are_finite_and_match_directional_difference(case):
     torch.testing.assert_close(analytic, numeric, atol=1e-6, rtol=1e-5)
 
 
-def _jump_densities(case, extensions):
-    from supermimic_rl.reward_kernel import RewardExtensions
-
+def _jump_densities(case, extensions, progress=None):
     composer, reference = setup(case)
-    install_shared_reward(composer, extensions=extensions)
+    install_shared_reward(composer, extensions=extensions, jump_tasks=_task_owner(lambda: None))
     begin(composer, reference, torch.zeros(2, 6))
     window = composer._window
     history = RewardHistory(window['dq'], window['action_cost'], window['action2_cost'], composer._action_count)
     physics = sample(composer, 1)
     physics = replace(physics, velocity_origin_world_m_s=torch.tensor([[0., 0., 1.5], [0., 0., -.5]]))
-    return composer, physical_reward_densities(physics, reference, history, RewardParameters.from_composer(composer))
+    return composer, physical_reward_densities(physics, reference, history, RewardParameters.from_composer(composer),
+                                               jump_progress=progress)
 
 
-def test_jump_extensions_pay_only_actual_flight_and_are_off_by_default():
+def _progress(stage_name, ascent, closed=(False, False)):
+    from transformer_rl.formal.tasks.jump import ReferenceStage
+    from supermimic_rl.reward_kernel import JumpProgress
+
+    return JumpProgress(torch.full((2,), int(getattr(ReferenceStage, stage_name))), torch.tensor(ascent),
+                        None if closed is None else torch.tensor(closed))
+
+
+def test_jump_extensions_pay_only_the_first_real_flight_and_are_off_by_default():
     from supermimic_rl.reward_kernel import RewardExtensions
 
     extensions = RewardExtensions(jump_flight=4., jump_lift=2., success_event=5.)
-    _, flight = _jump_densities('jump_flight', extensions)
+    _, flight = _jump_densities('jump_flight', extensions, _progress('BALLISTIC', [True, True]))
     torch.testing.assert_close(flight.positive['jump_flight'], torch.full((2,), 4.))
     torch.testing.assert_close(flight.positive['jump_lift'], torch.tensor([3., 0.]))
     assert not flight.invalid.any()
-    _, takeoff = _jump_densities('jump_takeoff', extensions)
+    # A real jump later than the reference still counts (SCUT: physical takeoff opens the window).
+    _, late = _jump_densities('jump_flight', extensions, _progress('HOLD', [True, True]))
+    torch.testing.assert_close(late.positive['jump_flight'], torch.full((2,), 4.))
+    # Wheel unloading without real ascent earns nothing.
+    _, unrisen = _jump_densities('jump_flight', extensions, _progress('COMPRESSION', [False, True]))
+    torch.testing.assert_close(unrisen.positive['jump_flight'], torch.tensor([0., 4.]))
+    # After the first touchdown, bouncing earns nothing.
+    _, bounce = _jump_densities('jump_flight', extensions, _progress('HOLD', [True, True], (True, False)))
+    torch.testing.assert_close(bounce.positive['jump_flight'], torch.tensor([0., 4.]))
+    torch.testing.assert_close(bounce.positive['jump_lift'], torch.tensor([0., 0.]))
+    _, takeoff = _jump_densities('jump_takeoff', extensions, _progress('EXTENSION', [True, True]))
     assert takeoff.positive['jump_flight'].abs().sum() == 0 and takeoff.positive['jump_lift'].abs().sum() == 0
+    with pytest.raises(ValueError, match='request progress'):
+        _jump_densities('jump_flight', extensions)
+    with pytest.raises(ValueError, match='first-flight latch'):
+        _jump_densities('jump_flight', extensions, _progress('BALLISTIC', [True, True], None))
     composer, default = _jump_densities('jump_flight', RewardExtensions())
     assert 'jump_flight' not in default.positive and composer.tuning.success_event == 1.
+
+
+def test_first_flight_latch_needs_real_ascent_and_closes_at_touchdown_per_request():
+    from supermimic_rl.course.reward import FirstFlightLatch
+
+    tasks = SimpleNamespace(physical_id=torch.tensor([3, 3]), ascent_seen=torch.tensor([False, True]),
+                            air_ticks=torch.tensor([2, 1]))
+    latch = FirstFlightLatch(tasks)
+    latch.observe(tasks)  # row 0 unloaded without ascent; row 1 not yet two airborne ticks
+    assert not latch.lifted.any() and not latch.closed.any()
+    tasks.air_ticks = torch.tensor([3, 2])
+    latch.observe(tasks)
+    assert latch.lifted.tolist() == [False, True] and not latch.closed.any()
+    tasks.air_ticks = torch.tensor([0, 0])
+    latch.observe(tasks)
+    assert latch.closed.tolist() == [False, True]
+    tasks.physical_id = torch.tensor([3, 4])  # a new request clears its latch
+    tasks.ascent_seen = torch.tensor([False, False])
+    latch.observe(tasks)
+    assert not latch.lifted.any() and not latch.closed.any()
 
 
 def test_success_event_extension_is_paid_and_recorded():
@@ -178,33 +219,44 @@ def test_success_event_extension_is_paid_and_recorded():
         install_shared_reward(setup('ordinary')[0], verify_native=True, extensions=RewardExtensions(jump_flight=1.))
 
 
-def test_jump_push_pays_reference_upward_speed_only_before_flight_in_the_push_window():
+def test_jump_push_pays_reference_upward_speed_only_before_the_first_real_landing():
     from supermimic_rl.reward_kernel import RewardExtensions
 
     extensions = RewardExtensions(jump_push=2.)
+    fresh = _progress('EXTENSION', [False, False])
     # Reference vertical speeds are [0.2, -0.1] m/s; measured [1.5, -0.5] m/s.
-    _, takeoff = _jump_densities('jump_takeoff', extensions)
+    _, takeoff = _jump_densities('jump_takeoff', extensions, fresh)
     torch.testing.assert_close(takeoff.positive['jump_push'], torch.tensor([2., 0.]))
     assert not takeoff.invalid.any()
     composer, reference = setup('jump_takeoff')
-    install_shared_reward(composer, extensions=extensions)
+    install_shared_reward(composer, extensions=extensions, jump_tasks=_task_owner(lambda: None))
     begin(composer, reference, torch.zeros(2, 6))
     window = composer._window
     history = RewardHistory(window['dq'], window['action_cost'], window['action2_cost'], composer._action_count)
     slow = replace(sample(composer, 1), velocity_origin_world_m_s=torch.tensor([[0., 0., .1], [0., 0., .3]]))
-    partial = physical_reward_densities(slow, reference, history, RewardParameters.from_composer(composer))
+    partial = physical_reward_densities(slow, reference, history, RewardParameters.from_composer(composer),
+                                        jump_progress=fresh)
     torch.testing.assert_close(partial.positive['jump_push'], torch.tensor([1., 0.]))
-    _, flight = _jump_densities('jump_flight', extensions)
+    _, flight = _jump_densities('jump_flight', extensions, fresh)
     assert flight.positive['jump_push'].abs().sum() == 0
+    # Early wheel unloading moves the native phase to LANDING; the push is still paid.
+    _, unloaded = _jump_densities('jump_landing', extensions, fresh)
+    torch.testing.assert_close(unloaded.positive['jump_push'], torch.tensor([2., 0.]))
+    # After the first real flight touched down, a second push is not paid.
+    _, landed = _jump_densities('jump_landing', extensions, _progress('BALLISTIC', [True, True], (True, False)))
+    torch.testing.assert_close(landed.positive['jump_push'], torch.tensor([0., 0.]))
+    with pytest.raises(ValueError, match='first-flight latch'):
+        _jump_densities('jump_takeoff', extensions, _progress('EXTENSION', [False, False], None))
     _, ordinary = _jump_densities('ordinary', extensions)
     assert ordinary.positive['jump_push'].abs().sum() == 0
 
 
 @pytest.mark.parametrize('case', ['jump_takeoff', 'jump_flight', 'jump_landing', 'ordinary', 'recovery'])
 @pytest.mark.parametrize('stage_name', ['COMPRESSION', 'EXTENSION', 'BALLISTIC', 'HOLD'])
-def test_missed_jump_removes_tracking_only_after_reference_has_finished(case, stage_name):
+@pytest.mark.parametrize('ascended', [False, True])
+def test_missed_jump_removes_tracking_only_after_reference_has_finished(case, stage_name, ascended):
     from transformer_rl.formal.tasks.jump import ReferenceStage
-    from supermimic_rl.reward_kernel import RewardExtensions
+    from supermimic_rl.reward_kernel import JumpProgress, RewardExtensions
 
     composer, reference = setup(case)
     begin(composer, reference, torch.zeros(2, 6))
@@ -218,8 +270,10 @@ def test_missed_jump_removes_tracking_only_after_reference_has_finished(case, st
     # Zero vertical speed also occurs before takeoff; it is not a missed jump.
     stages = torch.tensor([int(getattr(ReferenceStage, stage_name)), int(ReferenceStage.COMPRESSION)])
     original = physical_reward_densities(physics, reference, history, base)
-    result = physical_reward_densities(physics, reference, history, parameters, jump_reference_stage=stages)
-    missed = torch.tensor([case == 'jump_takeoff' and stage_name == 'HOLD', False])
+    progress = JumpProgress(stages, torch.tensor([ascended, False]))
+    result = physical_reward_densities(physics, reference, history, parameters, jump_progress=progress)
+    # Any jump phase counts, including native FLIGHT/LANDING from wheel unloading without rising.
+    missed = torch.tensor([case.startswith('jump') and stage_name == 'HOLD' and not ascended, False])
     torch.testing.assert_close(result.gates['jump_missed'], missed)
     torch.testing.assert_close(result.cost['jump_missed'], missed.float())
     for name, value in original.positive.items():
@@ -229,14 +283,14 @@ def test_missed_jump_removes_tracking_only_after_reference_has_finished(case, st
         torch.testing.assert_close(result.cost[name], value, atol=0, rtol=0)
     if case == 'jump_takeoff':
         assert original.positive['jump_vertical'][0] == 1.
-        with pytest.raises(ValueError, match='reference clock stage'):
+        with pytest.raises(ValueError, match='request progress'):
             physical_reward_densities(physics, reference, history, parameters)
     assert not result.invalid.any()
 
 
 def test_missed_jump_stable_hold_retains_attitude_without_tracking_profit():
     from transformer_rl.formal.tasks.jump import ReferenceStage
-    from supermimic_rl.reward_kernel import RewardExtensions
+    from supermimic_rl.reward_kernel import JumpProgress, RewardExtensions
 
     composer, reference = setup('jump_takeoff')
     reference = replace(reference, admitted_body_command=torch.tensor([[0., 0., 0., .32]]).repeat(2, 1),
@@ -257,7 +311,7 @@ def test_missed_jump_stable_hold_retains_attitude_without_tracking_profit():
     original = physical_reward_densities(physics, reference, history, base)
     result = physical_reward_densities(physics, reference, history,
         replace(base, extensions=RewardExtensions(jump_missed=1.)),
-        jump_reference_stage=torch.full((2,), int(ReferenceStage.HOLD)))
+        jump_progress=JumpProgress(torch.full((2,), int(ReferenceStage.HOLD)), torch.zeros(2, dtype=torch.bool)))
 
     assert (original.positive['forward'] > 0).all() and (original.positive['yaw'] > 0).all()
     for name in ('forward', 'yaw', 'height', 'jump_vertical'):
@@ -268,7 +322,14 @@ def test_missed_jump_stable_hold_retains_attitude_without_tracking_profit():
     assert not result.invalid.any()
 
 
-def test_missed_jump_native_clock_is_sampled_once_per_interval_and_physical_phase_per_tick():
+def _task_owner(jump_reference):
+    """The native jump task interface the shared reward reads (2 rows)."""
+    return SimpleNamespace(jump_reference=jump_reference, ascent_seen=torch.zeros(2, dtype=torch.bool),
+                           physical_id=torch.zeros(2, dtype=torch.long), air_ticks=torch.zeros(2, dtype=torch.long),
+                           landed_s=torch.zeros(2), observe_physics=lambda *args, **kwargs: None)
+
+
+def test_missed_jump_native_clock_is_sampled_once_per_interval_and_ascent_per_tick():
     from transformer_rl.formal.tasks.jump import ReferenceStage
     from supermimic_rl.reward_kernel import RewardExtensions
 
@@ -279,16 +340,56 @@ def test_missed_jump_native_clock_is_sampled_once_per_interval_and_physical_phas
         reads.append(1)
         return SimpleNamespace(clock_stage=torch.full((2,), int(ReferenceStage.HOLD)))
 
-    install_shared_reward(composer, extensions=RewardExtensions(jump_missed=1.),
-                          jump_tasks=SimpleNamespace(jump_reference=jump_reference))
+    tasks = _task_owner(jump_reference)
+    install_shared_reward(composer, extensions=RewardExtensions(jump_missed=1.), jump_tasks=tasks)
     for interval in range(2):
         begin(composer, reference, torch.zeros(2, 6))
         for tick in range(1, 5):
-            phase = reference.phase.clone()
-            if tick >= 3:
-                phase[1] = int(RewardPhase.FLIGHT)
-            composer.observe(sample(composer, tick), replace(reference, phase=phase))
+            # Row 1 really ascends from tick 3; the task owner updates the latch each substep.
+            tasks.ascent_seen = torch.tensor([False, tick >= 3])
+            composer.observe(sample(composer, tick), reference)
         result = finish(composer)
         torch.testing.assert_close(result.component_densities['cost.jump_missed'],
                                    torch.tensor([-1., -.5], dtype=torch.float64))
         assert len(reads) == interval + 1
+
+
+def test_settle_reward_grows_with_the_native_stable_landing_streak():
+    from supermimic_rl.reward_kernel import JumpProgress, RewardExtensions
+    from transformer_rl.formal.tasks.jump import ReferenceStage
+
+    extensions = RewardExtensions(jump_settle=2.)
+    stage, ascent = torch.full((2,), int(ReferenceStage.HOLD)), torch.ones(2, dtype=torch.bool)
+    closed = torch.ones(2, dtype=torch.bool)
+    _, start = _jump_densities('jump_landing', extensions, JumpProgress(stage, ascent, closed, torch.tensor([.005, 0.])))
+    torch.testing.assert_close(start.positive['jump_settle'], torch.tensor([2. * (.25 + .75 * .0025), 0.]))
+    _, long = _jump_densities('jump_landing', extensions, JumpProgress(stage, ascent, closed, torch.tensor([1., 3.])))
+    torch.testing.assert_close(long.positive['jump_settle'], torch.tensor([2. * .625, 2.]))
+    assert not long.invalid.any()
+    _, ordinary = _jump_densities('ordinary', extensions)
+    assert ordinary.positive['jump_settle'].abs().sum() == 0
+    with pytest.raises(ValueError, match='stable-landing time'):
+        _jump_densities('jump_landing', extensions, JumpProgress(stage, ascent, closed))
+
+
+def test_landing_rate_cost_applies_only_after_the_first_real_touchdown():
+    from supermimic_rl.reward_kernel import JumpProgress, RewardExtensions
+    from transformer_rl.formal.tasks.jump import ReferenceStage
+
+    extensions = RewardExtensions(jump_landing_rate=2.)
+    stage, ascent = torch.full((2,), int(ReferenceStage.HOLD)), torch.ones(2, dtype=torch.bool)
+    composer, reference = setup('jump_landing')
+    install_shared_reward(composer, extensions=extensions, jump_tasks=_task_owner(lambda: None))
+    begin(composer, reference, torch.zeros(2, 6))
+    window = composer._window
+    history = RewardHistory(window['dq'], window['action_cost'], window['action2_cost'], composer._action_count)
+    physics = replace(sample(composer, 1), angular_velocity_body_rad_s=torch.tensor([[0., .6, .8], [.3, 0., 0.]]))
+    progress = JumpProgress(stage, ascent, torch.tensor([True, True]))
+    result = physical_reward_densities(physics, reference, history, RewardParameters.from_composer(composer),
+                                       jump_progress=progress)
+    # Row 0: angular speed 1.0 rad/s (pitch and yaw, as the native quiet test) -> 2 * (1.0 - 0.4)^2;
+    # row 1 is inside the free band.
+    torch.testing.assert_close(result.cost['jump_landing_rate'], torch.tensor([2. * .36, 0.]))
+    before = physical_reward_densities(physics, reference, history, RewardParameters.from_composer(composer),
+                                       jump_progress=JumpProgress(stage, ascent, torch.tensor([False, False])))
+    assert before.cost['jump_landing_rate'].abs().sum() == 0

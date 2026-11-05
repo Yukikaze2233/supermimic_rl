@@ -4,10 +4,16 @@ The native course maps a real-transition coordinate to its stage, command and
 terrain envelopes and the SCUT special-mode unlocks. Without gates that
 coordinate equals real exposure, so a stage starts whether or not the policy
 learned the previous one; PPO2000 entered later stages while still crouched.
-Here the coordinate still advances with real data inside a stage, but waits
-just before a gated stage until the gate's criteria hold over a rolling window
-of update records. A gate held longer than its timeout stops training for
-diagnosis instead of consuming more data.
+In ``hold`` mode the coordinate still advances with real data inside a stage,
+but waits just before a gated stage until the gate's criteria hold over a
+rolling window of update records; a gate held longer than its timeout stops
+training for diagnosis. One failing skill then freezes every later stage.
+
+In ``report`` mode the coordinate never waits. Each reached gate is judged on
+its window every update until it passes, and its waiting time is reported for
+review instead of stopping training. Opened gates still drive the difficulty
+that is tied to them (e.g. the jump height ladder), so a skill's difficulty
+follows its own performance while the other skills keep their schedule.
 
 Criteria read the trainer's update record: either the rolling mean of one
 metric (dotted paths reach nested dictionaries), or a rolling ratio of summed
@@ -107,8 +113,14 @@ class StageGate:
                 raise ValueError(name + " must be a positive integer")
 
 
+GATE_MODES = ("hold", "report")
+
+
 class CourseGates:
-    def __init__(self, gates, stage_starts: dict[str, int], cap: int | None = None):
+    def __init__(self, gates, stage_starts: dict[str, int], cap: int | None = None, mode: str = "hold"):
+        if mode not in GATE_MODES:
+            raise ValueError("Course gate mode must be one of " + str(GATE_MODES))
+        self.mode = mode
         gates = tuple(gate if isinstance(gate, StageGate) else StageGate(**gate) for gate in gates)
         unknown = [gate.stage for gate in gates if gate.stage not in stage_starts]
         if unknown:
@@ -124,6 +136,9 @@ class CourseGates:
         self.gates = tuple(sorted(gates, key=self._position))
         self._by_key = {gate.key: gate for gate in self.gates}
         self.coordinate, self.opened, self.held_updates = 0, [], 0
+        self.waiting: dict[str, int] = {}   # report mode: updates since each reached gate first waited
+        self.records = 0                     # advance() calls, to place gate openings in the history
+        self.opened_at: dict[str, int] = {}  # report mode: record count when each gate opened
         self.history = deque(maxlen=max(gate.window for gate in self.gates) if self.gates else 1)
 
     def _position(self, gate: StageGate) -> int:
@@ -139,16 +154,50 @@ class CourseGates:
         # The native course enters a stage at its first coordinate; wait one before.
         return self._position(gate) - 1
 
+    def _judge(self, gate: StageGate) -> tuple[bool, dict]:
+        window = list(self.history)[-gate.window:]
+        values = {criterion.name: criterion.value(window) for criterion in gate.criteria}
+        passed = (len(window) >= gate.window
+                  and all(criterion.holds(values[criterion.name]) for criterion in gate.criteria))
+        return passed, values
+
+    def _advance_report(self, transitions: int) -> dict:
+        status = {"coordinate_before": self.coordinate, "gates": {}}
+        for gate in self.gates:
+            if gate.key in self.opened or self.coordinate < self._limit(gate):
+                continue
+            # Inside one stage the ladder opens in order (e.g. jump heights), and
+            # each step is judged only on a full window collected after the
+            # previous step opened, i.e. at the difficulty it unlocked.
+            earlier = [other.key for other in self.gates if other.stage == gate.stage
+                       and self._position(other) < self._position(gate)]
+            if not set(earlier) <= set(self.opened) or any(
+                    self.records - self.opened_at.get(key, 0) < gate.window for key in earlier):
+                continue
+            passed, values = self._judge(gate)
+            waited = self.waiting.get(gate.key, 0)
+            status["gates"][gate.key] = {"values": values, "passed": passed, "waiting_updates": waited}
+            if passed:
+                self.opened.append(gate.key)
+                self.opened_at[gate.key] = self.records
+                self.waiting.pop(gate.key, None)
+            else:
+                self.waiting[gate.key] = waited + 1
+        target = self.coordinate + transitions
+        self.coordinate = target if self.cap is None else min(target, self.cap)
+        status.update(coordinate=self.coordinate, opened=list(self.opened), waiting=dict(self.waiting))
+        return status
+
     def advance(self, record: dict, transitions: int) -> dict:
         """Evaluate the waiting gate on records up to this one, then move the coordinate."""
         self.history.append(record)
+        self.records += 1
+        if self.mode == "report":
+            return self._advance_report(transitions)
         status = {"coordinate_before": self.coordinate}
         gate = self._next()
         if gate is not None and self.coordinate >= self._limit(gate):
-            window = list(self.history)[-gate.window:]
-            values = {criterion.name: criterion.value(window) for criterion in gate.criteria}
-            passed = (len(window) >= gate.window
-                      and all(criterion.holds(values[criterion.name]) for criterion in gate.criteria))
+            passed, values = self._judge(gate)
             status.update(gate=gate.key, gate_values=values, gate_passed=passed)
             if passed:
                 self.opened.append(gate.key)
@@ -189,12 +238,16 @@ class CourseGates:
         self.coordinate = start
         self.opened = [key for key in self.opened if self._position(self._by_key[key]) <= start]
         self.held_updates = 0
+        self.waiting = {}
+        self.opened_at = {key: 0 for key in self.opened}
+        self.records = 0
         self.history.clear()
         return {**receipt, "opened": list(self.opened)}
 
     def state_dict(self) -> dict:
         return {"coordinate": self.coordinate, "opened": list(self.opened), "held_updates": self.held_updates,
-                "history": list(self.history)}
+                "waiting": dict(self.waiting), "history": list(self.history), "records": self.records,
+                "opened_at": dict(self.opened_at), "mode": self.mode}
 
     def load_state_dict(self, state: dict, *, restart_hold: bool = False) -> None:
         """Restore the coordinate and opened gates; optionally restart the waiting gate's clock.
@@ -204,8 +257,17 @@ class CourseGates:
         """
         if not set(state["opened"]) <= set(self._by_key):
             raise ValueError("Saved course gates differ from the configured gates")
+        if state.get("mode", "hold") == "report" and self.mode == "hold":
+            # A reported course may already be past closed gates; holding would freeze it there.
+            raise ValueError("A report-mode course cannot resume in hold mode")
         self.coordinate, self.opened = int(state["coordinate"]), list(state["opened"])
         self.held_updates = 0 if restart_hold else int(state["held_updates"])
+        self.waiting = {} if restart_hold else {key: int(value) for key, value in state.get("waiting", {}).items()}
         self.history.clear()
-        if not restart_hold:
+        if restart_hold:
+            # The old window is dropped, so earlier openings count as complete windows ago.
+            self.records, self.opened_at = 0, {key: -max(g.window for g in self.gates) for key in self.opened}
+        else:
             self.history.extend(state["history"])
+            self.records = int(state.get("records", len(state["history"])))
+            self.opened_at = {key: int(value) for key, value in state.get("opened_at", {}).items()}
