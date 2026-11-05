@@ -1,9 +1,9 @@
 """Native collection and repeated world/BPTT updates with recoverable replay.
 
-The initial producer supports the foundation course. Its coordinate stays zero
-until a native capability evaluation admits the next task producer; elapsed
-data volume alone never claims a new skill. Teacher trajectories are data, not
-PPO updates or behavior-cloning targets for the student.
+Fixed producers retain their selected coordinate. An explicit progression maps
+collection steps to the pinned sampling schedule; passing through a stage does
+not claim skill mastery. Teacher trajectories are data, not PPO updates or
+behavior-cloning targets for the student.
 """
 from __future__ import annotations
 
@@ -19,6 +19,7 @@ from ..contracts import StateSchema
 from ..formal_observation import known_horizon
 from ..runtime import atomic_save
 from .collection import Collector
+from .course_progression import CourseProgression, CourseProgressionConfig
 from .factory import make_learner
 from .learning import LearningConfig
 from .mixing import MixedDecision
@@ -69,6 +70,7 @@ class OnlineConfig:
     record_jumps: bool = False
     record_recovery: bool = False
     course_coordinate: int | None = None
+    course_progression: CourseProgressionConfig | None = None
     policy_start_cycle: int = 0
     seed: int = 7
     model_hidden: tuple[int, ...] = (2048, 2048, 2048)
@@ -106,6 +108,8 @@ class OnlineConfig:
             if key in value:
                 value[key] = tuple(value[key])
         value['learning'] = LearningConfig(**value.get('learning', {}))
+        if value.get('course_progression') is not None:
+            value['course_progression'] = CourseProgressionConfig(**value['course_progression'])
         return cls(**value)
 
     def __post_init__(self):
@@ -134,6 +138,10 @@ class OnlineConfig:
             raise ValueError('Jump collection requires the complete terrain and stair arbitration producer')
         if self.record_recovery and not self.record_jumps:
             raise ValueError('Recovery collection requires the complete jump and stair arbitration producer')
+        if self.course_progression is not None:
+            if (not isinstance(self.course_progression, CourseProgressionConfig) or not self.record_recovery
+                    or self.course_coordinate != self.course_progression.start_coordinate):
+                raise ValueError('Course progression requires the full task producer and matching initial coordinate')
         if (self.initial_actor is None) != (self.initial_actor_sha256 is None):
             raise ValueError('initial_actor and initial_actor_sha256 must be given together')
         validate_guard_settings(drop_fraction=self.guard_drop_fraction, patience=self.guard_patience,
@@ -237,6 +245,7 @@ class OnlineTrainer:
             actor_frame_dim=config.actor_frame_dim)
         self.teacher_source = teacher_source
         self.actor_initialization = None
+        self.course_progression = None
         saved = None
         if resume is not None:
             saved = torch.load(resume, map_location='cpu', weights_only=True)
@@ -246,13 +255,17 @@ class OnlineTrainer:
             if dataset['cycle'] != saved['cycle'] or dataset['schema_fingerprint'] != environment.schema.fingerprint:
                 raise ValueError('Checkpoint and replay generation differ')
             self.learner.load_state_dict(saved['learner'])
-            if config.record_stair_source and saved['environment']['curriculum']['real_transitions'] != config.course_coordinate:
+            self._initialize_course_progression(saved)
+            expected_coordinate = (config.course_coordinate if config.course_progression is None else
+                                   config.course_progression.coordinate(max(0, saved['collection_steps'] - 1)))
+            if config.record_stair_source and saved['environment']['curriculum']['real_transitions'] != expected_coordinate:
                 raise ValueError('Resume course placement must match the explicitly migrated lookup coordinate')
             environment.load_training_state_dict(saved['environment'])
             self.cycle = saved['cycle']
             self.seed_source = saved['seed_source']
             self.actor_initialization = saved.get('actor_initialization')
         else:
+            self._initialize_course_progression(None)
             if seed_dataset is None or world_checkpoint is None:
                 raise ValueError('A fresh online run requires native seed data and its fitted world model')
             dataset = torch.load(seed_dataset, map_location='cpu', weights_only=True, mmap=True)
@@ -304,6 +317,10 @@ class OnlineTrainer:
             initial_fraction=config.teacher_fraction, hold_updates=config.teacher_hold_updates,
             fade_updates=config.teacher_fade_updates)
         self.resume_migrations = list(saved.get('resume_migrations', [])) if saved is not None else []
+        if getattr(self, 'course_progression_activated', False):
+            self.resume_migrations.append({'course_progression_activated': asdict(config.course_progression),
+                'learner_replay_rng_preserved': True, 'additional_warmup_cycles': 0,
+                'scope': 'sampling schedule only; skill progress remains independently evaluated'})
         self.task_norm_pending = bool(saved.get('task_norm_pending', False)) if saved is not None else False
         self.critic_norm_from = saved.get('critic_norm_from') if saved is not None else None
         self.collector = Collector(environment, self.mixing, capacity_steps=config.replay_steps, replay=replay,
@@ -311,7 +328,8 @@ class OnlineTrainer:
             curriculum_transition_cap=config.curriculum_transition_cap, record_tasks=config.record_tasks,
             record_terrain=config.record_stair_source, record_stairs=config.record_stair_source,
             record_stair_source=config.record_stair_source, record_jumps=config.record_jumps,
-            record_recovery=config.record_recovery, course_coordinate=config.course_coordinate)
+            record_recovery=config.record_recovery, course_coordinate=config.course_coordinate,
+            course_coordinate_at=None if config.course_progression is None else config.course_progression.coordinate)
         held = max(1, round(environment.num_envs * config.validation_fraction))
         if held >= environment.num_envs:
             raise ValueError('Online learning needs distinct training and validation environment rows')
@@ -332,6 +350,21 @@ class OnlineTrainer:
         self.mixing.actor_updates = self.learner.updates['actor']
         self._write_json(self.output / 'configuration.json', asdict(config))
         self._write_json(self.output / 'resume-migrations.json', self.resume_migrations)
+
+    def _initialize_course_progression(self, saved):
+        config = self.config.course_progression
+        if config is None:
+            return
+        self.course_progression = CourseProgression(config, self.env.adapter.curriculum)
+        from ..course.metrics import install_jump_outcome_metrics
+        install_jump_outcome_metrics(self.env.adapter.env)
+        if saved is not None and saved.get('course_progression') is not None:
+            self.course_progression.load_state_dict(saved['course_progression'])
+        elif saved is not None:
+            config.validate_activation(saved, self.config.course_coordinate)
+        elif config.start_collection_step != 0:
+            raise ValueError('Fresh course progression must begin at collection step zero')
+        self.course_progression.apply_difficulty()
 
     def _initialize_guard(self, saved):
         config = self.config
@@ -368,6 +401,12 @@ class OnlineTrainer:
                 or saved['schema_fingerprint'] != self.env.schema.fingerprint):
             raise ValueError('Online checkpoint contract differs')
         configuration, requested = asdict(OnlineConfig.from_dict(saved['config'])), asdict(self.config)
+        old_progression, new_progression = configuration.pop('course_progression'), requested.pop('course_progression')
+        self.course_progression_activated = old_progression != new_progression
+        if self.course_progression_activated:
+            if old_progression is not None or self.config.course_progression is None:
+                raise ValueError('An active course progression cannot be replaced or removed on resume')
+            self.config.course_progression.validate_activation(saved, self.config.course_coordinate)
         # The cycle budget and the guard's supervision settings may change on
         # resume; the guard does not change the gradient recipe it supervises.
         changed = {}
@@ -490,6 +529,7 @@ class OnlineTrainer:
             'mixing': self.mixing.state_dict(), 'resume_migrations': self.resume_migrations,
             'guard': None if self.guard is None else self.guard.state_dict(),
             'task_norm_pending': self.task_norm_pending,
+            'course_progression': (None if self.course_progression is None else self.course_progression.state_dict()),
             'critic_norm_from': self.critic_norm_from, 'stair_scenario': self.stair_scenario,
             'jump_scenario': self.jump_scenario, 'recovery_scenario': self.recovery_scenario,
             'sample_rng': self.generator.get_state(), 'torch_rng': torch.get_rng_state(),
@@ -520,7 +560,12 @@ class OnlineTrainer:
             snapshot = (self.guard.snapshot(learner.actor, learner.optimizers['actor'],
                         estimator_optimizer=learner.optimizers['estimator'])
                         if guarded and self.guard.restores else None)
+            progression = getattr(self, 'course_progression', None)
+            before_counters = (None if progression is None else
+                               progression.snapshot_counters(self.env.adapter.env))
             collection = self.collector.collect(cfg.collection_steps, actor_updates=learner.updates['actor'])
+            course = (None if progression is None else
+                      progression.observe(self.env.adapter.env, collection, before_counters))
             guard = (self.guard.observe(collection.get('student_reward_mean'), snapshot, learner.actor,
                         learner.optimizers['actor'], estimator_optimizer=learner.optimizers['estimator'])
                      if guarded else None)
@@ -564,12 +609,14 @@ class OnlineTrainer:
                         'completed': index + 1, 'requested': cfg.actor_updates, 'updates': learner.updates.copy()})
             self.cycle = cycle
             record = {'cycle': cycle, 'real_transitions': self.collector.steps * self.env.num_envs,
-                'policy_learning': policy_learning, 'course_coordinate': cfg.course_coordinate,
+                'policy_learning': policy_learning,
+                'course_coordinate': collection.get('course_coordinate', cfg.course_coordinate),
                 'replay_transitions': len(self.collector.replay), 'collection': collection,
                 'world': {key: sum(row[key] for row in world) / len(world) for key in world[0]},
                 'policy': {key: sum(row[key] for row in policy) / len(policy) for key in policy[0]},
                 'updates': learner.updates.copy(), 'skipped': learner.skipped.copy(),
                 **({} if guard is None else {'guard': guard}),
+                **({} if course is None else {'course': course}),
                 **({} if floor_report is None else {'contact_floor': {
                     name: {key: channel[key] for key in ('floor_n', 'false_positive_raw', 'false_positive_floored',
                                                          'true_positive_raw', 'true_positive_floored')}

@@ -29,13 +29,15 @@ class Collector:
                  replay: CompactReplay | None = None, advance_training_progress: bool = True,
                  record_terrain: bool = False, record_tasks: bool = False, record_stairs: bool = False,
                  record_stair_source: bool = False, record_jumps: bool = False, record_recovery: bool = False,
-                 course_coordinate: int | None = None):
+                 course_coordinate: int | None = None, course_coordinate_at=None):
         if environment.current is None:
             raise ValueError('Reset the native environment before constructing its collector')
         if action_noise_std < 0 or history_length < 1 or capacity_steps < 1:
             raise ValueError('Invalid collection history or action noise')
         if course_coordinate is not None and (course_coordinate < 0 or not advance_training_progress):
             raise ValueError('A fixed course coordinate must be nonnegative and explicitly applied')
+        if course_coordinate_at is not None and (not callable(course_coordinate_at) or not advance_training_progress):
+            raise ValueError('A course sampling clock must be callable and explicitly applied')
         self.environment, self.decision = environment, decision
         self.layout = (SnapshotLayout(environment.schema, record_terrain=True) if record_terrain
                        else SnapshotLayout(environment.schema))
@@ -90,6 +92,7 @@ class Collector:
         self.history_length, self.action_noise_std = history_length, action_noise_std
         self.curriculum_transition_cap = curriculum_transition_cap
         self.course_coordinate = course_coordinate
+        self.course_coordinate_at = course_coordinate_at
         self.advance_training_progress = advance_training_progress
         self.generator = torch.Generator(device=environment.device).manual_seed(seed)
         frame = environment.current.actor_observation
@@ -115,6 +118,8 @@ class Collector:
                           min(real_transitions, self.curriculum_transition_cap))
             if self.course_coordinate is not None:
                 coordinate = self.course_coordinate
+            if self.course_coordinate_at is not None:
+                coordinate = self.course_coordinate_at(self.steps)
             if self.advance_training_progress:
                 env.set_training_progress(real_transitions=coordinate, actor_updates=actor_updates)
             task = MotionTask.capture(env.adapter.env) if self.record_tasks else None
@@ -192,7 +197,8 @@ class Collector:
         return {'transitions': self.steps * env.num_envs, 'stored_transitions': len(self.replay),
                 'reward_mean': reward_sum / (steps * self.environment.num_envs),
                 'terminations': terminations, 'truncations': truncations,
-                'course_coordinate': coordinate, 'fixed_course_coordinate': self.course_coordinate,
+                'course_coordinate': coordinate,
+                'fixed_course_coordinate': self.course_coordinate if self.course_coordinate_at is None else None,
                 **{f'{name}_{key}': value for name, totals in populations.items() if totals['transitions']
                    for key, value in (('reward_mean', totals['reward'] / totals['transitions']),
                                       ('transitions', totals['transitions']),

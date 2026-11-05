@@ -146,39 +146,10 @@ class CourseEnvironment:
         return starts
 
     def course_progress(self) -> tuple[dict[str, float], dict[str, float]]:
-        """Native cumulative skill counters (since cold setup) and current course gauges.
+        """Read native cumulative skill counters and current course gauges."""
+        from ..course.metrics import course_progress
 
-        Jump outcomes are physically verified request results; stair completion
-        is the read-only authored whole-course evidence; recovery counts are the
-        native lifecycle. None of these is a policy input.
-        """
-        metrics = self.env._terrain_course.metrics()
-        counters = {f"course/jump/{name}": value
-                    for name, value in metrics["physical_request_outcomes"].items()}
-        counters.update({f"course/stair/{name}": value for name, value in metrics["stair_closed_loop"].items()})
-        authored = metrics["authored_stair_completion"]
-        for name in ("ended", "ended_complete"):
-            counters[f"course/stair/authored_{name}"] = sum(authored[name + "_by_tile"])
-        counters.update({f"course/recovery/{name}": value
-                         for name, value in metrics["recovery"]["counts"].items()})
-        counters.update({f"course/births/{name}": value
-                         for name, value in metrics["episode_birth_family_counts"].items()})
-        levels = metrics["level_histogram"]
-        rows = sum(levels)
-        gauges = {"course/terrain/level_fraction": (
-            sum(level * count for level, count in enumerate(levels)) / (rows * max(len(levels) - 1, 1))
-            if rows else 0.)}
-        curriculum = self.adapter.curriculum
-        gauges["course/jump/height_cap_m"] = float(curriculum.command_context().domain.jump_m[1])
-        level = getattr(curriculum, "jump_height_level", lambda: None)()
-        if level is not None:
-            gauges["course/jump/height_level"] = float(level)
-        assist = getattr(self.env, "supermimic_jump_assist", None)
-        if assist is not None:
-            assist_counters, assist_gauges = assist.metrics()
-            counters.update(assist_counters)
-            gauges.update(assist_gauges)
-        return counters, gauges
+        return course_progress(self.env, self.adapter.curriculum)
 
     def termination_reasons(self) -> dict:
         latch = getattr(self.env, "_failure_latch", None)
