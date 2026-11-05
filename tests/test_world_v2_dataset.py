@@ -213,5 +213,6 @@ def test_recording_is_passive_and_captures_evaluation_config_before_restore(tmp_
     assert saved['stair_source_config']['min_height_m'] == .08
     torch.testing.assert_close(saved['replay']['storage']['action'], recorded[1], rtol=0, atol=0)
     for state, draw in zip(saved['source_rng']['state'], recorded[2]):
-        rng = torch.Generator().set_state(state)
+        # CPU state readers need owning storage, not an offset row of the saved stack.
+        rng = torch.Generator().set_state(state.clone())
         torch.testing.assert_close(torch.rand(2, generator=rng), draw, rtol=0, atol=0)

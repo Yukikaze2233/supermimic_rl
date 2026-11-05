@@ -76,7 +76,8 @@ def check(path, *, atlas, table, asset, device):
             continue
         # CUDA and CPU generators consume vector lengths differently. Never
         # redraw only the selected rows or substitute a CPU RNG for CUDA.
-        generator.set_state(rng['state'][slot])
+        # CPU state readers need owning storage, as in the jump-task audit.
+        generator.set_state(rng['state'][slot].clone())
         draws = source.draw(n, 1, device=device, generator=generator)
         before = {key: value[selected] for key, value in start.items()}
         after = {key: value[selected] for key, value in following.items()}
