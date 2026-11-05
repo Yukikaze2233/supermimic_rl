@@ -40,9 +40,14 @@ RISE_BINS = tuple(f'{low:.2f}-{high:.2f}' for low, high in zip((.0, *RISE_BIN_ED
 # "peak_low/peak_ok/peak_high": its peak rise against the native success window
 # |peak - requested| <= min(3 cm, requested / 2), counted when it ended.
 OUTCOMES = ('ended', 'success', 'liftoff', 'peak_low', 'peak_ok', 'peak_high')
+# Grounded physical ticks after a real jump whose peak is inside the window,
+# and how many of them meet each native stable-landing condition; plus ended
+# requests by their longest uninterrupted stable streak (success needs 2 s).
+SETTLE = ('settle_ticks', 'settle_contact', 'settle_vertical_speed', 'settle_tilt', 'settle_angular_speed',
+          'settle_height', 'settle_all', 'streak_0.5s', 'streak_1.0s', 'streak_1.5s')
 COUNTERS = ('assisted_requests', 'assisted_ended', 'assisted_success', 'unassisted_ended', 'unassisted_success',
             *(f'{who}{kind}_rise_{name}' for who in ('', 'unassisted_') for name in RISE_BINS
-              for kind in OUTCOMES))
+              for kind in OUTCOMES), *SETTLE)
 DECAYS = ('probability', 'force')
 
 
@@ -90,6 +95,7 @@ class JumpAssist:
         # Native flight_seen (2 N wheel unloading) is reachable by retracting the legs.
         self.latch = latch
         self.rise = torch.zeros(native.num_envs, device=device)   # requested rise latched at acceptance
+        self.streak = torch.zeros(native.num_envs, device=device)   # longest native landed_s of the request
         self.edges = torch.tensor(RISE_BIN_EDGES, device=device)
         self.generator = torch.Generator(device=device).manual_seed(config.seed)
         self.counts = torch.zeros(len(COUNTERS), dtype=torch.long, device=device)
@@ -140,6 +146,9 @@ class JumpAssist:
         self._count_by_rise('peak_low', ended & (error < -tolerance), helped)
         self._count_by_rise('peak_ok', ended & (error.abs() <= tolerance), helped)
         self._count_by_rise('peak_high', ended & (error > tolerance), helped)
+        for seconds in (.5, 1., 1.5):
+            self._count(f'streak_{seconds:.1f}s', ended & (self.streak >= seconds - 1e-6))
+        self.streak = torch.where(changed, 0., self.streak)
         accepted = changed & (current >= 0)
         level = self.level()
         chance = self.config.assist_request_probability * (float(level > 0) if self.config.decay == 'force' else level)
@@ -153,6 +162,23 @@ class JumpAssist:
         self.rise = torch.where(accepted, tasks.active_rise, self.rise)
         self._count('assisted_requests', accepted & draw)
         self.request = current.clone()
+
+    def observe_settling(self, tasks, force, velocity_z, tilt, world_height, angular_speed):
+        """Per grounded tick after a correct real jump, which native stable-landing conditions hold."""
+        active = tasks.physical_id >= 0
+        self.streak = torch.where(active, torch.maximum(self.streak, tasks.landed_s), self.streak)
+        tolerance = torch.minimum(torch.full_like(tasks.active_rise, .03), tasks.active_rise * .5) + 1e-6
+        base = (active & tasks.flight_seen & tasks.ascent_seen & tasks.supported_start
+                & ~(force <= 2).all(-1) & ((tasks.peak_rise - tasks.active_rise).abs() <= tolerance))
+        conditions = {'settle_contact': (force >= 5).all(-1), 'settle_vertical_speed': velocity_z.abs() <= .15,
+                      'settle_tilt': tilt <= .25, 'settle_angular_speed': angular_speed <= .5,
+                      'settle_height': (world_height - tasks.ground_anchor - tasks.latched_height).abs() <= .05}
+        self._count('settle_ticks', base)
+        every = base
+        for name, holds in conditions.items():
+            self._count(name, base & holds)
+            every = every & holds
+        self._count('settle_all', every)
 
     def record_success(self, before, tasks, lifted_before):
         """Count successes decided by one native ``observe_physics`` call.
@@ -227,10 +253,11 @@ def install_jump_assist(native, curriculum, configuration: dict) -> JumpAssist:
 
     observe_physics = tasks.observe_physics
 
-    def observe_and_count(*args, **kwargs):
+    def observe_and_count(force, velocity_z, tilt, world_height, **kwargs):
         before = tasks.physical_id.long().clone()
         lifted = assist.lifted(before)
-        result = observe_physics(*args, **kwargs)
+        result = observe_physics(force, velocity_z, tilt, world_height, **kwargs)
+        assist.observe_settling(tasks, force, velocity_z, tilt, world_height, kwargs['angular_speed_rad_s'])
         # The latch was updated inside (and may have moved to a new request).
         lifted = lifted | assist.lifted(before)
         assist.record_success(before, tasks, lifted)
