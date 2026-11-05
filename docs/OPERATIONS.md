@@ -77,7 +77,7 @@ python scripts/run_ppo_gated_course.py \
 
 ## SuperMimic（世界模型 V2）
 
-当前在线学生使用 `guard_mode="report"`，回报监控只供评审，不回滚策略或降低学习率；恢复后在原有策略预热结束的前提下立即恢复统计。`course_coordinate` 是固定课程采样位置：若保持该值，增加 cycles 不会自动获得后续台阶/地形数据，也不等于完成完整课程。
+当前在线学生使用 `guard_mode="report"`，回报监控只供评审，不回滚策略或降低学习率；恢复后在原有策略预热结束的前提下立即恢复统计。单独设置 `course_coordinate` 会固定课程采样位置，增加 cycles 不会自动获得后续台阶/地形数据。可从完整断点启用 `course_progression`，沿原生阶段顺序和比例推进采样；跳跃高度独立按实际结果提升，其他阶段继续。配置与恢复语义见 [世界模型课程接续](WORLD_V2_COURSE_PROGRESS.md)。阶段走完不代表能力通过，也不会自动补齐尚未建模的外部推扰。
 
 ```bash
 # 1. 教师导出（含原生评价证据）
