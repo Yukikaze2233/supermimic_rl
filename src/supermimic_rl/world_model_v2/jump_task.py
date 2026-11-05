@@ -273,7 +273,7 @@ class JumpInterval:
     reference_stage: Tensor
     ascent_seen: Tensor
     flight_closed: Tensor | None = None   # per tick; None without a recorded first-flight latch
-    stable: Tensor | None = None          # per tick: native stable-landing conditions hold
+    landed_s: Tensor | None = None        # per tick: native uninterrupted stable-landing time [s]
 
 
 class JumpTask:
@@ -439,7 +439,7 @@ class JumpTask:
                     dt=self.config.physics_dt_s)
                 phases.append(owner.phase.clone())
                 ascents.append(owner.ascent_seen.clone())
-                stable_ticks.append(owner.landed_s > 0)
+                stable_ticks.append(owner.landed_s.clone())
                 if latch is not None:
                     # The native FirstFlightLatch update after observe_physics.
                     latch = advance_flight_latch(*latch, current=owner.physical_id,

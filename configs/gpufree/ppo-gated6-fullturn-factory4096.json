@@ -24,7 +24,7 @@
   "jump_assist": {
     "probability": 1.0,
     "decay": "force",
-    "fade_stage_fraction": 0.75,
+    "fade_stage_fraction": 1.0,
     "velocity_gain_per_s": 10.0,
     "max_weight_fraction": 1.5,
     "stage": "active_jump",

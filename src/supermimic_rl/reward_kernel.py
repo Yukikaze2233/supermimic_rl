@@ -21,6 +21,7 @@ from transformer_rl.formal.tasks.reward import (
 from transformer_rl.formal.tasks.gimbal_course import GimbalCourse
 
 JUMP_PUSH_MIN_REFERENCE_M_S = .1
+JUMP_SETTLE_STREAK_S = 2.     # the native physical success needs this uninterrupted stable landing
 NATIVE_SOURCE_SHA256 = 'b03282693376a8af082d8433badfcba917270394113aaf2bec271289f7decdd8'
 
 
@@ -49,6 +50,9 @@ class RewardExtensions:
     success event gives a policy that never succeeded no gradient toward it, so
     ``jump_settle`` pays while those exact conditions hold. That happens only
     after a correct jump and lasts at most the 2 s before the request ends.
+    It grows with the native streak (``landed_s``) from 25% to 100% at 2 s:
+    R8b met every condition on 79% of those ticks but never for 2 s in a row,
+    so a per-tick reward alone did not value the unbroken streak.
     """
 
     jump_flight: float = 0.        # per second in the request's first real flight (after real ascent)
@@ -57,7 +61,7 @@ class RewardExtensions:
     jump_push: float = 0.          # per second at full reference upward speed while supported
     success_event: float | None = None
     jump_missed: float = 0.        # per second in reference HOLD without real ascent
-    jump_settle: float = 0.        # per second while the native stable-landing conditions hold
+    jump_settle: float = 0.        # per second at a 2 s native stable-landing streak (25% at its start)
 
     def __post_init__(self):
         values = (self.jump_flight, self.jump_lift, self.jump_lift_cap_m_s, self.jump_push, self.jump_missed,
@@ -92,15 +96,17 @@ class JumpProgress:
     reference_stage: Tensor
     ascent_seen: Tensor
     flight_closed: Tensor | None = None
-    stable: Tensor | None = None         # native stable-landing conditions hold (landed_s grows)
+    landed_s: Tensor | None = None       # native uninterrupted stable-landing time [s]; > 0 while stable
 
     def validate(self, mode: Tensor) -> None:
-        flags = (self.ascent_seen,) + tuple(flag for flag in (self.flight_closed, self.stable) if flag is not None)
+        flags = (self.ascent_seen,) + (() if self.flight_closed is None else (self.flight_closed,))
         if (self.reference_stage.shape != mode.shape or self.reference_stage.device != mode.device
                 or self.reference_stage.dtype != torch.long
                 or any(flag.shape != mode.shape or flag.device != mode.device or flag.dtype != torch.bool
-                       for flag in flags)):
-            raise ValueError('Jump progress needs matching int64 reference stages and boolean latch rows')
+                       for flag in flags)
+                or self.landed_s is not None and (self.landed_s.shape != mode.shape or self.landed_s.device != mode.device
+                                                  or not self.landed_s.is_floating_point())):
+            raise ValueError('Jump progress needs matching int64 reference stages, boolean latches and float times')
 
     @staticmethod
     def cat(items) -> JumpProgress | None:
@@ -108,13 +114,13 @@ class JumpProgress:
         if all(item is None for item in items):
             return None
         if (any(item is None for item in items) or len({item.flight_closed is None for item in items}) != 1
-                or len({item.stable is None for item in items}) != 1):
+                or len({item.landed_s is None for item in items}) != 1):
             raise ValueError('Jump progress coverage changes within a physical interval')
         optional = lambda name: (None if getattr(items[0], name) is None
                                  else torch.cat([getattr(item, name) for item in items]))
         return JumpProgress(torch.cat([item.reference_stage for item in items]),
                             torch.cat([item.ascent_seen for item in items]),
-                            optional('flight_closed'), optional('stable'))
+                            optional('flight_closed'), optional('landed_s'))
 
 
 def advance_flight_latch(request: Tensor, lifted: Tensor, closed: Tensor, *, current: Tensor,
@@ -441,15 +447,15 @@ def physical_reward_densities(sample: RewardPhysics, reference: RewardReference,
                 for key, value in cost.items()}
     extensions = parameters.extensions
     missed_jump = torch.zeros_like(jump)
-    stage = ascended = closed = stable = None
+    stage = ascended = closed = landed = None
     if extensions.needs_jump_progress:
         if jump_progress is None:
             if jump.any():
                 raise ValueError('Jump flight/missed rewards require the request progress (reference stage, ascent)')
         else:
             jump_progress.validate(reference.mode)
-            stage, ascended, closed, stable = (jump_progress.reference_stage, jump_progress.ascent_seen,
-                                               jump_progress.flight_closed, jump_progress.stable)
+            stage, ascended, closed, landed = (jump_progress.reference_stage, jump_progress.ascent_seen,
+                                               jump_progress.flight_closed, jump_progress.landed_s)
     if extensions.jump_missed:
         from transformer_rl.formal.tasks.jump import ReferenceStage
 
@@ -493,14 +499,15 @@ def physical_reward_densities(sample: RewardPhysics, reference: RewardReference,
         achieved = (sample.velocity_origin_world_m_s[:, 2] / target.clamp_min(JUMP_PUSH_MIN_REFERENCE_M_S)).clamp(0, 1)
         positive['jump_push'] = extensions.jump_push * pushing.to(v_up.dtype) * achieved
     if extensions.jump_settle:
-        settled = torch.zeros_like(jump)
+        settled = torch.zeros_like(v_up)
         if stage is not None:
-            if stable is None:
+            if landed is None:
                 if jump.any():
-                    raise ValueError('Jump settle rewards require the native stable-landing flag')
+                    raise ValueError('Jump settle rewards require the native stable-landing time')
             else:
-                settled = jump & stable
-        positive['jump_settle'] = extensions.jump_settle * settled.to(v_up.dtype)
+                streak = (landed.to(v_up.dtype) / JUMP_SETTLE_STREAK_S).clamp(0, 1)
+                settled = torch.where(jump & (landed > 0), .25 + .75 * streak, 0.)
+        positive['jump_settle'] = extensions.jump_settle * settled
     p, c = torch.stack(tuple(positive.values())).sum(0), torch.stack(tuple(cost.values())).sum(0)
     components = {**{'positive.' + key: value for key, value in positive.items()},
                   **{'cost.' + key: -value for key, value in cost.items()}}

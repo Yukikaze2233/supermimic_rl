@@ -354,17 +354,19 @@ def test_missed_jump_native_clock_is_sampled_once_per_interval_and_ascent_per_ti
         assert len(reads) == interval + 1
 
 
-def test_settle_reward_pays_only_while_the_native_stable_landing_conditions_hold():
+def test_settle_reward_grows_with_the_native_stable_landing_streak():
     from supermimic_rl.reward_kernel import JumpProgress, RewardExtensions
     from transformer_rl.formal.tasks.jump import ReferenceStage
 
     extensions = RewardExtensions(jump_settle=2.)
     stage, ascent = torch.full((2,), int(ReferenceStage.HOLD)), torch.ones(2, dtype=torch.bool)
-    progress = JumpProgress(stage, ascent, torch.ones(2, dtype=torch.bool), torch.tensor([True, False]))
-    _, landing = _jump_densities('jump_landing', extensions, progress)
-    torch.testing.assert_close(landing.positive['jump_settle'], torch.tensor([2., 0.]))
-    assert not landing.invalid.any()
+    closed = torch.ones(2, dtype=torch.bool)
+    _, start = _jump_densities('jump_landing', extensions, JumpProgress(stage, ascent, closed, torch.tensor([.005, 0.])))
+    torch.testing.assert_close(start.positive['jump_settle'], torch.tensor([2. * (.25 + .75 * .0025), 0.]))
+    _, long = _jump_densities('jump_landing', extensions, JumpProgress(stage, ascent, closed, torch.tensor([1., 3.])))
+    torch.testing.assert_close(long.positive['jump_settle'], torch.tensor([2. * .625, 2.]))
+    assert not long.invalid.any()
     _, ordinary = _jump_densities('ordinary', extensions)
     assert ordinary.positive['jump_settle'].abs().sum() == 0
-    with pytest.raises(ValueError, match='stable-landing'):
-        _jump_densities('jump_landing', extensions, JumpProgress(stage, ascent, torch.ones(2, dtype=torch.bool)))
+    with pytest.raises(ValueError, match='stable-landing time'):
+        _jump_densities('jump_landing', extensions, JumpProgress(stage, ascent, closed))
