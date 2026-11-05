@@ -4,6 +4,7 @@ from dataclasses import asdict, replace
 import hashlib
 import inspect
 import json
+import math
 from pathlib import Path
 
 import torch
@@ -13,6 +14,7 @@ from ...course.curriculum import CourseCurriculumConfig
 from ...course.jump_first import SCHEDULE, make_course_curriculum
 from ..imagination import Critic
 from ..jump_task import (
+    JUMP_FLIGHT_LATCH_RECORD_DTYPES, JUMP_FLIGHT_LATCH_RECORD_FIELDS,
     JUMP_TRIGGER_FEATURE_DIM, JUMP_TRIGGER_RECORD_DTYPES, JUMP_TRIGGER_RECORD_FIELDS, JumpTaskConfig,
 )
 from ..motion_task import MOTION_TASK_DIM
@@ -24,7 +26,7 @@ from ..teacher import PPO_TEACHER_FORMAT, file_sha256
 TASK_VALID_FLAGS = ('task_record_valid', 'stair_source_valid', 'jump_record_valid', 'recovery_record_valid')
 OPTIONAL_SOURCE_KEYS = ('jump_takeoff', 'stair_label', 'jump_assist')
 SEMANTIC_SOURCE_KEYS = ('runtime_sha256', 'course_sha256', 'curriculum', 'reward_kernel',
-                        'jump_takeoff', 'stair_label')
+                        'jump_takeoff', 'stair_label', 'course_schedule', 'numerical_isolation')
 
 
 def _source(value):
@@ -173,6 +175,25 @@ def upgrade_task_semantics(saved, dataset, reference, *, source_runtime_raw, tar
             or {k: v for k, v in source.items() if k not in SEMANTIC_SOURCE_KEYS}
             != {k: v for k, v in target.items() if k not in SEMANTIC_SOURCE_KEYS}):
         raise ValueError('Task handoff cannot change physical, sensor, execution or asset contracts')
+    old_schedule, new_schedule = source.get('course_schedule'), target.get('course_schedule')
+    if old_schedule != new_schedule and (not isinstance(old_schedule, dict)
+            or {**old_schedule, 'request_yaw_rate': 0.} != new_schedule):
+        raise ValueError('Task handoff may only add the zero-yaw jump request schedule')
+    old_isolation, new_isolation = source.get('numerical_isolation'), target.get('numerical_isolation')
+    if old_isolation != new_isolation:
+        # This repair changes only rejected rows, which already supply no
+        # model targets. Keep the explicit receipt in the new source rather
+        # than globally treating arbitrary simulator corrections as equivalent.
+        expected_isolation = {
+            'contract': 'physx_finite_coordinate_sampling_row_isolation_v3',
+            'native_period_rad': 4 * math.pi,
+            'scope': 'finite ambiguous position/speed samples; reject the entire policy interval',
+            'rejected_rows': 'restore interval-start pose/joints with zero velocity, then normal episode reset',
+            'native_state_modified': 'rejected rows only; never used for learning',
+            'unknown_or_nonfinite_errors': 'raise',
+        }
+        if old_isolation is not None or new_isolation != expected_isolation:
+            raise ValueError('Task handoff cannot change the dynamics of retained simulator rows')
     _check_runtime(source, target, source_runtime_raw, target_runtime_raw)
     old_reward, new_reward = source['reward_kernel'], target['reward_kernel']
     if ({k: v for k, v in old_reward.items() if k not in ('kernel_sha256', 'extensions')}
@@ -209,9 +230,12 @@ def upgrade_task_semantics(saved, dataset, reference, *, source_runtime_raw, tar
     storage, recorded = dataset['replay']['storage'], reference['replay']['storage']
     if any(name in storage for name in JUMP_TRIGGER_RECORD_FIELDS):
         raise ValueError('Task handoff cannot overwrite existing trigger records')
+    if old_jump.flight_latch or any(name in storage for name in JUMP_FLIGHT_LATCH_RECORD_FIELDS):
+        raise ValueError('Task handoff expects legacy data without first-flight records')
     fields = RecordSpec(schema.goal_dim, storage['sim_context'].shape[-1]).fields(
         record_tasks=True, record_terrain=True, record_stairs=True, record_stair_source=True,
-        record_jumps=True, record_recovery=True, record_jump_trigger=True)
+        record_jumps=True, record_recovery=True, record_jump_trigger=True,
+        record_jump_flight_latch=new_jump.flight_latch)
     valid = recorded['valid'] & recorded['policy_owned']
     for name, shape in fields.items():
         if name not in recorded or recorded[name].shape != (*valid.shape, *shape):
@@ -220,9 +244,11 @@ def upgrade_task_semantics(saved, dataset, reference, *, source_runtime_raw, tar
         if name not in storage:
             raise ValueError('Source replay lacks complete task validity flags')
         valid &= recorded[name][..., 0] > .5
-    for name, dtype in JUMP_TRIGGER_RECORD_DTYPES.items():
+    new_dtypes = {**JUMP_TRIGGER_RECORD_DTYPES,
+                  **(JUMP_FLIGHT_LATCH_RECORD_DTYPES if new_jump.flight_latch else {})}
+    for name, dtype in new_dtypes.items():
         if recorded[name].dtype != dtype:
-            raise ValueError('Native trigger record dtype differs')
+            raise ValueError('Native jump memory dtype differs: ' + name)
     valid &= recorded['jump_trigger_flags'][..., 0]
     clock = recorded['jump_trigger_clock'][..., 0]
     valid &= torch.isfinite(clock) | torch.isneginf(clock)
@@ -244,9 +270,17 @@ def upgrade_task_semantics(saved, dataset, reference, *, source_runtime_raw, tar
     learner = {**saved['learner'], 'critic': critic.state_dict(),
         'optimizers': {**saved['learner']['optimizers'], 'critic': optimizer.state_dict()}}
     additions = {name: torch.zeros_like(storage[name]) for name in TASK_VALID_FLAGS}
-    for name, shape in JUMP_TRIGGER_RECORD_FIELDS.items():
+    new_fields = {**JUMP_TRIGGER_RECORD_FIELDS,
+                  **(JUMP_FLIGHT_LATCH_RECORD_FIELDS if new_jump.flight_latch else {})}
+    for name, shape in new_fields.items():
         additions[name] = torch.zeros(*storage['frame'].shape[:2], *shape, device=storage['frame'].device,
-                                      dtype=JUMP_TRIGGER_RECORD_DTYPES[name])
+                                      dtype=new_dtypes[name])
+    if new_jump.flight_latch:
+        # Historical physical rows remain useful supervision, but their
+        # missing request memory cannot become an imagined starting state.
+        # TASK_VALID_FLAGS above keep these placeholders out until overwritten
+        # by a fresh native transition carrying its actual first-flight latch.
+        additions['jump_flight_latch'][..., 0] = -1
     next_config = replace(config, course_coordinate=course_coordinate, critic_warmup=True,
                           policy_start_cycle=saved['cycle'] + critic_warmup_cycles)
     report = {'migration': 'a05-to-r7-task-semantics-v1', 'cycle': saved['cycle'],
@@ -262,6 +296,8 @@ def upgrade_task_semantics(saved, dataset, reference, *, source_runtime_raw, tar
         'teacher_population_and_schedule_preserved': True,
         'legacy_task_valid_rows_invalidated': {name: int((storage[name] > .5).sum()) for name in TASK_VALID_FLAGS},
         'old_dynamics_rows_retained': int(storage['valid'].sum()), 'legacy_gate_histories_inferred': 0,
+        'first_flight_records_added': new_jump.flight_latch, 'legacy_flight_histories_inferred': 0,
+        'rejected_row_repair_added': old_isolation != new_isolation,
         'legacy_record_semantics': 'source_native_contract; physical data retained, all task starts invalid',
         'new_native_state': 'cold simulator/gate reset; collector offsets episode IDs; no capability promotion'}
     upgraded = {**saved, 'schema': target_schema.to_dict(), 'schema_fingerprint': target_schema.fingerprint,

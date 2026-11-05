@@ -4,6 +4,7 @@ from dataclasses import asdict
 import hashlib
 import inspect
 import json
+import math
 from pathlib import Path
 import runpy
 from types import SimpleNamespace
@@ -14,6 +15,7 @@ import torch
 from supermimic_rl.contracts import StateSchema
 from supermimic_rl.course.jump_first import make_course_curriculum
 from supermimic_rl.course.jump_takeoff import install_jump_takeoff
+from supermimic_rl.course.reward import FirstFlightLatch
 from supermimic_rl.reward_kernel import NATIVE_SOURCE_SHA256, RewardExtensions, physical_reward_densities
 from supermimic_rl.world_model_v2.jump_task import JumpTaskConfig, JumpTaskState
 from supermimic_rl.world_model_v2.migrations.recovery import upgrade_recovery_tasks
@@ -55,8 +57,10 @@ def fixture(tmp_path):
               'extensions': asdict(RewardExtensions(jump_flight=4., jump_lift=2., success_event=5.))}
     source = {'asset': 'unchanged', 'runtime_sha256': hashlib.sha256(old_runtime_raw).hexdigest(),
               'course_sha256': hashlib.sha256(old_course_raw).hexdigest(),
-              'curriculum': json.loads(old_course_raw), 'reward_kernel': {**reward, 'kernel_sha256': 'legacy'}}
+              'curriculum': json.loads(old_course_raw), 'reward_kernel': {**reward, 'kernel_sha256': 'legacy'},
+              'course_schedule': {'schedule': 'jump_first_v1', 'early_jump_domain': [.03, .1]}}
     native = native_jumps(2)
+    native._terrain_course.tasks.supermimic_flight_latch = FirstFlightLatch(native._terrain_course.tasks)
     gate = install_jump_takeoff(native, {'compression_depth_max_m': .04,
         'compression_duration_s': .2, 'nominal_extension_duration_s': .1})
     target = {**source, 'runtime_sha256': hashlib.sha256(new_runtime_raw).hexdigest(),
@@ -64,6 +68,12 @@ def fixture(tmp_path):
               'jump_takeoff': gate, 'jump_assist': None,
               'stair_label': {'stair_label': 'STAIR set by the ToF stair state machine only; terrain-kind labels disabled'},
               'reward_kernel': {**reward, 'extensions': {**reward['extensions'], 'jump_push': 2., 'jump_missed': 1.}}}
+    target['course_schedule'] = {**source['course_schedule'], 'request_yaw_rate': 0.}
+    target['numerical_isolation'] = {
+        'contract': 'physx_finite_coordinate_sampling_row_isolation_v3', 'native_period_rad': 4 * math.pi,
+        'scope': 'finite ambiguous position/speed samples; reject the entire policy interval',
+        'rejected_rows': 'restore interval-start pose/joints with zero velocity, then normal episode reset',
+        'native_state_modified': 'rejected rows only; never used for learning', 'unknown_or_nonfinite_errors': 'raise'}
     for item, provenance in ((saved, source), (reference, target)):
         schema = StateSchema.from_dict({**saved['schema'], 'source': json.dumps(provenance)})
         item.update(schema=schema.to_dict(), schema_fingerprint=schema.fingerprint)
@@ -121,6 +131,11 @@ def test_handoff_keeps_physics_optimizers_counters_but_resets_reward_learning(tm
         else:
             assert migrated['replay']['storage'][name] is value
     assert report['legacy_gate_histories_inferred'] == 0 and report['guard_reset']
+    assert report['first_flight_records_added'] and report['legacy_flight_histories_inferred'] == 0
+    assert report['rejected_row_repair_added']
+    latch = migrated['replay']['storage']['jump_flight_latch']
+    assert latch.dtype == torch.int64 and (latch[..., 0] == -1).all() and not latch[..., 1:].any()
+    assert upgraded['jump_scenario']['flight_latch']
     assert report['teacher_qualification'] == ['flat-data-only']
     assert report['course']['sampler_credits_reset'] and not report['course']['coordinate_is_capability_promotion']
     course = upgraded['environment']['curriculum']
@@ -235,7 +250,8 @@ def test_legacy_curriculum_normalization_still_checks_the_pinned_source(tmp_path
 @pytest.mark.parametrize('damage', [
     'delay', 'wrench', 'runtime_sha', 'asset', 'assist', 'course_domain', 'course_sha', 'reward_native',
     'reward_code', 'recovery', 'stair_sensor', 'gate_unknown', 'gate_dtype', 'partial_data',
-    'teacher_weights', 'teacher_evaluation', 'teacher_old_pin', 'zero_warmup',
+    'teacher_weights', 'teacher_evaluation', 'teacher_old_pin', 'zero_warmup', 'latch_missing', 'latch_dtype',
+    'jump_schedule', 'retained_physics',
 ])
 def test_handoff_refuses_unmodeled_physics_or_unsupported_task_rebinding(tmp_path, damage):
     saved, dataset, reference, options, _ = fixture(tmp_path)
@@ -275,6 +291,14 @@ def test_handoff_refuses_unmodeled_physics_or_unsupported_task_rebinding(tmp_pat
         reference['replay']['storage']['jump_trigger_clock'] = reference['replay']['storage']['jump_trigger_clock'].float()
     elif damage == 'partial_data':
         reference['replay']['storage'].pop('ticks')
+    elif damage == 'latch_missing':
+        reference['replay']['storage'].pop('jump_flight_latch')
+    elif damage == 'latch_dtype':
+        reference['replay']['storage']['jump_flight_latch'] = reference['replay']['storage']['jump_flight_latch'].float()
+    elif damage == 'jump_schedule':
+        source['course_schedule']['early_jump_domain'] = [.03, .4]
+    elif damage == 'retained_physics':
+        source['numerical_isolation']['native_state_modified'] = 'all rows clipped'
     elif damage.startswith('teacher_'):
         payload = torch.load(options['target_teacher_path'], weights_only=True)
         if damage == 'teacher_weights':
