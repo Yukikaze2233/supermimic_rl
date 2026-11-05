@@ -24,6 +24,7 @@ class Native:
             clock_stage=self.tasks.stage, velocity_world_z_m_s=self.tasks.reference_vz,
             launch_velocity_m_s=self.tasks.launch)
         self.outcome = None   # scripted native decision applied by observe_physics
+        self._last_state = SimpleNamespace(angular_velocity_body_rad_s=torch.zeros(3, 3))
         self.tasks.observe_physics = lambda *args, **kwargs: self.outcome and self.outcome()
         self._terrain_course = SimpleNamespace(tasks=self.tasks)
         self.wrenches, self.native_calls = [], 0
@@ -217,8 +218,11 @@ def test_settling_ticks_after_a_correct_jump_are_split_by_native_condition():
     native.observe(velocity_z=.3)                             # grounded but still moving vertically
     native.observe()
     tasks.landed_s[0] = 1.2
+    native._last_state.angular_velocity_body_rad_s[:, 2] = .8   # a yaw wobble
     native.observe(angular_speed=.8)
     counters, _ = assist.metrics()
+    assert counters["course/jump_assist/settle_yaw_rate"] == 2
+    assert counters["course/jump_assist/settle_roll_pitch_rate"] == 3
     assert counters["course/jump_assist/settle_ticks"] == 3
     assert counters["course/jump_assist/settle_vertical_speed"] == 2
     assert counters["course/jump_assist/settle_angular_speed"] == 2

@@ -44,7 +44,8 @@ OUTCOMES = ('ended', 'success', 'liftoff', 'peak_low', 'peak_ok', 'peak_high')
 # and how many of them meet each native stable-landing condition; plus ended
 # requests by their longest uninterrupted stable streak (success needs 2 s).
 SETTLE = ('settle_ticks', 'settle_contact', 'settle_vertical_speed', 'settle_tilt', 'settle_angular_speed',
-          'settle_height', 'settle_all', 'streak_0.5s', 'streak_1.0s', 'streak_1.5s')
+          'settle_roll_pitch_rate', 'settle_yaw_rate', 'settle_height', 'settle_all',
+          'streak_0.5s', 'streak_1.0s', 'streak_1.5s')
 COUNTERS = ('assisted_requests', 'assisted_ended', 'assisted_success', 'unassisted_ended', 'unassisted_success',
             *(f'{who}{kind}_rise_{name}' for who in ('', 'unassisted_') for name in RISE_BINS
               for kind in OUTCOMES), *SETTLE)
@@ -163,8 +164,12 @@ class JumpAssist:
         self._count('assisted_requests', accepted & draw)
         self.request = current.clone()
 
-    def observe_settling(self, tasks, force, velocity_z, tilt, world_height, angular_speed):
-        """Per grounded tick after a correct real jump, which native stable-landing conditions hold."""
+    def observe_settling(self, tasks, force, velocity_z, tilt, world_height, angular_speed, angular_velocity_body):
+        """Per grounded tick after a correct real jump, which native stable-landing conditions hold.
+
+        The native quiet test bounds the norm of the body angular velocity; its
+        roll/pitch and yaw parts are also counted, against the same 0.5 rad/s.
+        """
         active = tasks.physical_id >= 0
         self.streak = torch.where(active, torch.maximum(self.streak, tasks.landed_s), self.streak)
         tolerance = torch.minimum(torch.full_like(tasks.active_rise, .03), tasks.active_rise * .5) + 1e-6
@@ -172,12 +177,15 @@ class JumpAssist:
                 & ~(force <= 2).all(-1) & ((tasks.peak_rise - tasks.active_rise).abs() <= tolerance))
         conditions = {'settle_contact': (force >= 5).all(-1), 'settle_vertical_speed': velocity_z.abs() <= .15,
                       'settle_tilt': tilt <= .25, 'settle_angular_speed': angular_speed <= .5,
+                      'settle_roll_pitch_rate': angular_velocity_body[:, :2].norm(dim=-1) <= .5,
+                      'settle_yaw_rate': angular_velocity_body[:, 2].abs() <= .5,
                       'settle_height': (world_height - tasks.ground_anchor - tasks.latched_height).abs() <= .05}
         self._count('settle_ticks', base)
         every = base
         for name, holds in conditions.items():
             self._count(name, base & holds)
-            every = every & holds
+            if name not in ('settle_roll_pitch_rate', 'settle_yaw_rate'):   # parts of the angular speed
+                every = every & holds
         self._count('settle_all', every)
 
     def record_success(self, before, tasks, lifted_before):
@@ -257,7 +265,9 @@ def install_jump_assist(native, curriculum, configuration: dict) -> JumpAssist:
         before = tasks.physical_id.long().clone()
         lifted = assist.lifted(before)
         result = observe_physics(force, velocity_z, tilt, world_height, **kwargs)
-        assist.observe_settling(tasks, force, velocity_z, tilt, world_height, kwargs['angular_speed_rad_s'])
+        # The native state of this substep, whose norm is the quiet test's angular speed.
+        assist.observe_settling(tasks, force, velocity_z, tilt, world_height, kwargs['angular_speed_rad_s'],
+                                native._last_state.angular_velocity_body_rad_s)
         # The latch was updated inside (and may have moved to a new request).
         lifted = lifted | assist.lifted(before)
         assist.record_success(before, tasks, lifted)
