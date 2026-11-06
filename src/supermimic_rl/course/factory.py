@@ -23,6 +23,9 @@ def _read_pinned(path, digest):
 
 def create_course(configuration):
     """Full45 history MLP course using the source FSM and exact static terrain."""
+    stair_timeout_retry = configuration.get("stair_timeout_retry", False)
+    if type(stair_timeout_retry) is not bool:
+        raise ValueError('Stair timeout retry must be a boolean')
     hint_lifetime = configuration.get("stair_height_hint_lifetime", "fixed")
     if hint_lifetime not in ("fixed", "request"):
         raise ValueError('Stair height hint lifetime must be fixed or request')
@@ -145,6 +148,9 @@ def create_course(configuration):
             from .stair_label import install_tof_stair_label
 
             stair_label_receipt = install_tof_stair_label(native, height_hint_lifetime=hint_lifetime)
+        from .stair_retry import install_stair_timeout_retry
+
+        stair_retry_receipt = install_stair_timeout_retry(native, enabled=stair_timeout_retry)
         jump_assist_receipt = None
         if configuration.get("jump_assist") is not None:
             if configuration.get("evaluation") is not None:
@@ -181,6 +187,8 @@ def create_course(configuration):
             "model_state": "full physical articulation, controller memories, local terrain scan, course memories",
             "native_execution_validated": False,
             "sdk_versions": {package: metadata.version(package) for package in strategy.sdk_packages}}
+        if stair_retry_receipt is not None:
+            provenance['stair_timeout_retry'] = stair_retry_receipt
         (log / "course-provenance.json").write_text(json.dumps(provenance, indent=2) + "\n")
         setup = {"action_contract": action_contract,
                  "materials": getattr(native._wheel_materials, "receipt", None),
