@@ -123,6 +123,7 @@ def test_imagination_advances_disturbances_without_changing_initial_actor_histor
         disturbance_config=config)
     start['disturbance'] = DisturbanceState(torch.tensor([.01, .03]),
         torch.tensor([.007, .012]), torch.zeros(2, 6), torch.ones(2)).encode()
+    start['disturbance_record_valid'] = torch.ones(2, 1)
     start = learner.imagination.prepare(start, 3)
     rng = torch.random.get_rng_state()
     assert learner.imagination.prepare(start, 3)['disturbance_uniform'] is start['disturbance_uniform']

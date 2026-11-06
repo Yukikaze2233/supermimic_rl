@@ -220,6 +220,8 @@ def policy_start_candidates(replay, config, env_ids, policy_dt_s):
             dynamic = horizon[:, 1]
         if not config.record_stair_source:
             known = known_horizon(horizon[:, 0], dynamic, goal, policy_dt_s) >= 1
+        if 'disturbance' in data:
+            ordinary &= data['disturbance_record_valid'][slots, env, 0] > .5
         replay._cache[key] = candidates[(data['reward_context_valid'][slots, env, 0] > .5) & ordinary & known]
     return replay._cache[key]
 
@@ -369,7 +371,9 @@ class OnlineTrainer:
         self.train_ids = list(range(environment.num_envs - held))
         self.validation_ids = list(range(environment.num_envs - held, environment.num_envs))
         self.auxiliary_world = (AuxiliaryWorldData(config.world_datasets, environment.schema, replay,
-            config.fit_horizon, seed=config.seed + 5) if config.world_datasets else None)
+            config.fit_horizon, seed=config.seed + 5,
+            disturbance_runtime_pairs=tuple(m['disturbance_runtime_pair'] for m in self.resume_migrations
+                                            if 'disturbance_runtime_pair' in m)) if config.world_datasets else None)
         if self.auxiliary_world is not None and saved is not None and saved.get('auxiliary_world') is not None:
             self.auxiliary_world.load_state_dict(saved['auxiliary_world'])
         if getattr(self, 'world_datasets_changed', None) is not None:

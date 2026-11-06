@@ -19,6 +19,7 @@ DISTURBANCE_STATE_FIELDS = (
 DISTURBANCE_RECORD_FIELDS = {
     "disturbance": (9,), "end_disturbance": (9,),
     "velocity_push": (3,), "external_wrench": (4, 6),
+    "disturbance_record_valid": (1,),
 }
 DISTURBANCE_NOISE_DIM = 4 + 4 * 7
 

@@ -224,4 +224,5 @@ class SnapshotLayout:
             record['end_disturbance'] = self.state.flat(end.state, DISTURBANCE_STATE_FIELDS)
             record['velocity_push'] = self.substep(transition.substeps, 'velocity_push_world')[:, 0]
             record['external_wrench'] = self.substep(transition.substeps, 'external_wrench_body')
+            record['disturbance_record_valid'] = state.new_ones(state.shape[0], 1)
         return record

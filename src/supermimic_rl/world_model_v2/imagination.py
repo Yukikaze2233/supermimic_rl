@@ -293,6 +293,8 @@ class Imagination:
         disturbance = task_features.get('disturbance_state')
         if (disturbance is None) != (self.disturbance_config is None):
             raise ValueError('Imagined disturbance state and configured schedule differ')
+        if disturbance is not None and not (start['disturbance_record_valid'] > .5).all():
+            raise ValueError('Imagination requires recorded disturbance clocks, not migrated placeholders')
         if (recovery is None) != (self.recovery_task is None):
             raise ValueError('Imagined recovery state and configured lifecycle differ')
         if (jump is None) != (self.jump_task is None):

@@ -11,6 +11,7 @@ import torch
 
 from ..contracts import StateSchema
 from .fitting import WorldModelFit
+from .migrations.disturbance import zero_disturbance_contract
 from .records import MODEL_CONTRACT
 from .replay import CompactReplay
 from .validation import validate
@@ -49,11 +50,12 @@ class AuxiliaryWorldData:
     recovery ring; checkpoints retain their pins, splits and sampling state.
     """
 
-    def __init__(self, configs, schema, live_replay, horizon, *, seed):
+    def __init__(self, configs, schema, live_replay, horizon, *, seed, disturbance_runtime_pairs=()):
         self.generator = torch.Generator().manual_seed(seed)
         self.validation_generator = torch.Generator().manual_seed(seed + 1)
         self.sources = []
         self.source_schemas = {}
+        self.derived_conditions = {}
         self.sampled = {}
         self.fields = WorldModelFit.RECORD_FIELDS + tuple(
             name for name in WorldModelFit.OPTIONAL_RECORD_FIELDS if name in live_replay.data)
@@ -68,9 +70,24 @@ class AuxiliaryWorldData:
             if (payload.get('format') != 'supermimic-world-v2-dataset-v1'
                     or payload.get('model_contract') != MODEL_CONTRACT
                     or payload.get('schema_fingerprint') != recorded_schema.fingerprint
-                    or not self._same_dynamics_contract(recorded_schema, schema)):
+                    or not self._same_dynamics_contract(recorded_schema, schema, disturbance_runtime_pairs)):
                 raise ValueError('Auxiliary world dataset contract differs: ' + config.name)
             replay = CompactReplay.from_state_dict(payload['replay'], 'cpu', read_only=True)
+            if 'velocity_push_world' not in {field.name for field in recorded_schema.substep_fields}:
+                # The contract comparison above permits this only for verified
+                # zero-disturbance history and a byte-audited runtime pair. Add
+                # dynamics conditions in memory; do not invent scheduler clocks
+                # or rewrite the immutable native data and its provenance.
+                derived = []
+                for name in ('velocity_push', 'external_wrench'):
+                    if name in self.fields:
+                        if name in replay.data:
+                            raise ValueError('Unrecorded disturbance field in auxiliary source: ' + name)
+                        replay.data[name] = torch.zeros(*replay.data['physical'].shape[:2],
+                            *live_replay.data[name].shape[2:], dtype=live_replay.data[name].dtype)
+                        derived.append(name)
+                if derived:
+                    self.derived_conditions[config.name] = derived
             if max((*config.train_env_ids, *config.validation_env_ids)) >= replay.num_envs:
                 raise ValueError('Auxiliary world environment ID exceeds the dataset')
             for name in self.fields:
@@ -87,12 +104,13 @@ class AuxiliaryWorldData:
             self.sampled[config.name] = 0
 
     @staticmethod
-    def _same_dynamics_contract(recorded, live):
+    def _same_dynamics_contract(recorded, live, disturbance_runtime_pairs=()):
         """Reward labels are unused here; keep their original provenance intact.
 
-        Only the analytic kernel hash and extension weights may differ. Physical
-        parameters, task clocks, observation/execution contracts and record layout
-        still match exactly. This exception does not apply to online Actor starts.
+        Analytic kernel hashes and extension weights are unused. A recorded
+        disturbance migration may also supply zero physical inputs for old
+        undisturbed data. Both exceptions preserve its original provenance and
+        do not apply to online Actor starts.
         """
         if recorded.fingerprint == live.fingerprint:
             return True
@@ -112,7 +130,8 @@ class AuxiliaryWorldData:
                                        if key not in ('kernel_sha256', 'extensions')}
             fields['source'] = source
             contracts.append(fields)
-        return contracts[0] == contracts[1]
+        return (contracts[0] == contracts[1]
+                or zero_disturbance_contract(*contracts, disturbance_runtime_pairs))
 
     def mix(self, windows):
         batch, horizon = windows['action'].shape[:2]
@@ -161,6 +180,7 @@ class AuxiliaryWorldData:
             report[source.name] = {'sha256': source.sha256,
                 'recorded_schema_fingerprint': self.source_schemas[source.name],
                 'reward_labels_used': False,
+                'verified_zero_conditions': self.derived_conditions.get(source.name, []),
                 'validation_env_ids': list(source.validation_env_ids),
                 'sampled_training_windows': self.sampled[source.name], 'prediction': prediction}
         return report
