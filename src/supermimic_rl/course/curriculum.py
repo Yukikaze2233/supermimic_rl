@@ -88,6 +88,9 @@ class CourseCurriculumConfig:
     # Reuse one fifth of the existing STEP_UP birth slots for the two named
     # authored assets. This is a birth quota, not the native random ceiling mask.
     foundation_authored_rehearsal: bool = False
+    # Six intermediate side-roll births replace alternate easy-pose slots;
+    # original difficult-pose and task-family shares remain unchanged.
+    recovery_roll_bridge: bool = False
 
     def __post_init__(self):
         budgets = tuple(self.stage_transition_budgets)
@@ -157,6 +160,8 @@ class CourseCurriculumConfig:
         object.__setattr__(self, "recovery_posture_stages", stages)
         if type(self.foundation_authored_rehearsal) is not bool:
             raise ValueError("foundation_authored_rehearsal must be boolean")
+        if type(self.recovery_roll_bridge) is not bool:
+            raise ValueError("recovery_roll_bridge must be boolean")
         if self.jump_standing_fraction_of_stage >= self.jump_full_motion_fraction_of_stage:
             raise ValueError("Jump moving exposure must follow standing exposure")
         object.__setattr__(self, "stage_transition_budgets", budgets)
@@ -178,6 +183,8 @@ class CourseCurriculumConfig:
         # A disabled opt-in must preserve old checkpoint configuration identity.
         if not self.foundation_authored_rehearsal:
             result.pop("foundation_authored_rehearsal")
+        if not self.recovery_roll_bridge:
+            result.pop("recovery_roll_bridge")
         return result
 
 
@@ -240,6 +247,13 @@ class SuperMimicCurriculum(FormalTaskCurriculum):
             "family": [0] * len(TaskFamily), "terrain": [0] * len(TerrainKind),
             "recovery_posture": [0] * len(RECOVERY_NAMES), "jump_motion": [0, 0],
         }
+        self._recovery_birth_variant = None
+        self._pending_recovery_variant = None
+        if config.recovery_roll_bridge:
+            from .recovery_bridge import RECOVERY_VARIANTS
+
+            self.sample_counts['recovery_posture'] = [0] * len(RECOVERY_VARIANTS)
+            self._recovery_birth_variant = torch.full((num_envs,), -1, dtype=torch.long, device=device)
         # A reset samples then routes within the same call. This transient row
         # receipt is never replayed across physical reset/checkpoint restore;
         # the persisted terrain ordinal determines the next draw exactly.
@@ -326,6 +340,7 @@ class SuperMimicCurriculum(FormalTaskCurriculum):
         trajectory, step = draw.trajectory_kind.clone(), draw.step_up_m.clone()
         rehearsal = (torch.zeros_like(draw.family, dtype=torch.bool)
                      if self.config.foundation_authored_rehearsal else None)
+        variants = (torch.full_like(draw.family, -1) if self.config.recovery_roll_bridge else None)
         for family in (TaskFamily.RECOVERY, TaskFamily.TERRAIN, TaskFamily.REQUEST):
             rows = (draw.family == int(family)).nonzero().flatten()
             if not len(rows):
@@ -336,6 +351,10 @@ class SuperMimicCurriculum(FormalTaskCurriculum):
                 names = self.recovery_posture_pool()
                 pool = posture.new_tensor([RECOVERY_NAMES.index(name) for name in names])
                 posture[rows] = pool[ordinal % len(pool)]
+                if variants is not None:
+                    from .recovery_bridge import select_variants
+
+                    posture[rows], variants[rows] = select_variants(ordinal, posture[rows], names)
                 nominal[rows], trajectory[rows] = False, 0
             elif family == TaskFamily.TERRAIN:
                 names = (self.config.foundation_terrain_kinds
@@ -382,6 +401,7 @@ class SuperMimicCurriculum(FormalTaskCurriculum):
                 self.sample_counts["jump_motion"][0] += int((~moving).sum())
                 self.sample_counts["jump_motion"][1] += int(moving.sum())
         self._pending_foundation_authored = rehearsal
+        self._pending_recovery_variant = variants
         return replace(draw, recovery_posture=posture, terrain_kind=terrain,
                        requested_command=command, nominal=nominal,
                        trajectory_kind=trajectory, step_up_m=step)
@@ -397,14 +417,27 @@ class SuperMimicCurriculum(FormalTaskCurriculum):
         if self._foundation_authored_rows is not None:
             self._foundation_authored_rows[ids] = self._pending_foundation_authored
             self._pending_foundation_authored = None
+        if self._recovery_birth_variant is not None:
+            self._recovery_birth_variant[ids] = self._pending_recovery_variant
         for name, values in (
             ("family", draw.family),
             ("terrain", draw.terrain_kind[draw.family == int(TaskFamily.TERRAIN)]),
-            ("recovery_posture", draw.recovery_posture[draw.family == int(TaskFamily.RECOVERY)]),
+            ("recovery_posture", (draw.recovery_posture if self._pending_recovery_variant is None
+                                  else self._pending_recovery_variant)[draw.family == int(TaskFamily.RECOVERY)]),
         ):
             counts = torch.bincount(values, minlength=len(self.sample_counts[name])).cpu().tolist()
             self.sample_counts[name] = [a + b for a, b in zip(self.sample_counts[name], counts)]
+        self._pending_recovery_variant = None
         return draw
+
+    def recovery_birth_variants(self, ids):
+        """Actual latest birth labels, distinct from reused native base-pose IDs."""
+        if self._recovery_birth_variant is None:
+            raise ValueError('Recovery roll bridge is disabled')
+        labels = self._recovery_birth_variant[ids]
+        if (labels < 0).any():
+            raise ValueError('A recovery birth must have a current sampler label')
+        return labels.clone()
 
     def foundation_authored_rehearsal_receipt(self):
         if not self.config.foundation_authored_rehearsal:
@@ -462,3 +495,6 @@ class SuperMimicCurriculum(FormalTaskCurriculum):
         if self._foundation_authored_rows is not None:
             self._foundation_authored_rows.zero_()
             self._pending_foundation_authored = None
+        if self._recovery_birth_variant is not None:
+            self._recovery_birth_variant.fill_(-1)
+            self._pending_recovery_variant = None

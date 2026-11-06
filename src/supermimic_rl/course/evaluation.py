@@ -253,6 +253,11 @@ class FixedCourseScenarios:
         # Reuse the already installed sampler, preparation and sensor objects.
         # Calling env.set_task_sampler again would replace recovery components.
         tasks = self.env._terrain_course.tasks
+        bridge = getattr(self.env, 'supermimic_recovery_bridge', None)
+        if bridge is not None:
+            # Every installed fixed plan uses the original endpoints,
+            # independently of how the plan was created.
+            self._install(bridge, 'evaluation', True)
         original_tracking = tasks.begin_tracking
 
         def begin_tracking(mask):

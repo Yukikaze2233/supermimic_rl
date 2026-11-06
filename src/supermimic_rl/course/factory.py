@@ -129,6 +129,10 @@ def create_course(configuration):
         curriculum = make_course_curriculum(configuration["num_envs"], configuration["device"],
                                             configuration.get("seed", 7), course_configuration)
         native.set_task_sampler(LabTaskDrawSampler(curriculum))
+        from .recovery_bridge import install_recovery_roll_bridge
+
+        recovery_bridge_receipt = install_recovery_roll_bridge(
+            native, curriculum, log, evaluation=configuration.get('evaluation') is not None)
         # The native sampler installation creates LabTerrainCourse and its
         # jump task owner; the environment constructor leaves it unset.
         reward_kernel_receipt = install_shared_reward(
@@ -189,6 +193,8 @@ def create_course(configuration):
             "sdk_versions": {package: metadata.version(package) for package in strategy.sdk_packages}}
         if stair_retry_receipt is not None:
             provenance['stair_timeout_retry'] = stair_retry_receipt
+        if recovery_bridge_receipt is not None:
+            provenance['recovery_roll_bridge'] = recovery_bridge_receipt
         (log / "course-provenance.json").write_text(json.dumps(provenance, indent=2) + "\n")
         setup = {"action_contract": action_contract,
                  "materials": getattr(native._wheel_materials, "receipt", None),

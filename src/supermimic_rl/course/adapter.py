@@ -372,6 +372,11 @@ class CourseAdapter(IsaacAdapter):
         state["gimbal.velocity_rad_s"] = state["joint_velocity_native"][:, indices].clone()
         state["gimbal.yaw_sin_cos"] = self._gimbal_sensors.instantaneous()[:, :2]
         self._capture_course(state, context, clock)
+        bridge = getattr(env, 'supermimic_recovery_bridge', None)
+        if bridge is not None and not terminal:
+            base = self.body_names.index('base_link')
+            bridge.record_births(self._episode_id, clock, state['body_link_pose_world_xyzw'][:, base],
+                                 state['body_com_pose_world_xyzw'][:, base, 2])
         owned = state["target.control_source"].eq(0)
         if env._recovery_preparation is not None:
             owned &= ~env._recovery_preparation.active

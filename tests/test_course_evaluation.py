@@ -674,3 +674,20 @@ def test_authored_events_keep_row_identity_through_finish_and_reset():
         evaluator.close()
     assert evidence.observe.__func__ is original_observe
     assert not {"observe", "reset", "_finish"} & evidence.__dict__.keys()
+
+
+def test_fixed_plan_disables_bridge_even_without_factory_evaluation_config(adapter):
+    bridge = SimpleNamespace(evaluation=False)
+    adapter.env.supermimic_recovery_bridge = bridge
+    plan = FixedCourseScenarios(adapter, CourseEvaluationConfig(family='RECOVERY'))
+    plan.install()
+    try:
+        assert bridge.evaluation is True
+        ids = torch.arange(adapter.num_envs)
+        sample = adapter.env._task_sampler(ids)
+        assert (sample.draw.recovery_posture < 16).all()
+        assert all('side_45' not in name and 'side_60' not in name and 'side_75' not in name
+                   for name in plan.row_names)
+    finally:
+        plan.close()
+    assert bridge.evaluation is False
