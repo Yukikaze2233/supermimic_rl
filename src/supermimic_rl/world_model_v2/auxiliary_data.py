@@ -52,7 +52,7 @@ class AuxiliaryWorldData:
     """
 
     def __init__(self, configs, schema, live_replay, horizon, *, seed, disturbance_runtime_pairs=(),
-                 terrain_migrations=()):
+                 terrain_migrations=(), course_migrations=()):
         self.generator = torch.Generator().manual_seed(seed)
         self.validation_generator = torch.Generator().manual_seed(seed + 1)
         self.sources = []
@@ -74,7 +74,7 @@ class AuxiliaryWorldData:
                     or payload.get('model_contract') != MODEL_CONTRACT
                     or payload.get('schema_fingerprint') != recorded_schema.fingerprint
                     or not self._same_dynamics_contract(recorded_schema, schema, disturbance_runtime_pairs,
-                                                        terrain_migrations)):
+                                                        terrain_migrations, course_migrations)):
                 raise ValueError('Auxiliary world dataset contract differs: ' + config.name)
             replay = CompactReplay.from_state_dict(payload['replay'], 'cpu', read_only=True)
             if terrain_migrations:
@@ -116,13 +116,15 @@ class AuxiliaryWorldData:
             self.sampled[config.name] = 0
 
     @staticmethod
-    def _same_dynamics_contract(recorded, live, disturbance_runtime_pairs=(), terrain_migrations=()):
+    def _same_dynamics_contract(recorded, live, disturbance_runtime_pairs=(), terrain_migrations=(),
+                               course_migrations=()):
         """Reward labels are unused here; keep their original provenance intact.
 
         Analytic kernel hashes and extension weights are unused. A recorded
         disturbance migration may also supply zero physical inputs for old
         undisturbed data. Both exceptions preserve its original provenance and
-        do not apply to online Actor starts.
+        do not apply to online Actor starts. Verified future-sampling changes
+        retain each historical task parameter and the original dataset split.
         """
         if recorded.fingerprint == live.fingerprint:
             return True
@@ -142,6 +144,11 @@ class AuxiliaryWorldData:
                                        if key not in ('kernel_sha256', 'extensions')}
             fields['source'] = source
             contracts.append(fields)
+        if course_migrations:
+            from .migrations.course import compatible_course_source
+
+            contracts[1]['source'] = compatible_course_source(
+                contracts[0]['source'], contracts[1]['source'], course_migrations)
         contracts[1]['source'], _ = compatible_terrain_source(
             contracts[0]['source'], contracts[1]['source'], terrain_migrations)
         return (contracts[0] == contracts[1]

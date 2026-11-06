@@ -14,6 +14,7 @@ import math
 import torch
 from torch import Tensor, nn
 
+from .dynamics import MODEL_FIT_PRECISIONS
 from .fitting import WorldModelFit
 from .imagination import Critic, Imagined, Imagination, InvalidImagination
 from .model import WorldModelV2
@@ -44,10 +45,14 @@ class LearningConfig:
     # start histories. Imagination may improve the student only near the
     # teacher, where the world model has data. 0 disables it.
     anchor_coefficient: float = 0.
+    # CUDA motion-MLP fitting only; policy imagination and CPU remain FP32.
+    model_fit_precision: str = 'float32'
 
     def __post_init__(self):
         if not math.isfinite(self.anchor_coefficient) or self.anchor_coefficient < 0:
             raise ValueError('Anchor coefficient must be finite and nonnegative')
+        if self.model_fit_precision not in MODEL_FIT_PRECISIONS:
+            raise ValueError('Model fit precision must be float32 or bfloat16')
 
 
 @torch.no_grad()
@@ -134,7 +139,8 @@ class Learner:
         # Statistics keep seeing the current real course distribution. They
         # are never updated with imagined states or during a backward graph.
         self.fit.observe(windows)
-        terms = self.fit.terms(windows)
+        with self.model.motion.fitting_precision(self.config.model_fit_precision):
+            terms = self.fit.terms(windows)
         updated = self._step("model", terms.state + terms.ticks)
         return {"model/updated": updated, "model/state": float(terms.state.detach()),
                 "model/ticks": float(terms.ticks.detach()), "model/skipped": self.skipped["model"],

@@ -100,8 +100,8 @@ def export_ppo_teacher_payload(checkpoint, evaluation_path, qualified_for):
             'mean_squash': config.mean_squash}
 
 
-def load_native_teacher(path, expected_sha256, *, device, native_provenance):
-    """Load the qualified own MLP artifact or retain the existing CP18026 bridge."""
+def load_native_teacher(path, expected_sha256, *, device, native_provenance, course_migrations=()):
+    """Load pinned weights; sampling compatibility never expands qualification."""
     path = Path(path).resolve(strict=True)
     if file_sha256(path) != expected_sha256:
         raise ValueError('Native teacher checkpoint SHA256 differs')
@@ -120,7 +120,12 @@ def load_native_teacher(path, expected_sha256, *, device, native_provenance):
                 or not source.get('qualified_for')):
             raise ValueError('Own PPO teacher deployment contract differs')
         native = json.loads(_native_schema_source(native_provenance))
-        if source['native_source'] != native:
+        compatible = native
+        if course_migrations:
+            from .migrations.course import compatible_course_source
+
+            compatible = compatible_course_source(source['native_source'], native, course_migrations)
+        if source['native_source'] != compatible:
             raise ValueError('Own PPO teacher evaluation and native collection source differ')
         if tuple(source['action_bounds']) != action_bounds_from_source(native):
             raise ValueError('Own PPO teacher action bounds differ from the native collection')

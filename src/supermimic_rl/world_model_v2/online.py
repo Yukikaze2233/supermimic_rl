@@ -356,6 +356,11 @@ class OnlineTrainer:
             self.resume_migrations.append({'jump_height_progression': self.jump_height_progression_changed,
                 'learner_replay_rng_preserved': True, 'additional_warmup_cycles': 0,
                 'scope': 'Future height sampling only; gate verdicts and course clocks preserved'})
+        if getattr(self, 'model_fit_precision_changed', None):
+            self.resume_migrations.append({'model_fit_precision': self.model_fit_precision_changed,
+                'learner_replay_rng_preserved': True, 'additional_warmup_cycles': 0,
+                'scope': 'CUDA motion MLP fitting arithmetic only; FP32 parameters, optimizer state, '
+                         'normalizers, analytic modules and policy imagination preserved'})
         self.task_norm_pending = bool(saved.get('task_norm_pending', False)) if saved is not None else False
         self.critic_norm_from = saved.get('critic_norm_from') if saved is not None else None
         self.collector = Collector(environment, self.mixing, capacity_steps=config.replay_steps, replay=replay,
@@ -375,7 +380,10 @@ class OnlineTrainer:
             disturbance_runtime_pairs=tuple(m['disturbance_runtime_pair'] for m in self.resume_migrations
                                             if 'disturbance_runtime_pair' in m),
             terrain_migrations=tuple(m['terrain_repair'] for m in self.resume_migrations
-                                     if 'terrain_repair' in m)) if config.world_datasets else None)
+                                     if 'terrain_repair' in m),
+            course_migrations=tuple(m['course_sampling'] for m in self.resume_migrations
+                                    if isinstance(m, dict) and 'course_sampling' in m))
+            if config.world_datasets else None)
         if self.auxiliary_world is not None and saved is not None and saved.get('auxiliary_world') is not None:
             self.auxiliary_world.load_state_dict(saved['auxiliary_world'])
         if getattr(self, 'world_datasets_changed', None) is not None:
@@ -447,6 +455,9 @@ class OnlineTrainer:
                 or saved['schema_fingerprint'] != self.env.schema.fingerprint):
             raise ValueError('Online checkpoint contract differs')
         configuration, requested = asdict(OnlineConfig.from_dict(saved['config'])), asdict(self.config)
+        before = configuration['learning'].pop('model_fit_precision')
+        after = requested['learning'].pop('model_fit_precision')
+        self.model_fit_precision_changed = None if before == after else {'before': before, 'after': after}
         before, after = configuration.pop('world_datasets'), requested.pop('world_datasets')
         self.world_datasets_changed = None if before == after else {'before': before, 'after': after}
         before, after = configuration.pop('actor_features'), requested.pop('actor_features')
