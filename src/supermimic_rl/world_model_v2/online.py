@@ -390,16 +390,15 @@ class OnlineTrainer:
             raise ValueError('Online learning needs distinct training and validation environment rows')
         self.train_ids = list(range(environment.num_envs - held))
         self.validation_ids = list(range(environment.num_envs - held, environment.num_envs))
+        from .migrations.source_lineage import source_lineage_from_saved
+
         self.auxiliary_world = (AuxiliaryWorldData(config.world_datasets, environment.schema, replay,
             config.fit_horizon, seed=config.seed + 5,
             disturbance_runtime_pairs=tuple(m['disturbance_runtime_pair'] for m in self.resume_migrations
                                             if 'disturbance_runtime_pair' in m),
             terrain_migrations=tuple(m['terrain_repair'] for m in self.resume_migrations
                                      if 'terrain_repair' in m),
-            course_migrations=tuple(m['course_sampling'] for m in self.resume_migrations
-                                    if isinstance(m, dict) and 'course_sampling' in m),
-            stair_hint_migrations=tuple(m['stair_hint'] for m in self.resume_migrations
-                                        if isinstance(m, dict) and 'stair_hint' in m))
+            source_lineage=source_lineage_from_saved(saved, environment.schema) if saved is not None else ())
             if config.world_datasets else None)
         if self.auxiliary_world is not None and saved is not None and saved.get('auxiliary_world') is not None:
             self.auxiliary_world.load_state_dict(saved['auxiliary_world'])

@@ -19,59 +19,23 @@ def read_actor(path, device):
     return load_student_actor(path, device)
 
 
-def read_course_migrations(path, schema):
-    """Read verified sampling receipts only from this native recovery contract.
-
-    The model file is mapped read-only; loading compatibility never reads or
-    copies the online replay. Full learner/replay restore still belongs to the
-    trainer, including its exact task-signature checks.
-    """
+def read_source_lineage(path, schema):
+    """Read authenticated source receipts from the small model file only."""
     if path is None:
         return ()
-    from supermimic_rl.contracts import StateSchema
-    from supermimic_rl.world_model_v2.migrations.course import (
-        FORMAT, IDENTITY_KEYS, verify_course_sampling,
-    )
-    from supermimic_rl.world_model_v2.records import MODEL_CONTRACT
+    from supermimic_rl.world_model_v2.migrations.source_lineage import source_lineage_from_saved
 
     saved = torch.load(path, map_location='cpu', weights_only=True, mmap=True)
-    if (not isinstance(saved, dict) or saved.get('format') != 'supermimic-online-v2'
-            or saved.get('model_contract') != MODEL_CONTRACT
-            or not isinstance(saved.get('schema'), dict)
-            or not isinstance(saved.get('learner'), dict) or 'optimizers' not in saved['learner']
-            or not isinstance(saved.get('environment'), dict) or not isinstance(saved.get('config'), dict)
-            or not isinstance(saved.get('replay_file'), str) or not saved['replay_file']
-            or type(saved.get('cycle')) is not int or saved['cycle'] < 0):
-        raise ValueError('Course compatibility requires a complete online recovery checkpoint')
-    recorded = StateSchema.from_dict(saved['schema'])
-    if saved.get('schema_fingerprint') != recorded.fingerprint or recorded.fingerprint != schema.fingerprint:
-        raise ValueError('Resume compatibility schema differs from the complete native contract')
-    ledger = saved.get('resume_migrations', ())
-    if not isinstance(ledger, (tuple, list)):
-        raise ValueError('Online migration ledger must be a sequence')
-    proofs = []
-    for entry in ledger:
-        if not isinstance(entry, dict) or not ('course_sampling' in entry or entry.get('migration') == FORMAT):
-            continue
-        proof = entry.get('course_sampling')
-        if (entry.get('migration') != FORMAT or not isinstance(proof, dict)
-                or type(entry.get('cycle')) is not int or not 0 <= entry['cycle'] <= saved['cycle']):
-            raise ValueError('Unrecognized course sampling migration record')
-        try:
-            checked = verify_course_sampling(proof['before'], proof['after'],
-                source_course=proof['source_course_utf8'].encode('utf-8'),
-                target_course=proof['target_course_utf8'].encode('utf-8'))
-        except (KeyError, TypeError, AttributeError) as error:
-            raise ValueError('Incomplete course sampling migration receipt') from error
-        if checked != proof:
-            raise ValueError('Course sampling receipt differs from its authenticated bytes')
-        proofs.append(proof)
-    identity = json.loads(recorded.source)
-    for proof in reversed(proofs):
-        if any(identity.get(key) != proof['after'].get(key) for key in IDENTITY_KEYS):
-            raise ValueError('Course sampling ledger does not reach the native course identity')
-        identity.update(proof['before'])
-    return tuple(proofs)
+    return source_lineage_from_saved(saved, schema)
+
+
+def read_course_migrations(path, schema):
+    """Keep the legacy sampling-only reader output for existing callers."""
+    if path is None:
+        return ()
+    from supermimic_rl.world_model_v2.migrations.course import FORMAT
+
+    return tuple(proof for proof in read_source_lineage(path, schema) if proof['format'] == FORMAT)
 
 
 def exit_native_failure(output, error):
@@ -142,9 +106,9 @@ def main():
             if args.command == 'train':
                 from supermimic_rl.world_model_v2.online import OnlineConfig, OnlineTrainer
                 from supermimic_rl.world_model_v2.teacher import load_native_teacher, native_teacher_decision
-                course_migrations = read_course_migrations(args.resume, env.schema)
+                source_lineage = read_source_lineage(args.resume, env.schema)
                 teacher = load_native_teacher(args.teacher, args.teacher_sha256,
-                    device=env.device, native_provenance=adapter.provenance, course_migrations=course_migrations)
+                    device=env.device, native_provenance=adapter.provenance, source_lineage=source_lineage)
 
                 def teacher_decision():
                     return native_teacher_decision(teacher, env)

@@ -52,7 +52,7 @@ class AuxiliaryWorldData:
     """
 
     def __init__(self, configs, schema, live_replay, horizon, *, seed, disturbance_runtime_pairs=(),
-                 terrain_migrations=(), course_migrations=(), stair_hint_migrations=()):
+                 terrain_migrations=(), course_migrations=(), stair_hint_migrations=(), source_lineage=()):
         self.generator = torch.Generator().manual_seed(seed)
         self.validation_generator = torch.Generator().manual_seed(seed + 1)
         self.sources = []
@@ -75,7 +75,7 @@ class AuxiliaryWorldData:
                     or payload.get('schema_fingerprint') != recorded_schema.fingerprint
                     or not self._same_dynamics_contract(recorded_schema, schema, disturbance_runtime_pairs,
                                                         terrain_migrations, course_migrations,
-                                                        stair_hint_migrations)):
+                                                        stair_hint_migrations, source_lineage)):
                 raise ValueError('Auxiliary world dataset contract differs: ' + config.name)
             replay = CompactReplay.from_state_dict(payload['replay'], 'cpu', read_only=True)
             if terrain_migrations:
@@ -118,7 +118,7 @@ class AuxiliaryWorldData:
 
     @staticmethod
     def _same_dynamics_contract(recorded, live, disturbance_runtime_pairs=(), terrain_migrations=(),
-                               course_migrations=(), stair_hint_migrations=()):
+                               course_migrations=(), stair_hint_migrations=(), source_lineage=()):
         """Reward labels are unused here; keep their original provenance intact.
 
         Analytic kernel hashes and extension weights are unused. A recorded
@@ -143,16 +143,25 @@ class AuxiliaryWorldData:
             kernel = source.get('reward_kernel')
             if not isinstance(kernel, dict) or kernel.get('implementation') != 'shared_physical_reward_densities':
                 return False
-            source['reward_kernel'] = {key: value for key, value in kernel.items()
-                                       if key not in ('kernel_sha256', 'extensions')}
             fields['source'] = source
             contracts.append(fields)
-        if course_migrations:
+        if source_lineage:
+            from .migrations.source_lineage import compatible_source_lineage
+
+            contracts[1]['source'] = compatible_source_lineage(
+                contracts[0]['source'], contracts[1]['source'], source_lineage)
+        # Full-source proofs must run before dynamics-only reward fields are
+        # omitted; otherwise an authenticated after source could never match.
+        for fields in contracts:
+            kernel = fields['source']['reward_kernel']
+            fields['source']['reward_kernel'] = {key: value for key, value in kernel.items()
+                                                 if key not in ('kernel_sha256', 'extensions')}
+        if course_migrations and not source_lineage:
             from .migrations.course import compatible_course_source
 
             contracts[1]['source'] = compatible_course_source(
                 contracts[0]['source'], contracts[1]['source'], course_migrations)
-        if stair_hint_migrations:
+        if stair_hint_migrations and not source_lineage:
             from .migrations.stair_hint import compatible_stair_hint_source
 
             contracts[1]['source'] = compatible_stair_hint_source(
