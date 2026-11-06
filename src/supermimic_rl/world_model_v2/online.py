@@ -19,6 +19,7 @@ from ..contracts import StateSchema
 from ..chassis_observation import COMMAND_CONTRACTS, HEADING_COMMANDS, LEGACY_COMMANDS
 from ..formal_observation import known_horizon
 from ..runtime import atomic_save
+from .auxiliary_data import AuxiliaryWorldData, WorldDatasetConfig
 from .collection import Collector
 from .course_progression import CourseProgression, CourseProgressionConfig
 from .factory import make_learner
@@ -82,6 +83,7 @@ class OnlineConfig:
     estimator_hidden: tuple[int, ...] = (128, 64)
     critic_hidden: tuple[int, ...] = (256, 128)
     learning: LearningConfig = field(default_factory=LearningConfig)
+    world_datasets: tuple[WorldDatasetConfig, ...] = ()
     # A fresh run may copy a PPO actor (same 5x35 interface and bounds) into the student.
     initial_actor: str | None = None
     initial_actor_sha256: str | None = None
@@ -111,12 +113,19 @@ class OnlineConfig:
             if key in value:
                 value[key] = tuple(value[key])
         value['learning'] = LearningConfig(**value.get('learning', {}))
+        value['world_datasets'] = tuple(WorldDatasetConfig(**item) for item in value.get('world_datasets', ()))
         if value.get('course_progression') is not None:
             value['course_progression'] = CourseProgressionConfig(**value['course_progression'])
         return cls(**value)
 
     def __post_init__(self):
         from ..actor_features import actor_feature_config
+        sources = tuple(self.world_datasets)
+        if (any(not isinstance(source, WorldDatasetConfig) for source in sources)
+                or len({source.name for source in sources}) != len(sources)
+                or sum(source.fraction for source in sources) >= 1):
+            raise ValueError('Auxiliary world sources need distinct names and total fraction below one')
+        object.__setattr__(self, 'world_datasets', sources)
         actor_feature_config(self.actor_features)
         if self.actor_features is not None and (self.actor_frame_dim != 35 or not self.record_jumps):
             raise ValueError('Actor reference features require the 35D actor and recorded jump tasks')
@@ -354,6 +363,13 @@ class OnlineTrainer:
             raise ValueError('Online learning needs distinct training and validation environment rows')
         self.train_ids = list(range(environment.num_envs - held))
         self.validation_ids = list(range(environment.num_envs - held, environment.num_envs))
+        self.auxiliary_world = (AuxiliaryWorldData(config.world_datasets, environment.schema, replay,
+            config.fit_horizon, seed=config.seed + 5) if config.world_datasets else None)
+        if self.auxiliary_world is not None and saved is not None and saved.get('auxiliary_world') is not None:
+            self.auxiliary_world.load_state_dict(saved['auxiliary_world'])
+        if getattr(self, 'world_datasets_changed', None) is not None:
+            self.resume_migrations.append({'world_datasets': self.world_datasets_changed,
+                'scope': 'Auxiliary dynamics windows only; live replay and all learner states preserved'})
         self._initialize_guard(saved)
         if saved is not None:
             self.collector.steps = saved['collection_steps']
@@ -420,6 +436,8 @@ class OnlineTrainer:
                 or saved['schema_fingerprint'] != self.env.schema.fingerprint):
             raise ValueError('Online checkpoint contract differs')
         configuration, requested = asdict(OnlineConfig.from_dict(saved['config'])), asdict(self.config)
+        before, after = configuration.pop('world_datasets'), requested.pop('world_datasets')
+        self.world_datasets_changed = None if before == after else {'before': before, 'after': after}
         before, after = configuration.pop('actor_features'), requested.pop('actor_features')
         self.actor_features_activated = before != after
         if self.actor_features_activated and (before is not None or after is None):
@@ -499,7 +517,8 @@ class OnlineTrainer:
         if staging is not None:
             # Wait once after all transfers, before reusing pinned host storage.
             torch.cuda.current_stream(self.device).synchronize()
-        return moved
+        auxiliary = getattr(self, 'auxiliary_world', None)
+        return moved if auxiliary is None else auxiliary.mix(moved)
 
     @torch.no_grad()
     def initialize_added_critic_norm(self):
@@ -563,6 +582,8 @@ class OnlineTrainer:
             'validation_rng': self.validation_generator.get_state(),
             'sample_rng_device': str(self.generator.device),
             'validation_rng_device': str(self.validation_generator.device),
+            'auxiliary_world': (None if getattr(self, 'auxiliary_world', None) is None
+                                else self.auxiliary_world.state_dict()),
             'cuda_rng': torch.cuda.get_rng_state_all() if torch.cuda.is_available() else []}
         checkpoint = f'resume-{slot}.pt'
         atomic_save(payload, self.output / checkpoint)
@@ -611,6 +632,8 @@ class OnlineTrainer:
             self._write_json(self.output / 'progress.json', {'cycle': cycle, 'phase': 'world', 'completed': 0,
                                                             'requested': cfg.model_updates})
             world = []
+            auxiliary = getattr(self, 'auxiliary_world', None)
+            auxiliary_before = {} if auxiliary is None else auxiliary.sampled.copy()
             for index in range(cfg.model_updates):
                 windows = self.sample_windows(cfg.model_batch_size, cfg.fit_horizon)
                 world.append(learner.fit_model(windows))
@@ -642,6 +665,8 @@ class OnlineTrainer:
                 'world': {key: sum(row[key] for row in world) / len(world) for key in world[0]},
                 'policy': {key: sum(row[key] for row in policy) / len(policy) for key in policy[0]},
                 'updates': learner.updates.copy(), 'skipped': learner.skipped.copy(),
+                **({} if auxiliary is None else {'auxiliary_world_windows': {
+                    name: count - auxiliary_before[name] for name, count in auxiliary.sampled.items()}}),
                 **({} if guard is None else {'guard': guard}),
                 **({} if course is None else {'course': course}),
                 **({} if floor_report is None else {'contact_floor': {
@@ -676,6 +701,9 @@ class OnlineTrainer:
                     if floor_report is not None:
                         validation['contact_floor'] = floor_report
                     self._write_json(self.output / f'world-validation-{cycle:06d}.json', validation)
+                    if auxiliary is not None:
+                        self._write_json(self.output / f'auxiliary-world-validation-{cycle:06d}.json',
+                                         auxiliary.validate(learner, cfg, self.device))
                 finally:
                     # A diagnostic failure must not discard the completed cycle
                     # that is needed to reproduce it. Preserve state, then raise.
