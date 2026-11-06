@@ -1,4 +1,4 @@
-"""Requested peak progress must remove small-hop profit without changing other tasks."""
+"""Retain requested-peak progress after a small hop without changing other tasks."""
 from dataclasses import replace
 
 import pytest
