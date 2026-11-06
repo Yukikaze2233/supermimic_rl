@@ -12,6 +12,7 @@ import torch
 from ..contracts import StateSchema
 from .fitting import WorldModelFit
 from .migrations.disturbance import zero_disturbance_contract
+from .migrations.terrain import compatible_terrain_source, exclude_changed_tiles
 from .records import MODEL_CONTRACT
 from .replay import CompactReplay
 from .validation import validate
@@ -50,12 +51,14 @@ class AuxiliaryWorldData:
     recovery ring; checkpoints retain their pins, splits and sampling state.
     """
 
-    def __init__(self, configs, schema, live_replay, horizon, *, seed, disturbance_runtime_pairs=()):
+    def __init__(self, configs, schema, live_replay, horizon, *, seed, disturbance_runtime_pairs=(),
+                 terrain_migrations=()):
         self.generator = torch.Generator().manual_seed(seed)
         self.validation_generator = torch.Generator().manual_seed(seed + 1)
         self.sources = []
         self.source_schemas = {}
         self.derived_conditions = {}
+        self.terrain_exclusions = {}
         self.sampled = {}
         self.fields = WorldModelFit.RECORD_FIELDS + tuple(
             name for name in WorldModelFit.OPTIONAL_RECORD_FIELDS if name in live_replay.data)
@@ -70,9 +73,18 @@ class AuxiliaryWorldData:
             if (payload.get('format') != 'supermimic-world-v2-dataset-v1'
                     or payload.get('model_contract') != MODEL_CONTRACT
                     or payload.get('schema_fingerprint') != recorded_schema.fingerprint
-                    or not self._same_dynamics_contract(recorded_schema, schema, disturbance_runtime_pairs)):
+                    or not self._same_dynamics_contract(recorded_schema, schema, disturbance_runtime_pairs,
+                                                        terrain_migrations)):
                 raise ValueError('Auxiliary world dataset contract differs: ' + config.name)
             replay = CompactReplay.from_state_dict(payload['replay'], 'cpu', read_only=True)
+            if terrain_migrations:
+                _, changed_tiles = compatible_terrain_source(
+                    json.loads(recorded_schema.source), json.loads(schema.source), terrain_migrations)
+                if changed_tiles:
+                    valid, excluded = exclude_changed_tiles(replay.data, changed_tiles)
+                    replay.data['valid'] = valid
+                    self.terrain_exclusions[config.name] = {
+                        'changed_tiles': changed_tiles, 'historical_intervals_excluded': excluded}
             if 'velocity_push_world' not in {field.name for field in recorded_schema.substep_fields}:
                 # The contract comparison above permits this only for verified
                 # zero-disturbance history and a byte-audited runtime pair. Add
@@ -104,7 +116,7 @@ class AuxiliaryWorldData:
             self.sampled[config.name] = 0
 
     @staticmethod
-    def _same_dynamics_contract(recorded, live, disturbance_runtime_pairs=()):
+    def _same_dynamics_contract(recorded, live, disturbance_runtime_pairs=(), terrain_migrations=()):
         """Reward labels are unused here; keep their original provenance intact.
 
         Analytic kernel hashes and extension weights are unused. A recorded
@@ -130,6 +142,8 @@ class AuxiliaryWorldData:
                                        if key not in ('kernel_sha256', 'extensions')}
             fields['source'] = source
             contracts.append(fields)
+        contracts[1]['source'], _ = compatible_terrain_source(
+            contracts[0]['source'], contracts[1]['source'], terrain_migrations)
         return (contracts[0] == contracts[1]
                 or zero_disturbance_contract(*contracts, disturbance_runtime_pairs))
 
@@ -181,6 +195,7 @@ class AuxiliaryWorldData:
                 'recorded_schema_fingerprint': self.source_schemas[source.name],
                 'reward_labels_used': False,
                 'verified_zero_conditions': self.derived_conditions.get(source.name, []),
+                'terrain_source_exclusions': self.terrain_exclusions.get(source.name),
                 'validation_env_ids': list(source.validation_env_ids),
                 'sampled_training_windows': self.sampled[source.name], 'prediction': prediction}
         return report

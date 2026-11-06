@@ -42,3 +42,19 @@ atlas or relabel an old replay as newly collected data. Any training handoff
 must update the atlas, runtime and routing pins together, retain complete
 optimizer/checkpoint state, and explicitly account for old samples from the
 changed terrain. The repair tool neither changes training nor filters samples.
+
+`world_model_v2.migrations.terrain.upgrade_terrain` performs that explicit
+checkpoint conversion. It authenticates both runtimes/manifests and compares
+the actual geometry arrays, allowing only reversed vertical triangles. It
+retains all learned parameters, optimizer moments, normalization, random
+streams and task clocks. Historical physical labels remain present; the new
+replay's eligibility excludes intervals routed to a changed tile. The source
+pair remains the record of their original eligibility. This is a physical
+source change, not a force threshold or a success filter.
+
+Auxiliary data retains its original file/hash and train/validation partition.
+Only the registered source-to-target terrain/runtime mapping is accepted,
+composed with an existing verified zero-disturbance mapping when necessary.
+Changed-tile intervals are likewise excluded in memory; unchanged flat-flight
+data and its sampler RNG remain available. Future online records on the fixed
+terrain follow the ordinary validity rules without this historical exclusion.

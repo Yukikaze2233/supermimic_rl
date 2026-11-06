@@ -373,7 +373,9 @@ class OnlineTrainer:
         self.auxiliary_world = (AuxiliaryWorldData(config.world_datasets, environment.schema, replay,
             config.fit_horizon, seed=config.seed + 5,
             disturbance_runtime_pairs=tuple(m['disturbance_runtime_pair'] for m in self.resume_migrations
-                                            if 'disturbance_runtime_pair' in m)) if config.world_datasets else None)
+                                            if 'disturbance_runtime_pair' in m),
+            terrain_migrations=tuple(m['terrain_repair'] for m in self.resume_migrations
+                                     if 'terrain_repair' in m)) if config.world_datasets else None)
         if self.auxiliary_world is not None and saved is not None and saved.get('auxiliary_world') is not None:
             self.auxiliary_world.load_state_dict(saved['auxiliary_world'])
         if getattr(self, 'world_datasets_changed', None) is not None:
