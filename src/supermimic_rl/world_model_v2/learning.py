@@ -49,6 +49,8 @@ class LearningConfig:
     model_fit_precision: str = 'float32'
 
     def __post_init__(self):
+        if type(self.imagination_horizon) is not int or self.imagination_horizon < 1:
+            raise ValueError('Imagination horizon must be a positive integer')
         if not math.isfinite(self.anchor_coefficient) or self.anchor_coefficient < 0:
             raise ValueError('Anchor coefficient must be finite and nonnegative')
         if self.model_fit_precision not in MODEL_FIT_PRECISIONS:

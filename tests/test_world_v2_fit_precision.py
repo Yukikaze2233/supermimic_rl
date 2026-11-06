@@ -175,7 +175,7 @@ def test_resume_only_allows_precision_change_and_preserves_saved_learner_rng(bef
         torch.testing.assert_close(saved['learner'][name], original['learner'][name], atol=0, rtol=0)
     torch.testing.assert_close(saved['sample_rng'], original['sample_rng'], atol=0, rtol=0)
     torch.testing.assert_close(torch.get_rng_state(), rng, atol=0, rtol=0)
-    for field, value in (('model_learning_rate', .01), ('imagination_horizon', 32), ('critic_learning_rate', .01)):
+    for field, value in (('model_learning_rate', .01), ('gamma', .8), ('critic_learning_rate', .01)):
         trainer.config = replace(old, learning=replace(old.learning, model_fit_precision=after, **{field: value}))
         with pytest.raises(ValueError, match='training recipe'):
             trainer._check_saved(saved)

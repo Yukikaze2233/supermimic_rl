@@ -361,6 +361,12 @@ class OnlineTrainer:
                 'learner_replay_rng_preserved': True, 'additional_warmup_cycles': 0,
                 'scope': 'CUDA motion MLP fitting arithmetic only; FP32 parameters, optimizer state, '
                          'normalizers, analytic modules and policy imagination preserved'})
+        if getattr(self, 'imagination_horizon_changed', None):
+            self.resume_migrations.append({'imagination_horizon': self.imagination_horizon_changed,
+                'resumed_cycle': self.cycle, 'learner_replay_rng_preserved': True,
+                'additional_warmup_cycles': 0,
+                'scope': 'Policy imagination and critic return horizon only; model fitting, '
+                         'networks, optimizer state, sampling and task/reward contracts preserved'})
         self.task_norm_pending = bool(saved.get('task_norm_pending', False)) if saved is not None else False
         self.critic_norm_from = saved.get('critic_norm_from') if saved is not None else None
         self.collector = Collector(environment, self.mixing, capacity_steps=config.replay_steps, replay=replay,
@@ -460,6 +466,11 @@ class OnlineTrainer:
         before = configuration['learning'].pop('model_fit_precision')
         after = requested['learning'].pop('model_fit_precision')
         self.model_fit_precision_changed = None if before == after else {'before': before, 'after': after}
+        # Unroll length is a recorded recipe change, not a different model or
+        # replay contract. Loading the learner must retain Adam and its rates.
+        before = configuration['learning'].pop('imagination_horizon')
+        after = requested['learning'].pop('imagination_horizon')
+        self.imagination_horizon_changed = None if before == after else {'before': before, 'after': after}
         before, after = configuration.pop('world_datasets'), requested.pop('world_datasets')
         self.world_datasets_changed = None if before == after else {'before': before, 'after': after}
         before, after = configuration.pop('actor_features'), requested.pop('actor_features')
@@ -492,7 +503,7 @@ class OnlineTrainer:
             if name != 'cycles' and before != after:
                 changed[name] = [before, after]
         if configuration != requested or self.config.cycles <= saved['cycle']:
-            raise ValueError('Resume may extend the cycle budget or change guard supervision, not the training recipe')
+            raise ValueError('Resume training recipe differs beyond explicitly supported settings')
         self.guard_settings_changed = changed
         if saved.get('teacher_source') != self.teacher_source:
             raise ValueError('Resume teacher source differs')
