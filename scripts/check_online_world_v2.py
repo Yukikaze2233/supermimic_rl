@@ -117,7 +117,8 @@ def main():
         device=args.device, model_hidden=config.model_hidden, actor_hidden=config.actor_hidden,
         estimator_hidden=config.estimator_hidden, critic_hidden=config.critic_hidden, record_tasks=config.record_tasks,
         terrain=terrain, stair_task=stair_task, stair_source=stair_source, jump_task=jump_task,
-        actor_frame_dim=config.actor_frame_dim, chassis_command_contract=config.chassis_command_contract)
+        actor_frame_dim=config.actor_frame_dim, chassis_command_contract=config.chassis_command_contract,
+        actor_features=config.actor_features)
     learner.model.load_state_dict(saved['learner']['model'])
     learner.model.eval().requires_grad_(False)
     report = validate(learner.fit, replay, list(range(held)), args.horizon, args.batch,

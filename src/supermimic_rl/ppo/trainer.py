@@ -64,6 +64,7 @@ class PPOConfig:
     curriculum_transition_cap: int | None = None
     mean_squash: str = "tanh"
     chassis_command_contract: str = LEGACY_COMMANDS
+    actor_features: dict | None = None
     # Fresh runs may start from an actor-initialization artifact; its SHA256 is required.
     initial_actor: str | None = None
     initial_actor_sha256: str | None = None
@@ -108,6 +109,8 @@ class PPOConfig:
             raise ValueError(f"mean_squash must be one of {MEAN_SQUASHES}")
         if self.chassis_command_contract not in COMMAND_CONTRACTS:
             raise ValueError("Unknown chassis command contract")
+        from ..actor_features import actor_feature_config
+        actor_feature_config(self.actor_features)
         if (self.initial_actor is None) != (self.initial_actor_sha256 is None):
             raise ValueError("initial_actor and initial_actor_sha256 must be given together")
         if type(self.actor_freeze_updates) is not int or self.actor_freeze_updates < 0:
@@ -289,7 +292,10 @@ class PPOTrainer:
             raise ValueError(f"PPO action_bounds {config.action_bounds} differ from the native {native_bounds}")
         self.actor = TeacherActor(config.actor_hidden, config.estimator_hidden, config.initial_std,
                                   mean_squash=config.mean_squash, action_bounds=config.action_bounds,
-                                  chassis_command_contract=config.chassis_command_contract).to(self.device)
+                                  chassis_command_contract=config.chassis_command_contract,
+                                  actor_features=config.actor_features).to(self.device)
+        if config.actor_features is not None:
+            self.actor.features.validate_reference(environment.env._terrain_course.tasks.reference.config)
         self.initialization = None
         self.resume_migrations = []
         if config.initial_actor is not None and resume is None:
@@ -353,6 +359,7 @@ class PPOTrainer:
                           if isinstance(layer, nn.Linear))[:-1]
         if (hidden != config.actor_hidden or estimator != config.estimator_hidden
                 or source.mean_squash != config.mean_squash
+                or source.features.configuration != self.actor.features.configuration
                 or not torch.equal(source.action_bounds, self.actor.action_bounds)):
             raise ValueError("Initial actor artifact differs from the configured actor interface")
         state = source.state_dict()
@@ -687,6 +694,12 @@ class PPOTrainer:
         if before != after and (before, after) != (LEGACY_COMMANDS, HEADING_COMMANDS):
             raise ValueError("Resume only activates the versioned chassis command projection")
         self.resume_migrations = list(payload.get("resume_migrations", []))
+        if saved.actor_features != self.config.actor_features:
+            if saved.actor_features is not None or self.config.actor_features is None:
+                raise ValueError('Resume may activate actor reference features, not silently replace them')
+            self.resume_migrations.append({'actor_features': self.actor.features.configuration,
+                'resumed_update': payload['updates'], 'learner_rng_preserved': True,
+                'scope': 'Actor decoder input only; raw history, estimator, reward and optimizer preserved'})
         if before != after:
             self.resume_migrations.append({"chassis_command_contract": after,
                 "resumed_update": payload["updates"], "learner_rng_preserved": True,
@@ -734,7 +747,8 @@ def load_actor(path: Path, device="cpu") -> TeacherActor:
     config = PPOConfig.from_dict(payload["config"])
     actor = TeacherActor(config.actor_hidden, config.estimator_hidden, config.initial_std,
                          mean_squash=config.mean_squash, action_bounds=config.action_bounds,
-                         chassis_command_contract=config.chassis_command_contract).to(device)
+                         chassis_command_contract=config.chassis_command_contract,
+                         actor_features=config.actor_features).to(device)
     actor.load_state_dict(payload["actor"])
     return actor.eval()
 
@@ -745,6 +759,7 @@ def artifact_actor(payload: dict) -> TeacherActor:
     bounds = tuple(payload.get("action_bounds", ACTION_BOUNDS))
     actor = TeacherActor(tuple(payload["actor_hidden"]), tuple(payload["estimator_hidden"]),
                          mean_squash=payload["mean_squash"], action_bounds=bounds,
-                         chassis_command_contract=payload.get("chassis_command_contract", LEGACY_COMMANDS))
+                         chassis_command_contract=payload.get("chassis_command_contract", LEGACY_COMMANDS),
+                         actor_features=payload.get('actor_features'))
     actor.load_state_dict(payload["actor"])
     return actor

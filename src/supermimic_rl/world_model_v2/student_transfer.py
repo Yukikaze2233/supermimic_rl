@@ -41,7 +41,8 @@ def load_student_actor(path: str | Path, device: str | torch.device = "cpu") -> 
     bounds = tuple(saved["actor"]["action_bounds"].tolist())
     actor = EstimatorActor(estimator_hidden=config.estimator_hidden, actor_hidden=config.actor_hidden,
                            frame_dim=config.actor_frame_dim, action_bounds=bounds,
-                           chassis_command_contract=config.chassis_command_contract).to(device)
+                           chassis_command_contract=config.chassis_command_contract,
+                           actor_features=config.actor_features).to(device)
     actor.load_state_dict(saved["actor"])
     return actor.eval(), saved
 
@@ -57,7 +58,8 @@ def ppo_actor_from_student(student: EstimatorActor,
         raise ValueError("Only the 5x35 chassis student matches the PPO actor interface")
     bounds = tuple(student.action_bounds.tolist()) if action_bounds is None else tuple(action_bounds)
     actor = TeacherActor(_hidden(student.decoder), _hidden(student.estimator), mean_squash="tanh",
-                         action_bounds=bounds, chassis_command_contract=student.chassis_command_contract)
+                         action_bounds=bounds, chassis_command_contract=student.chassis_command_contract,
+                         actor_features=student.features.configuration)
     actor.estimator.network.load_state_dict(student.estimator.state_dict())
     actor.network.load_state_dict(student.decoder.state_dict())
     with torch.no_grad():
@@ -72,6 +74,15 @@ def max_action_difference(student: EstimatorActor, actor: TeacherActor, *, sampl
                           seed: int = 0) -> float:
     generator = torch.Generator().manual_seed(seed)
     history = torch.randn(samples, HISTORY_LENGTH, FRAME_DIM, generator=generator)
+    if student.features.configuration is not None:
+        c = student.features.configuration['reference']
+        history[..., 3] = 5 * (c['support_height_min_m'] + torch.rand(samples, HISTORY_LENGTH,
+            generator=generator) * (c['support_height_max_m'] - c['support_height_min_m']))
+        history[..., 28:33] = torch.nn.functional.one_hot(
+            torch.arange(samples)[:, None].expand(-1, HISTORY_LENGTH) % 5, 5).float()
+        history[..., 33] = 5 * (c['jump_min_m'] + torch.rand(samples, HISTORY_LENGTH,
+            generator=generator) * (c['jump_max_m'] - c['jump_min_m']))
+        history[..., 34] = 5 * torch.rand(samples, HISTORY_LENGTH, generator=generator)
     history = history.to(student.action_bounds.device)
     return float((student(history) - actor(history)).abs().max())
 
@@ -90,13 +101,15 @@ def actor_init_payload(student_path: str | Path, action_bounds: tuple[float, ...
             "actor_hidden": list(_hidden(student.decoder)), "estimator_hidden": list(_hidden(student.estimator)),
             "mean_squash": "tanh",
             "chassis_command_contract": student.chassis_command_contract,
+            "actor_features": student.features.configuration,
             "action_bounds": (student.action_bounds.tolist() if action_bounds is None
                               else [float(value) for value in action_bounds]),
             "source": {"kind": "v2_chassis_student", "path": str(path), "sha256": digest,
                        "cycle": saved["cycle"], "updates": saved["updates"],
                        "model_contract": saved["model_contract"], "schema_fingerprint": saved["schema_fingerprint"]},
             "equivalence": {"exact": exact, "max_abs_action_difference": difference, "samples": 4096,
-                            "inputs": "standard-normal 5x35 histories",
+                            "inputs": ("standard-normal physical channels with valid visible jump commands"
+                                       if student.features.configuration else "standard-normal 5x35 histories"),
                             "scope": ("deterministic mean; PPO adds its own exploration std" if exact else
                                       "first-order start for wider bounds; imitate the exact student next")}}
 
@@ -116,6 +129,7 @@ def initialize_student_from_ppo(student: EstimatorActor, path: Path, expected_sh
     device = student.action_bounds.device
     actor = load_actor(path, device)
     if (actor.mean_squash != "tanh" or student.frame_dim != CHASSIS_FRAME_DIM
+            or actor.features.configuration != student.features.configuration
             or not torch.equal(actor.action_bounds, student.action_bounds)
             or _hidden(actor.network) != _hidden(student.decoder)
             or _hidden(actor.estimator.network) != _hidden(student.estimator)):

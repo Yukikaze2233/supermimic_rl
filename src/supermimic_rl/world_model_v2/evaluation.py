@@ -20,6 +20,9 @@ def evaluate_native(environment, actor, steps, *, on_progress=None,
     if environment.current is None:
         environment.reset()
     owner = environment.adapter
+    features = getattr(actor, 'features', None)
+    if features is not None and features.configuration is not None:
+        features.validate_reference(owner.env._terrain_course.tasks.reference.config)
     begin = getattr(owner, 'evaluation_begin', None)
     fixed_suite = callable(begin) and getattr(owner, '_evaluation_configuration', None) is not None
     if fixed_suite:

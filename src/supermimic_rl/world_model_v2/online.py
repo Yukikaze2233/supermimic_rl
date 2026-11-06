@@ -78,6 +78,7 @@ class OnlineConfig:
     actor_hidden: tuple[int, ...] = (512, 256, 128)
     actor_frame_dim: int = 45
     chassis_command_contract: str = LEGACY_COMMANDS
+    actor_features: dict | None = None
     estimator_hidden: tuple[int, ...] = (128, 64)
     critic_hidden: tuple[int, ...] = (256, 128)
     learning: LearningConfig = field(default_factory=LearningConfig)
@@ -115,6 +116,10 @@ class OnlineConfig:
         return cls(**value)
 
     def __post_init__(self):
+        from ..actor_features import actor_feature_config
+        actor_feature_config(self.actor_features)
+        if self.actor_features is not None and (self.actor_frame_dim != 35 or not self.record_jumps):
+            raise ValueError('Actor reference features require the 35D actor and recorded jump tasks')
         if self.replay_device not in ('learner', 'cpu'):
             raise ValueError('Replay device must be learner or cpu')
         if type(self.actor_frame_dim) is not int or self.actor_frame_dim not in (35, 45):
@@ -247,7 +252,8 @@ class OnlineTrainer:
             estimator_hidden=config.estimator_hidden, critic_hidden=config.critic_hidden, record_tasks=config.record_tasks,
             terrain=terrain, stair_task=stair_task, stair_source=stair_source, jump_task=jump_task,
             recovery_task=recovery_task,
-            actor_frame_dim=config.actor_frame_dim, chassis_command_contract=config.chassis_command_contract)
+            actor_frame_dim=config.actor_frame_dim, chassis_command_contract=config.chassis_command_contract,
+            actor_features=config.actor_features)
         self.teacher_source = teacher_source
         self.actor_initialization = None
         self.course_progression = None
@@ -322,6 +328,10 @@ class OnlineTrainer:
             initial_fraction=config.teacher_fraction, hold_updates=config.teacher_hold_updates,
             fade_updates=config.teacher_fade_updates)
         self.resume_migrations = list(saved.get('resume_migrations', [])) if saved is not None else []
+        if getattr(self, 'actor_features_activated', False):
+            self.resume_migrations.append({'actor_features': config.actor_features,
+                'learner_replay_rng_preserved': True, 'additional_warmup_cycles': 0,
+                'scope': 'Actor decoder input only; raw replay, estimator, dynamics and rewards preserved'})
         if getattr(self, 'chassis_commands_activated', False):
             self.resume_migrations.append({'chassis_command_contract': config.chassis_command_contract,
                 'learner_replay_rng_preserved': True, 'additional_warmup_cycles': 0,
@@ -410,6 +420,10 @@ class OnlineTrainer:
                 or saved['schema_fingerprint'] != self.env.schema.fingerprint):
             raise ValueError('Online checkpoint contract differs')
         configuration, requested = asdict(OnlineConfig.from_dict(saved['config'])), asdict(self.config)
+        before, after = configuration.pop('actor_features'), requested.pop('actor_features')
+        self.actor_features_activated = before != after
+        if self.actor_features_activated and (before is not None or after is None):
+            raise ValueError('Resume may activate actor reference features, not silently replace them')
         before, after = configuration.pop('chassis_command_contract'), requested.pop('chassis_command_contract')
         self.chassis_commands_activated = before != after
         if self.chassis_commands_activated and (before, after) != (LEGACY_COMMANDS, HEADING_COMMANDS):

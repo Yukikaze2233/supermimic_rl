@@ -30,6 +30,8 @@ class NativeHistoryActor:
         if type(sampling_seed) is not int or not 0 <= sampling_seed < 2**63:
             raise ValueError("Evaluation sampling seed must be an integer in [0, 2**63)")
         self.actor, self.environment, self._estimate = actor, environment, None
+        if actor.features.configuration is not None:
+            actor.features.validate_reference(environment.adapter.env._terrain_course.tasks.reference.config)
         self.action_sampling, self.sampling_seed = action_sampling, sampling_seed
         self._action_rng = (torch.Generator(device=actor.log_std.device).manual_seed(sampling_seed)
                             if action_sampling == "ppo-gaussian" else None)
@@ -62,6 +64,7 @@ class NativeHistoryActor:
 
     def sampling_report(self):
         return {"mode": self.action_sampling,
+                "actor_features": self.actor.features.configuration,
                 "seed": self.sampling_seed if self._action_rng is not None else None,
                 "checkpoint_std": self.actor.log_std.detach().exp().cpu().tolist(),
                 "std_semantics": "checkpoint Gaussian action units before clipping; unused in deterministic mode",

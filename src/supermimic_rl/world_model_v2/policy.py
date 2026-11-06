@@ -14,6 +14,7 @@ import torch
 from torch import Tensor, nn
 
 from ..contracts import ACTION_BOUNDS
+from ..actor_features import ActorFeatures, annotate_onnx_features
 from ..chassis_observation import (
     COMMAND_CONTRACTS, LEGACY_COMMANDS, annotate_onnx_commands, chassis_frame,
 )
@@ -36,7 +37,7 @@ class EstimatorActor(nn.Module):
     def __init__(self, history_length: int = 5, estimator_hidden: tuple[int, ...] = (128, 64),
                  actor_hidden: tuple[int, ...] = (512, 256, 128), *, frame_dim: int = FRAME_DIM,
                  action_bounds: tuple[float, ...] = ACTION_BOUNDS,
-                 chassis_command_contract: str = LEGACY_COMMANDS):
+                 chassis_command_contract: str = LEGACY_COMMANDS, actor_features: dict | None = None):
         super().__init__()
         if type(frame_dim) is not int or frame_dim not in (CHASSIS_FRAME_DIM, FRAME_DIM):
             raise ValueError('Actor frame dimension must be 35 (chassis) or 45 (legacy gimbal)')
@@ -45,6 +46,9 @@ class EstimatorActor(nn.Module):
                 or frame_dim != CHASSIS_FRAME_DIM and chassis_command_contract != LEGACY_COMMANDS):
             raise ValueError("Projected chassis commands require the 35D actor")
         self.chassis_command_contract = chassis_command_contract
+        if actor_features is not None and frame_dim != CHASSIS_FRAME_DIM:
+            raise ValueError('Jump reference features require the chassis actor')
+        self.features = ActorFeatures(actor_features)
         flat = history_length * frame_dim
         self.estimator = elu_mlp(flat, estimator_hidden, ESTIMATE_DIM)
         self.decoder = elu_mlp(flat + ESTIMATE_DIM, actor_hidden, 6)
@@ -75,7 +79,9 @@ class EstimatorActor(nn.Module):
         else:
             frozen = {name: parameter.detach() for name, parameter in self.estimator.named_parameters()}
             estimate = torch.func.functional_call(self.estimator, frozen, (flat,))
-        return torch.tanh(self.decoder(torch.cat((flat, estimate), -1))) * self.action_bounds
+        frames = flat.reshape(*flat.shape[:-1], self.history_length, self.frame_dim)
+        decoder_input = self.features(frames).flatten(-2)
+        return torch.tanh(self.decoder(torch.cat((decoder_input, estimate), -1))) * self.action_bounds
 
     def estimator_loss(self, history: Tensor, velocity_body: Tensor, wheel_contact: Tensor) -> Tensor:
         estimate = self.estimate(history)
@@ -93,4 +99,5 @@ def export_onnx(actor: EstimatorActor, path: Path) -> Path:
                       opset_version=17, dynamo=False)
     if actor.frame_dim == CHASSIS_FRAME_DIM:
         annotate_onnx_commands(path, actor.chassis_command_contract)
+    annotate_onnx_features(path, actor.features.configuration)
     return path

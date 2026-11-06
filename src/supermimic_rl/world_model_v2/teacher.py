@@ -71,7 +71,8 @@ def export_ppo_teacher_payload(checkpoint, evaluation_path, qualified_for):
     with torch.random.fork_rng(devices=[]):
         actor = TeacherActor(config.actor_hidden, config.estimator_hidden, config.initial_std,
                              mean_squash=config.mean_squash, action_bounds=config.action_bounds,
-                             chassis_command_contract=config.chassis_command_contract)
+                             chassis_command_contract=config.chassis_command_contract,
+                             actor_features=config.actor_features)
     actor.load_state_dict(saved['actor'], strict=True)
     bounds = action_bounds_from_source(source)
     if (not all(torch.isfinite(value).all() for value in actor.state_dict().values())
@@ -83,6 +84,7 @@ def export_ppo_teacher_payload(checkpoint, evaluation_path, qualified_for):
         'updates': saved['updates'], 'transitions': saved['transitions']},
         'history_length': HISTORY_LENGTH, 'observation_dim': FRAME_DIM, 'action_bounds': list(bounds),
         'chassis_command_contract': config.chassis_command_contract,
+        'actor_features': config.actor_features,
         'action_semantics': ('own PPO deterministic mean followed by existing per-axis hard clipping; '
                              f'mean squash {config.mean_squash}'),
         'history_semantics': ('native obs_buf policy [N,5,42], oldest first; versioned chassis_frame '
@@ -127,7 +129,8 @@ def load_native_teacher(path, expected_sha256, *, device, native_provenance):
             actor = TeacherActor(tuple(payload['actor_hidden']), tuple(payload['estimator_hidden']),
                                  mean_squash=payload.get('mean_squash', 'none'),
                                  action_bounds=tuple(source['action_bounds']),
-                                 chassis_command_contract=source.get('chassis_command_contract', LEGACY_COMMANDS))
+                                 chassis_command_contract=source.get('chassis_command_contract', LEGACY_COMMANDS),
+                                 actor_features=source.get('actor_features'))
         actor.load_state_dict(payload['actor'], strict=True)
         teacher = PinnedPpoTeacher(actor, {**source, 'teacher_artifact': {'path': str(path), 'sha256': expected_sha256}})
         if file_sha256(path) != expected_sha256:

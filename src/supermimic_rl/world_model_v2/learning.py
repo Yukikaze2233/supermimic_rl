@@ -324,7 +324,8 @@ class Learner:
                 "optimizers": {name: optimizer.state_dict() for name, optimizer in self.optimizers.items()},
                 **({} if floor is None else {"contact_floor": {"body": floor[0], "base": floor[1]}}),
                 **({} if self.anchor is None else
-                   {"anchor": {"actor": self.anchor[0].state_dict(), "std": self.anchor[1]}})}
+                   {"anchor": {"actor": self.anchor[0].state_dict(), "std": self.anchor[1],
+                               "actor_features": self.anchor[0].features.configuration}})}
 
     def load_state_dict(self, state: dict) -> None:
         for name in ("model", "actor", "critic"):
@@ -334,7 +335,12 @@ class Learner:
         self.updates, self.skipped = dict(state["updates"]), dict(state["skipped"])
         anchor = state.get("anchor")
         if anchor is not None:
+            from ..actor_features import ActorFeatures
+
             teacher = copy.deepcopy(self.actor)
+            # An existing reference policy retains its own command semantics
+            # when the trainable actor activates new decoder features.
+            teacher.features = ActorFeatures(anchor.get("actor_features"))
             teacher.load_state_dict(anchor["actor"])
             self.set_anchor(teacher, anchor["std"])
         floor = state.get("contact_floor")
