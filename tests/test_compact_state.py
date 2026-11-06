@@ -138,6 +138,37 @@ def test_root_motion_uses_named_link_origin_not_com_or_body_zero(raw):
         torch.testing.assert_close(shifted.state[name], projected.state[name], atol=1e-4, rtol=1e-4)
 
 
+def test_projection_matches_native_origin_velocity_with_large_world_coordinates(raw):
+    from supermimic_rl.compact_state import _inverse_rotate
+    from transformer_rl.formal.lab_env.dynamics import LabStartupDynamics
+
+    link = raw.state['body_link_pose_world_xyzw'][:, 7]
+    local = torch.tensor([[.03517, -.01463, .02179],
+                          [-.02653, .04171, -.01237],
+                          [.01713, -.02357, .03119]])
+    context = torch.zeros(3, len(BODY_NAMES), 7)
+    context[..., 6] = 1.
+    context[:, 7, :3] = local
+    raw.context['body_com_pose_local_xyzw'] = context
+    dynamics = object.__new__(LabStartupDynamics)
+    dynamics.base_com_local_m = local
+    native_com = dynamics.base_com_position(link[:, :3], link[:, 3:])
+    q = link[:, 3:] / link[:, 3:].norm(dim=-1, keepdim=True)
+    conjugate = torch.cat((-q[:, :3], q[:, 3:]), -1)
+    # SDK-style p + R*c and native (p + c) + rotation correction round
+    # differently in float32 far from the world origin.
+    sdk_com = link[:, :3] + _inverse_rotate(conjugate, local)
+    assert (sdk_com - native_com).abs().max() > 1e-6
+    raw.state['body_com_pose_world_xyzw'][:, 7, :3] = sdk_com
+    twist = raw.state['body_com_velocity_world'][:, 7]
+    expected = _inverse_rotate(q, twist[:, :3] - torch.linalg.cross(
+        twist[:, 3:], native_com - link[:, :3]))
+    projected = CompactStateProjector(BODY_NAMES, JOINT_NAMES).project(raw)
+    torch.testing.assert_close(projected.state['root_linear_velocity_body_m_s'], expected,
+                               rtol=0, atol=0)
+    torch.testing.assert_close(raw.state['body_com_pose_world_xyzw'][:, 7, :3], sdk_com)
+
+
 def test_full_vehicle_auxiliary_axes_and_exogenous_commands_are_not_fabricated(raw):
     assert not any(name.startswith("gimbal.") for name in packed(raw)[0].state)
     for name, value in (("position_rad", 1.), ("velocity_rad_s", 2.), ("effort_nm", 3.)):
