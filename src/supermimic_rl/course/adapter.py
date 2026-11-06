@@ -90,7 +90,7 @@ class CourseAdapter(IsaacAdapter):
 
     def __init__(self, env, launcher, health, curriculum, provenance, log_directory, *,
                  mechanics_backend="newton", evaluation_configuration=None, record_substeps=False, substep_audit=False,
-                 profile_steps=False, desynchronize_episodes=False, seed=0):
+                 record_disturbances=False, profile_steps=False, desynchronize_episodes=False, seed=0):
         if type(desynchronize_episodes) is not bool:
             raise ValueError("desynchronize_episodes must be boolean")
         if desynchronize_episodes and evaluation_configuration is not None:
@@ -124,11 +124,14 @@ class CourseAdapter(IsaacAdapter):
             raise ValueError("record_substeps and substep_audit must be boolean")
         if substep_audit and not record_substeps:
             raise ValueError("substep_audit extends recorded substeps; enable record_substeps")
+        if type(record_disturbances) is not bool or record_disturbances and not record_substeps:
+            raise ValueError("record_disturbances must be boolean and requires record_substeps")
         self._substeps = None
         self.substep_fields, self.substeps_per_step = (), 0
         if record_substeps:
             from ..adapters.substeps import SubstepRecorder
-            self._substeps = SubstepRecorder(env, audit=substep_audit).install()
+            self._substeps = SubstepRecorder(env, audit=substep_audit,
+                                             disturbances=record_disturbances).install()
             self.substep_fields = self._substeps.fields
             self.substeps_per_step = self._substeps.count
         if type(profile_steps) is not bool:
@@ -317,6 +320,10 @@ class CourseAdapter(IsaacAdapter):
         if randomization is not None:
             for name, value in randomization.context_parameters().items():
                 context["requested." + name] = value.clone()
+        recorder = getattr(self, "_substeps", None)
+        if recorder is not None and recorder.disturbances is not None:
+            for name, value in recorder.disturbances.snapshot().items():
+                state[name] = value.clone()
         if hasattr(env._sensor_model, "noise_distribution"):
             context["sensor.noise_distribution"] = clock.new_full(
                 (self.num_envs, 1), env._sensor_model.noise_distribution).float()

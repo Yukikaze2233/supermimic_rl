@@ -120,7 +120,8 @@ class RecordSpec:
                record_stairs: bool = False, record_stair_source: bool = False,
                record_jumps: bool = False, record_recovery: bool = False,
                record_jump_trigger: bool = False,
-               record_jump_flight_latch: bool = False) -> dict[str, tuple[int, ...]]:
+               record_jump_flight_latch: bool = False,
+               record_disturbances: bool = False) -> dict[str, tuple[int, ...]]:
         if record_stair_source and not (record_terrain and record_tasks and record_stairs):
             raise ValueError('Ideal stair-source records require terrain, command and stair task records')
         if record_jumps and not record_stair_source:
@@ -165,4 +166,8 @@ class RecordSpec:
         if record_recovery:
             result.update(RECOVERY_RECORD_FIELDS)
             result['recovery_record_valid'] = (1,)
+        if record_disturbances:
+            from .disturbance import DISTURBANCE_RECORD_FIELDS
+
+            result.update(DISTURBANCE_RECORD_FIELDS)
         return result

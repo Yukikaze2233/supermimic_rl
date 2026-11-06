@@ -187,6 +187,7 @@ def create_course(configuration):
                              evaluation_configuration=configuration.get("evaluation"),
                              record_substeps=configuration.get("record_substeps", False),
                              substep_audit=configuration.get("substep_audit", False),
+                             record_disturbances=configuration.get("record_disturbances", False),
                              profile_steps=configuration.get("profile_steps", False),
                              desynchronize_episodes=configuration.get("desynchronize_episodes", False),
                              seed=configuration.get("seed", 7))

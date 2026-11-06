@@ -18,6 +18,7 @@ from .physical import POSITION_JOINTS, VELOCITY_JOINTS, PhysicalState, increment
 from .records import (CONTACT_BODIES, FORBIDDEN_BODIES, RESULTANT_BODIES, PASSIVE_KNEE_JOINTS,
                       Memory, encode_memory, encode_physical, encode_queues)
 from .sensing import SensorQueues
+from .disturbance import DISTURBANCE_STATE_FIELDS
 
 def _names(frame: str, kind: str) -> tuple[str, ...]:
     match = re.search(rf"native {kind} order: ([^;]+)", frame)
@@ -61,6 +62,11 @@ class SnapshotLayout:
         if record_terrain and any(name not in self.state for name in ('course.terrain_tile', 'course.tasks.family')):
             raise ValueError('Terrain records require the actual native tile assignment and task family')
         self.substep = _Fields(schema.substep_fields)
+        disturbance_fields = [name in self.state for name in DISTURBANCE_STATE_FIELDS]
+        disturbance_fields += [name in self.substep for name in ("velocity_push_world", "external_wrench_body")]
+        if any(disturbance_fields) and not all(disturbance_fields):
+            raise ValueError("Disturbance records require both scheduler state and issued substep conditions")
+        self.record_disturbances = all(disturbance_fields)
         frames = {field.name: field.frame for field in schema.state_fields}
         self.joint_names = _names(frames["joint_velocity_native"], "joint")
         substep_frames = {field.name: field.frame for field in schema.substep_fields}
@@ -213,4 +219,9 @@ class SnapshotLayout:
         if self.record_terrain:
             record['terrain_tile'] = get('course.terrain_tile').reshape(-1, 1)
             record['task_family'] = get('course.tasks.family').reshape(-1, 1)
+        if self.record_disturbances:
+            record['disturbance'] = self.state.flat(state, DISTURBANCE_STATE_FIELDS)
+            record['end_disturbance'] = self.state.flat(end.state, DISTURBANCE_STATE_FIELDS)
+            record['velocity_push'] = self.substep(transition.substeps, 'velocity_push_world')[:, 0]
+            record['external_wrench'] = self.substep(transition.substeps, 'external_wrench_body')
         return record
