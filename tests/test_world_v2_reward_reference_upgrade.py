@@ -133,3 +133,29 @@ def test_recovery_migration_is_not_a_general_reward_override(tmp_path):
     reference.update(schema=schema.to_dict(), schema_fingerprint=schema.fingerprint)
     with pytest.raises(ValueError, match='unrelated weights'):
         upgrade_recovery_quiet(saved, dataset, reference, **options)
+
+
+@pytest.mark.parametrize('change', ['wording', 'projection', 'features'])
+def test_old_teacher_history_wording_requires_identical_actual_preprocessing(tmp_path, change):
+    saved, dataset, reference, options = fixture(tmp_path, recovery_quiet=True)
+    old = torch.load(options['source_teacher_path'], weights_only=True)
+    new = torch.load(options['target_teacher_path'], weights_only=True)
+    old['source']['history_semantics'] = (
+        'native obs_buf policy [N,5,42], oldest first, first 35 channels; native reset filling')
+    new['source']['history_semantics'] = (
+        'native obs_buf policy [N,5,42], oldest first; versioned chassis_frame preprocessing; native reset filling')
+    new['source']['chassis_command_contract'] = 'native_first35_v1'
+    if change == 'projection':
+        new['source']['chassis_command_contract'] = 'gimbal_heading_v1'
+    if change == 'features':
+        new['source']['actor_features'] = {'version': 'another-transform'}
+    torch.save(old, options['source_teacher_path'])
+    torch.save(new, options['target_teacher_path'])
+    saved['teacher_source'] = {**old['source'], 'teacher_artifact': {
+        'path': str(options['source_teacher_path']), 'sha256': file_sha256(options['source_teacher_path'])}}
+    if change == 'wording':
+        upgraded, _, _ = upgrade_recovery_quiet(saved, dataset, reference, **options)
+        assert upgraded['learner'] is saved['learner']
+    else:
+        with pytest.raises(ValueError, match='same teacher weights'):
+            upgrade_recovery_quiet(saved, dataset, reference, **options)

@@ -4,6 +4,7 @@ from pathlib import Path
 
 import torch
 
+from ...chassis_observation import LEGACY_COMMANDS
 from ..teacher import PPO_TEACHER_FORMAT, file_sha256
 
 
@@ -34,11 +35,26 @@ def rebind_teacher_source(saved, source, target, source_path, target_path):
             raise ValueError('Teacher needs its own native evaluation on the pinned task source')
     if old['source'] != {k: v for k, v in before.items() if k != 'teacher_artifact'}:
         raise ValueError('Source teacher metadata differs from the online checkpoint')
+    # Early exports described the raw slice before its behavior acquired a
+    # versioned name. Accept that wording change only for the identical legacy
+    # observation projection; the actual contract and feature transform still pin it.
+    histories = {payload['source']['history_semantics'] for payload in (old, new)}
+    legacy_histories = {
+        'native obs_buf policy [N,5,42], oldest first, first 35 channels; native reset filling',
+        'native obs_buf policy [N,5,42], oldest first; versioned chassis_frame preprocessing; native reset filling',
+    }
+    same_history = (len(histories) == 1 or histories == legacy_histories
+                    and all(payload['source'].get('chassis_command_contract', LEGACY_COMMANDS) == LEGACY_COMMANDS
+                            for payload in (old, new)))
     if (any(old['source']['initial_checkpoint'][key] != new['source']['initial_checkpoint'][key]
             for key in ('sha256', 'updates', 'transitions'))
             or any(old['source'][key] != new['source'][key] for key in
                    ('history_length', 'observation_dim', 'action_bounds', 'action_semantics',
-                    'history_semantics', 'estimate_semantics'))
+                    'estimate_semantics'))
+            or not same_history
+            or old['source'].get('chassis_command_contract', LEGACY_COMMANDS)
+            != new['source'].get('chassis_command_contract', LEGACY_COMMANDS)
+            or old['source'].get('actor_features') != new['source'].get('actor_features')
             or any(old.get(k) != new.get(k) for k in ('actor_hidden', 'estimator_hidden', 'mean_squash'))
             or old['actor'].keys() != new['actor'].keys()
             or any(not torch.equal(value, new['actor'][name]) for name, value in old['actor'].items())):
