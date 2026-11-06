@@ -63,6 +63,12 @@ class RewardExtensions:
     roll/pitch alone moved the wobble into yaw. ``jump_landing_rate`` costs the
     same quantity the native quiet test bounds by 0.5 rad/s, the body angular
     speed, above 0.4 rad/s from the first real touchdown on.
+
+    ``recovery_quiet`` rewards low three-axis angular speed once recovery has
+    attained its existing height/upright objective. It reuses that objective's
+    smooth weight and the yaw tracking kernel's 0.25 (rad/s)^2 scale. This
+    supplies a settling signal without damping the whole flip or changing the
+    recovery handoff. It is not physical success or contact certification.
     """
 
     jump_flight: float = 0.        # per second in the request's first real flight (after real ascent)
@@ -73,10 +79,11 @@ class RewardExtensions:
     jump_missed: float = 0.        # per second in reference HOLD without real liftoff
     jump_settle: float = 0.        # per second at a 2 s native stable-landing streak (25% at its start)
     jump_landing_rate: float = 0.  # per second and (rad/s)^2 of body angular speed above 0.4 rad/s after a real landing
+    recovery_quiet: float = 0.    # per second at quiet, upright target height; default retains native parity
 
     def __post_init__(self):
         values = (self.jump_flight, self.jump_lift, self.jump_lift_cap_m_s, self.jump_push, self.jump_missed,
-                  self.jump_settle, self.jump_landing_rate,
+                  self.jump_settle, self.jump_landing_rate, self.recovery_quiet,
                   1. if self.success_event is None else self.success_event)
         if any(type(value) not in (int, float) or not math.isfinite(value) or value < 0 for value in values):
             raise ValueError("Reward extensions must be finite and nonnegative")
@@ -84,7 +91,7 @@ class RewardExtensions:
     @property
     def active(self) -> bool:
         return bool(self.jump_flight or self.jump_lift or self.jump_push or self.jump_missed or self.jump_settle
-                    or self.jump_landing_rate or self.success_event is not None)
+                    or self.jump_landing_rate or self.recovery_quiet or self.success_event is not None)
 
     @property
     def needs_jump_progress(self) -> bool:
@@ -556,12 +563,18 @@ def physical_reward_densities(sample: RewardPhysics, reference: RewardReference,
                 landed_after_flight = jump & closed & (phase != int(RewardPhase.FLIGHT))
         excess = (sample.angular_velocity_body_rad_s.norm(dim=-1) - JUMP_LANDING_RATE_FREE_RAD_S).clamp_min(0)
         cost['jump_landing_rate'] = extensions.jump_landing_rate * landed_after_flight.to(v_up.dtype) * excess.square()
+    if extensions.recovery_quiet:
+        # Existing height reward approaches zero while collapsed or inverted.
+        # Use all axes: yaw is not otherwise tracked during native recovery.
+        angular_square = sample.angular_velocity_body_rad_s.square().sum(-1)
+        positive['recovery_quiet'] = (extensions.recovery_quiet * recovery * positive['height']
+                                     * torch.exp(-angular_square / .25))
     p, c = torch.stack(tuple(positive.values())).sum(0), torch.stack(tuple(cost.values())).sum(0)
     components = {**{'positive.' + key: value for key, value in positive.items()},
                   **{'cost.' + key: -value for key, value in cost.items()}}
     positive_bound = torch.where(gimbal_active, 11., 8.)
     positive_bound = (positive_bound + extensions.jump_flight + extensions.jump_lift * extensions.jump_lift_cap_m_s
-                      + extensions.jump_push + extensions.jump_settle)
+                      + extensions.jump_push + extensions.jump_settle + extensions.recovery_quiet)
     if rough_dash:
         # 10 centering + 20 zero torque + 10 directional wheel speed.
         positive_bound = positive_bound + 40 * rough_active

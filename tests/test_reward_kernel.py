@@ -219,6 +219,81 @@ def test_success_event_extension_is_paid_and_recorded():
         install_shared_reward(setup('ordinary')[0], verify_native=True, extensions=RewardExtensions(jump_flight=1.))
 
 
+@pytest.mark.parametrize('case', ['ordinary', 'terrain', 'gimbal', 'jump_takeoff', 'jump_flight', 'jump_landing'])
+def test_recovery_quiet_does_not_pay_other_tasks(case):
+    from supermimic_rl.reward_kernel import RewardExtensions
+
+    composer, reference = setup(case)
+    begin(composer, reference, torch.zeros(2, 6))
+    parameters = RewardParameters.from_composer(composer)
+    physics = sample(composer, 1)
+    history = RewardHistory(composer._window['dq'], torch.zeros(2), torch.zeros(2), torch.ones(2))
+    baseline = physical_reward_densities(physics, reference, history, parameters)
+    result = physical_reward_densities(physics, reference, history,
+        replace(parameters, extensions=RewardExtensions(recovery_quiet=1.)))
+    assert not result.positive['recovery_quiet'].any()
+    for name, expected in baseline.components.items():
+        torch.testing.assert_close(result.components[name], expected, atol=0, rtol=0)
+
+
+def test_recovery_quiet_uses_height_and_upright_and_penalizes_all_angular_axes():
+    from supermimic_rl.reward_kernel import RewardExtensions
+
+    extensions = RewardExtensions(recovery_quiet=1.)
+    assert extensions.active and not extensions.needs_jump_progress
+    composer, reference = setup('recovery')
+    receipt = install_shared_reward(composer, extensions=extensions)
+    assert receipt['extensions']['recovery_quiet'] == 1.
+    begin(composer, reference, torch.zeros(2, 6))
+    parameters = RewardParameters.from_composer(composer)
+    history = RewardHistory(composer._window['dq'], torch.zeros(2), torch.zeros(2), torch.ones(2))
+    physics = replace(sample(composer, 1),
+        height_above_ground_m=reference.admitted_body_command[:, 3],
+        gravity_body=torch.tensor([[0., 0., -1.], [0., 0., -1.]]),
+        angular_velocity_body_rad_s=torch.zeros(2, 3))
+
+    def quiet(value):
+        return physical_reward_densities(value, reference, history, parameters).positive['recovery_quiet']
+
+    torch.testing.assert_close(quiet(physics), torch.ones(2))
+    for axis in range(3):
+        angular = torch.zeros(2, 3)
+        angular[:, axis] = .5
+        torch.testing.assert_close(quiet(replace(physics, angular_velocity_body_rad_s=angular)),
+                                   torch.full((2,), torch.exp(torch.tensor(-1.)).item()))
+    fallen = replace(physics, gravity_body=torch.tensor([[0., 0., 1.], [0., 0., 1.]]))
+    assert not quiet(fallen).any()
+    collapsed = replace(physics, height_above_ground_m=physics.height_above_ground_m - .15)
+    assert (quiet(collapsed) < 1e-9).all()
+    with pytest.raises(ValueError, match='finite and nonnegative'):
+        RewardExtensions(recovery_quiet=-1.)
+
+
+def test_recovery_quiet_gradient_points_toward_rest_and_matches_finite_difference():
+    from supermimic_rl.reward_kernel import RewardExtensions
+
+    composer, reference = setup('recovery')
+    begin(composer, reference, torch.zeros(2, 6))
+    parameters = replace(RewardParameters.from_composer(composer),
+                         extensions=RewardExtensions(recovery_quiet=1.))
+    physics = sample(composer, 1)
+    history = RewardHistory(composer._window['dq'], torch.zeros(2), torch.zeros(2), torch.ones(2))
+    angular = torch.tensor([[.1, -.2, .3], [0., 0., 0.]], dtype=torch.float64, requires_grad=True)
+
+    def score(value):
+        result = physical_reward_densities(replace(physics, angular_velocity_body_rad_s=value),
+                                          reference, history, parameters)
+        return result.positive['recovery_quiet'].sum()
+
+    gradient, = torch.autograd.grad(score(angular), (angular,))
+    assert torch.isfinite(gradient).all() and (gradient[0] * angular[0] < 0).all()
+    assert not gradient[1].any()
+    direction = torch.tensor([[.2, -.1, .3], [.1, .2, .3]], dtype=angular.dtype)
+    epsilon = 1e-5
+    numeric = (score(angular + epsilon * direction) - score(angular - epsilon * direction)) / (2 * epsilon)
+    torch.testing.assert_close((gradient * direction).sum(), numeric, atol=1e-8, rtol=1e-6)
+
+
 def test_jump_push_pays_reference_upward_speed_only_before_the_first_real_landing():
     from supermimic_rl.reward_kernel import RewardExtensions
 
