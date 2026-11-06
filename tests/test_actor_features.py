@@ -2,6 +2,8 @@
 from dataclasses import asdict, replace
 from copy import deepcopy
 import json
+import subprocess
+import sys
 from types import SimpleNamespace
 
 import pytest
@@ -132,6 +134,27 @@ def test_reference_metadata_must_match_the_native_curve():
         features.validate_reference(JumpReferenceConfig())
     with pytest.raises(ValueError, match='complete native jump reference'):
         ActorFeatures({'version': JUMP_REFERENCE_FEATURES, 'reference': {}})
+
+
+def test_actor_configuration_loads_without_the_native_training_package():
+    import supermimic_rl
+
+    script = '''
+import importlib.abc, json, pathlib, sys
+sys.path.insert(0, str(pathlib.Path(sys.argv[1]).parent.parent))
+class NoNative(importlib.abc.MetaPathFinder):
+    def find_spec(self, fullname, path, target=None):
+        if fullname.startswith('transformer_rl'):
+            raise ImportError('Native training package unavailable in deployment')
+sys.meta_path.insert(0, NoNative())
+from supermimic_rl.ppo.trainer import PPOConfig
+from supermimic_rl.ppo.policy import TeacherActor
+configuration = json.loads(sys.argv[2])
+config = PPOConfig(actor_features=configuration)
+assert TeacherActor(actor_features=config.actor_features).features.configuration == configuration
+'''
+    subprocess.run([sys.executable, '-I', '-c', script, supermimic_rl.__file__,
+                    json.dumps(feature_config())], check=True, capture_output=True, text=True)
 
 
 def test_world_resume_activates_features_without_rewriting_recorded_data():

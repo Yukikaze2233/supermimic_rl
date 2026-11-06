@@ -8,8 +8,9 @@ input validation/synchronization inside every imagined actor call.
 """
 from __future__ import annotations
 
-from dataclasses import asdict, fields
+from dataclasses import asdict
 import json
+import math
 from pathlib import Path
 
 import torch
@@ -17,20 +18,29 @@ from torch import nn
 
 JUMP_REFERENCE_FEATURES = 'jump_reference_height_v1'
 ONNX_FEATURE_METADATA = 'supermimic.actor_features'
+_REFERENCE_FIELDS = {
+    'gravity_m_s2', 'support_height_min_m', 'support_height_max_m', 'jump_min_m', 'jump_max_m',
+    'compression_depth_max_m', 'compression_duration_s', 'nominal_extension_duration_s',
+}
 
 
 def actor_feature_config(value: dict | None) -> dict | None:
     if value is None:
         return None
-    from transformer_rl.formal.tasks.jump import JumpReferenceConfig
-
     if (not isinstance(value, dict) or set(value) != {'version', 'reference'}
             or value['version'] != JUMP_REFERENCE_FEATURES
             or not isinstance(value['reference'], dict)
-            or set(value['reference']) != {f.name for f in fields(JumpReferenceConfig)}):
+            or set(value['reference']) != _REFERENCE_FIELDS):
         raise ValueError('Actor features require a version and the complete native jump reference')
-    return {'version': JUMP_REFERENCE_FEATURES,
-            'reference': asdict(JumpReferenceConfig(**value['reference']))}
+    # Actor loading/export must work before the native factory adds its pinned
+    # source path, and on deployment machines without the training environment.
+    c = value['reference']
+    if (any(type(v) not in (int, float) or not math.isfinite(v) or v <= 0 for v in c.values())
+            or c['support_height_min_m'] >= c['support_height_max_m']
+            or c['jump_min_m'] > c['jump_max_m']
+            or c['compression_depth_max_m'] >= c['support_height_max_m'] - c['support_height_min_m']):
+        raise ValueError('Actor jump reference requires positive heights, durations and gravity')
+    return {'version': JUMP_REFERENCE_FEATURES, 'reference': dict(c)}
 
 
 class ActorFeatures(nn.Module):
