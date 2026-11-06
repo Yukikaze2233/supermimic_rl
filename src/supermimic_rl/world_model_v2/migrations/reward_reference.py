@@ -21,6 +21,22 @@ TARGET_REFERENCE = 'first_real_flight_landing_v1'
 RECOVERY_SOURCE_KERNEL_SHA256 = '10ac1a471ef34100ba2828d871a6f08cf7cd8992908b57d6f02e757d55bd52ce'
 # Recovery settling kernel, before the ordinary acceleration coefficient became configurable.
 ACCELERATION_SOURCE_KERNEL_SHA256 = '35d7e113f8cda0fa65289fc9b2b6e7c0ba1271b93b4f8c710dbace1fe384a51a'
+# Current shared reward before request-height completion scales post-flight profit.
+PEAK_SOURCE_KERNEL_SHA256 = '19aeee76a4ee7f4da06177f6477a55991652aa61caa5133e9ec76724625619c4'
+
+
+def verify_jump_peak_completion(before, after):
+    """Authenticate the one reward change, also when composing a stair handoff."""
+    expected = {**before, 'kernel_sha256': file_sha256(inspect.getfile(physical_reward_densities)),
+                'extensions': {**asdict(RewardExtensions(**before['extensions'])),
+                               'jump_peak_completion': True}}
+    if (before.get('implementation') != 'shared_physical_reward_densities'
+            or before.get('kernel_sha256') != PEAK_SOURCE_KERNEL_SHA256
+            or before['extensions'].get('jump_peak_completion', False)
+            or before['extensions'].get('jump_missed', 0.) <= 0
+            or before.get('jump_tracking_reference') != TARGET_REFERENCE
+            or after != expected):
+        raise ValueError('Peak completion requires the known reward and only its completion switch')
 
 
 def _upgrade_reward(saved, dataset, reference, *, source_teacher_path, target_teacher_path, change):
@@ -68,6 +84,9 @@ def _upgrade_reward(saved, dataset, reference, *, source_teacher_path, target_te
         if (before.get('kernel_sha256') != ACCELERATION_SOURCE_KERNEL_SHA256
                 or before['extensions'].get('ordinary_leg_acceleration') is not None):
             raise ValueError('Acceleration migration requires the known native-coefficient kernel')
+    elif change == 'jump-peak-completion-v1':
+        verify_jump_peak_completion(before, after)
+        expected['extensions']['jump_peak_completion'] = True
     else:
         raise ValueError('Unknown analytic reward migration')
     if after != expected or before.get('implementation') != 'shared_physical_reward_densities':
@@ -123,3 +142,9 @@ def upgrade_ordinary_acceleration(saved, dataset, reference, *, source_teacher_p
     """Use the reviewed 1e-7 locomotion coefficient while retaining learning state."""
     return _upgrade_reward(saved, dataset, reference, source_teacher_path=source_teacher_path,
                            target_teacher_path=target_teacher_path, change='ordinary-leg-acceleration-v1')
+
+
+def upgrade_jump_peak_completion(saved, dataset, reference, *, source_teacher_path, target_teacher_path):
+    """Enable request-height reward scaling; keep physical evidence and all learners."""
+    return _upgrade_reward(saved, dataset, reference, source_teacher_path=source_teacher_path,
+                           target_teacher_path=target_teacher_path, change='jump-peak-completion-v1')

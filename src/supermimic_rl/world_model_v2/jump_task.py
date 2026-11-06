@@ -7,7 +7,7 @@ All heights here use the terrain tile's coordinates, like PhysicalState.
 """
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from types import SimpleNamespace
 from typing import TYPE_CHECKING
 
@@ -275,6 +275,8 @@ class JumpInterval:
     flight_closed: Tensor | None = None   # per tick; None without a recorded first-flight latch
     landed_s: Tensor | None = None        # per tick: native uninterrupted stable-landing time [s]
     flight_started: Tensor | None = None  # per tick: first-real-flight latch, including after landing
+    peak_rise: Tensor | None = None       # continuous running root rise, outside the detached FSM
+    requested_rise: Tensor | None = None
 
 
 class JumpTask:
@@ -296,7 +298,7 @@ class JumpTask:
                 admitted: Tensor, base_mode: Tensor, task_family: Tensor, elapsed_s: Tensor,
                 ground_z: Tensor, blocked_by_stair: Tensor, interval_uniform: Tensor | None = None,
                 packet: RequestCommand | None = None, previous_command_height: Tensor | None = None,
-                previous_elapsed_s: Tensor | None = None) -> JumpAdvance:
+                previous_elapsed_s: Tensor | None = None, retain_peak_gradient: bool = False) -> JumpAdvance:
         """Advance after old-interval reward, and after motion command admission.
 
         ``elapsed_s`` is MotionTask's already advanced episode clock. Random
@@ -391,8 +393,13 @@ class JumpTask:
             active = protocol.active_id >= 0
             last_end = torch.where(was_active & ~active, now_s, last_end)
             trigger = (last_end[:, None], torch.stack((state.trigger_flags[:, 0], active), -1))
-        return JumpAdvance(JumpTaskState._pack(now_s, protocol, owner, trigger=trigger,
-                                               flight_latch=state.flight_latch), command, mode,
+        following = JumpTaskState._pack(now_s, protocol, owner, trigger=trigger, flight_latch=state.flight_latch)
+        if retain_peak_gradient:
+            continuing = (following.physical_id >= 0) & (following.physical_id == state.physical_id) & ~accepted
+            peak = torch.where(continuing, state.values[:, 15], following.values[:, 15])
+            following = replace(following, values=torch.cat((following.values[:, :15], peak[:, None],
+                                                            following.values[:, 16:]), -1))
+        return JumpAdvance(following, command, mode,
             condition.height_m, condition.clock_s, condition.response, condition.finished_id, condition.end_reason,
             postponed)
 
@@ -407,7 +414,8 @@ class JumpTask:
 
     def observe_interval(self, state: JumpTaskState, *, physical: PhysicalState,
                          wheel_support_load: Tensor, base_com_offset: Tensor, base_mode: Tensor,
-                         command_height: Tensor, ground_z: Tensor) -> JumpInterval:
+                         command_height: Tensor, ground_z: Tensor,
+                         retain_peak_gradient: bool = False) -> JumpInterval:
         """Integrate four physical samples and return their native reward targets.
 
         ``wheel_support_load`` is the two wheels' upward patch-normal support
@@ -433,8 +441,11 @@ class JumpTask:
             tilt = torch.atan2(gravity[..., :2].norm(dim=-1), -gravity[..., 2])
             speed = physical.angular_velocity_body.norm(dim=-1)
             phases, ascents, closed_ticks, stable_ticks, lifted_ticks = [], [], [], [], []
+            peak_active = []
             latch = None if state.flight_latch is None else state._flight_latch_state()
             for tick in range(4):
+                if retain_peak_gradient:
+                    peak_active.append((owner.physical_id >= 0).clone())
                 LabCourseTasks.observe_physics(owner, wheel_support_load[:, tick], velocity_z[:, tick],
                     tilt[:, tick], physical.position[:, tick, 2], angular_speed_rad_s=speed[:, tick],
                     dt=self.config.physics_dt_s)
@@ -453,6 +464,24 @@ class JumpTask:
             following = JumpTaskState._pack(state.now_s, protocol, owner, trigger=trigger, flight_latch=flight_latch)
             phase = torch.stack(phases, -1)
             success = (owner.success_id >= 0) & (owner.success_id > state.ids[:, 6])
+        peaks = requested = None
+        if retain_peak_gradient:
+            # Reuse the native root-rise coordinate. Only this continuous
+            # history carries gradients; contact, success and reset decisions
+            # above remain the exact detached native state machine.
+            rise = physical.position[..., 2] - state.values[:, 7:8] - state.values[:, 6:7]
+            peak, recorded_peaks = state.values[:, 15], []
+            for tick, active in enumerate(peak_active):
+                peak = torch.where(active, torch.maximum(peak, rise[:, tick]), peak)
+                recorded_peaks.append(peak)
+            peaks = torch.stack(recorded_peaks, -1)
+            requested = state.values[:, 5:6].expand(-1, 4)
+            # Success can close a request inside the interval. Preserve the
+            # native final value in that case and detach its completed history.
+            continuing = (following.physical_id >= 0) & (following.physical_id == state.physical_id)
+            final_peak = torch.where(continuing, peaks[:, -1], following.values[:, 15])
+            following = replace(following, values=torch.cat((following.values[:, :15], final_peak[:, None],
+                                                            following.values[:, 16:]), -1))
         curve = self.reference(state)
         height, velocity = jump_tracking_targets(
             phase, curve.height_world_z_m[:, None], curve.velocity_world_z_m_s[:, None],
@@ -461,4 +490,4 @@ class JumpTask:
         return JumpInterval(following, phase, height, velocity, owner.success_id.clone(), success,
                             curve.clock_stage[:, None].expand(-1, 4), torch.stack(ascents, -1),
                             torch.stack(closed_ticks, -1) if closed_ticks else None, torch.stack(stable_ticks, -1),
-                            torch.stack(lifted_ticks, -1) if lifted_ticks else None)
+                            torch.stack(lifted_ticks, -1) if lifted_ticks else None, peaks, requested)

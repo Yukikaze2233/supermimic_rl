@@ -86,7 +86,8 @@ class LocomotionRewardContext:
             jump_interval = self.jump_task.observe_interval(jump_state, physical=ticks.state,
                 wheel_support_load=ticks.wheel_load.clamp_min(0),
                 base_com_offset=self.base_com_offset, base_mode=mode if base_mode is None else base_mode,
-                command_height=goal[:, 3] / 5., ground_z=ground[:, :, 0])
+                command_height=goal[:, 3] / 5., ground_z=ground[:, :, 0],
+                retain_peak_gradient=self.assembly.parameters.extensions.jump_peak_completion)
         for tick in range(count):
             state = ticks.state.tick(tick)
             wheel = geometry.tick(tick)
@@ -118,7 +119,9 @@ class LocomotionRewardContext:
                     jump_interval.reference_stage[:, tick], jump_interval.ascent_seen[:, tick],
                     None if jump_interval.flight_closed is None else jump_interval.flight_closed[:, tick],
                     None if jump_interval.landed_s is None else jump_interval.landed_s[:, tick],
-                    None if jump_interval.flight_started is None else jump_interval.flight_started[:, tick])))
+                    None if jump_interval.flight_started is None else jump_interval.flight_started[:, tick],
+                    None if jump_interval.peak_rise is None else jump_interval.peak_rise[:, tick],
+                    None if jump_interval.requested_rise is None else jump_interval.requested_rise[:, tick])))
         result = self.assembly.integrate(start, tuple(samples), action, reward_memory,
             controller_memory.wheel_torque_history, self.legs, self.encoder_bias, self.motor_strength)
         return replace(result, termination_height=torch.stack(heights, -1)[..., None],

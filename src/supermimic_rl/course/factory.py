@@ -23,6 +23,11 @@ def _read_pinned(path, digest):
 
 def create_course(configuration):
     """Full45 history MLP course using the source FSM and exact static terrain."""
+    hint_lifetime = configuration.get("stair_height_hint_lifetime", "fixed")
+    if hint_lifetime not in ("fixed", "request"):
+        raise ValueError('Stair height hint lifetime must be fixed or request')
+    if hint_lifetime == "request" and not configuration.get("tof_stair_label", False):
+        raise ValueError('Request-lifetime stair hints require the explicit ToF stair label')
     root = Path(configuration["upstream_root"]).resolve(strict=True)
     commit = subprocess.check_output(["git", "-C", str(root), "rev-parse", "HEAD"], text=True).strip()
     if commit != configuration["expected_commit"]:
@@ -139,7 +144,7 @@ def create_course(configuration):
         if configuration.get("tof_stair_label", False):
             from .stair_label import install_tof_stair_label
 
-            stair_label_receipt = install_tof_stair_label(native)
+            stair_label_receipt = install_tof_stair_label(native, height_hint_lifetime=hint_lifetime)
         jump_assist_receipt = None
         if configuration.get("jump_assist") is not None:
             if configuration.get("evaluation") is not None:

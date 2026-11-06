@@ -39,7 +39,9 @@ class SharedRewardComposer(PhysicalRewardComposer):
                 window['jump_reference_stage'] = (tasks.jump_reference() if curve is None else curve).clock_stage
             latch = tasks.supermimic_flight_latch
             progress = JumpProgress(window['jump_reference_stage'], tasks.ascent_seen.clone(), latch.closed.clone(),
-                                    tasks.landed_s.clone(), latch.lifted.clone())
+                                    tasks.landed_s.clone(), latch.lifted.clone(),
+                                    tasks.peak_rise.clone() if self.supermimic_reward_extensions.jump_peak_completion else None,
+                                    tasks.active_rise.clone() if self.supermimic_reward_extensions.jump_peak_completion else None)
         densities = physical_reward_densities(
             sample, reference,
             RewardHistory(window['dq'], window['action_cost'], window['action2_cost'], self._action_count),
@@ -188,6 +190,9 @@ def install_shared_reward(composer, *, verify_native=False, extensions: RewardEx
                "kernel_sha256": hashlib.sha256(Path(inspect.getfile(physical_reward_densities)).read_bytes()).hexdigest()}
     if extensions.active:
         receipt["extensions"] = asdict(extensions)
+        if not extensions.jump_peak_completion:
+            # An absent opt-in keeps old source receipts and replay contracts.
+            receipt['extensions'].pop('jump_peak_completion')
     return receipt
 
 

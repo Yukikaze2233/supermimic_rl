@@ -535,7 +535,9 @@ class Imagination:
                         task_family=start['task_family'][rows, 0].long(), elapsed_s=following.timing[:, 0],
                         ground_z=ground, blocked_by_stair=stair.ids[rows, 1] >= 0,
                         interval_uniform=start['jump_uniform'][rows, step],
-                        previous_command_height=task.current[rows, 3], previous_elapsed_s=task.timing[rows, 0])
+                        previous_command_height=task.current[rows, 3], previous_elapsed_s=task.timing[rows, 0],
+                        retain_peak_gradient=getattr(getattr(self.reward, 'extensions', None),
+                                                     'jump_peak_completion', False))
                     # Native tasks latch the accepted baseline into the command
                     # stream before stair assistance and gimbal eligibility.
                     following = replace(following, current=jumped.command)

@@ -23,6 +23,9 @@ from transformer_rl.formal.tasks.gimbal_course import GimbalCourse
 JUMP_PUSH_MIN_REFERENCE_M_S = .1
 JUMP_SETTLE_STREAK_S = 2.     # the native physical success needs this uninterrupted stable landing
 JUMP_LANDING_RATE_FREE_RAD_S = .4   # inside the native quiet limit of 0.5 rad/s
+# Pinned LabCourseTasks.observe_physics uses min(0.03 m, requested rise * 0.5).
+JUMP_PEAK_TOLERANCE_MAX_M = .03
+JUMP_PEAK_TOLERANCE_TARGET_FRACTION = .5
 NATIVE_SOURCE_SHA256 = 'b03282693376a8af082d8433badfcba917270394113aaf2bec271289f7decdd8'
 
 
@@ -50,6 +53,12 @@ class RewardExtensions:
     until real liftoff. A supported rise alone does not complete takeoff.
     Compression and extension retain their shaping rewards, and a late real
     jump can still earn flight and landing rewards within the request window.
+
+    ``jump_peak_completion`` retains that missed-jump signal after a small
+    first flight. From first touchdown or HOLD, tracking rewards are scaled
+    by attained peak / the native acceptable lower peak, and the existing
+    missed-jump weight costs the remaining fraction. The landing reference
+    stays at the baseline. This option only changes JUMP-mode rewards.
 
     The native success needs 2 s of uninterrupted stable landing (contact,
     quiet, near the start height, peak inside the target window). The single
@@ -85,8 +94,11 @@ class RewardExtensions:
     jump_landing_rate: float = 0.  # per second and (rad/s)^2 of body angular speed above 0.4 rad/s after a real landing
     recovery_quiet: float = 0.    # per second at quiet, upright target height; default retains native parity
     ordinary_leg_acceleration: float | None = None  # per second and (rad/s^2)^2, summed over four legs
+    jump_peak_completion: bool = False  # reuse missed-jump weight with continuous requested-peak completion
 
     def __post_init__(self):
+        if type(self.jump_peak_completion) is not bool or self.jump_peak_completion and self.jump_missed <= 0:
+            raise ValueError('Jump peak completion requires a boolean flag and positive jump_missed weight')
         values = (self.jump_flight, self.jump_lift, self.jump_lift_cap_m_s, self.jump_push, self.jump_missed,
                   self.jump_settle, self.jump_landing_rate, self.recovery_quiet,
                   0. if self.ordinary_leg_acceleration is None else self.ordinary_leg_acceleration,
@@ -126,6 +138,8 @@ class JumpProgress:
     flight_closed: Tensor | None = None
     landed_s: Tensor | None = None       # native uninterrupted stable-landing time [s]; > 0 while stable
     flight_started: Tensor | None = None # first-real-flight latch, retained after touchdown
+    peak_rise: Tensor | None = None      # running native root-height rise; differentiable in imagination
+    requested_rise: Tensor | None = None
 
     def validate(self, mode: Tensor) -> None:
         flags = tuple(flag for flag in (self.ascent_seen, self.flight_closed, self.flight_started)
@@ -137,6 +151,11 @@ class JumpProgress:
                 or self.landed_s is not None and (self.landed_s.shape != mode.shape or self.landed_s.device != mode.device
                                                   or not self.landed_s.is_floating_point())):
             raise ValueError('Jump progress needs matching int64 reference stages, boolean latches and float times')
+        peaks = (self.peak_rise, self.requested_rise)
+        if ((peaks[0] is None) != (peaks[1] is None)
+                or any(value is not None and (value.shape != mode.shape or value.device != mode.device
+                       or not value.is_floating_point()) for value in peaks)):
+            raise ValueError('Jump peak progress needs matching floating-point achieved and requested rises')
 
     @staticmethod
     def cat(items) -> JumpProgress | None:
@@ -145,13 +164,16 @@ class JumpProgress:
             return None
         if (any(item is None for item in items) or len({item.flight_closed is None for item in items}) != 1
                 or len({item.landed_s is None for item in items}) != 1
-                or len({item.flight_started is None for item in items}) != 1):
+                or len({item.flight_started is None for item in items}) != 1
+                or len({item.peak_rise is None for item in items}) != 1
+                or len({item.requested_rise is None for item in items}) != 1):
             raise ValueError('Jump progress coverage changes within a physical interval')
         optional = lambda name: (None if getattr(items[0], name) is None
                                  else torch.cat([getattr(item, name) for item in items]))
         return JumpProgress(torch.cat([item.reference_stage for item in items]),
                             torch.cat([item.ascent_seen for item in items]),
-                            optional('flight_closed'), optional('landed_s'), optional('flight_started'))
+                            optional('flight_closed'), optional('landed_s'), optional('flight_started'),
+                            optional('peak_rise'), optional('requested_rise'))
 
 
 def advance_flight_latch(request: Tensor, lifted: Tensor, closed: Tensor, *, current: Tensor,
@@ -523,9 +545,28 @@ def physical_reward_densities(sample: RewardPhysics, reference: RewardReference,
         # A missed request must not keep earning locomotion tracking rewards.
         # Keep jump_attitude to encourage upright support while waiting,
         # instead of turning the entire HOLD interval into pure punishment.
-        for name in ('forward', 'yaw', 'height', 'jump_vertical'):
-            positive[name] = torch.where(missed_jump, 0., positive[name])
-        cost['jump_missed'] = extensions.jump_missed * missed_jump.to(v_up.dtype)
+        if extensions.jump_peak_completion and stage is not None:
+            peak, requested = jump_progress.peak_rise, jump_progress.requested_rise
+            if peak is None or requested is None or closed is None or started is None:
+                raise ValueError('Jump peak completion requires peak, request and first-flight records')
+            tolerance = torch.minimum(torch.full_like(requested, JUMP_PEAK_TOLERANCE_MAX_M),
+                                      requested * JUMP_PEAK_TOLERANCE_TARGET_FRACTION)
+            # Inactive rows carry a zero request. Keep their division defined
+            # without altering any admitted jump target or success tolerance.
+            lower = torch.where(jump, requested - tolerance, torch.ones_like(requested))
+            if (jump & (lower <= 0)).any():
+                raise ValueError('Jump peak completion requires a positive admitted rise')
+            completion = started.to(peak.dtype) * (peak / lower).clamp(0, 1)
+            late = jump & ((stage == int(ReferenceStage.HOLD)) | closed)
+            gain = torch.where(late, completion, 1.)
+            for name in ('forward', 'yaw', 'height', 'jump_vertical'):
+                positive[name] = positive[name] * gain
+            cost['jump_missed'] = extensions.jump_missed * torch.where(late, 1 - completion, 0.)
+            missed_jump = late & (completion < 1)
+        else:
+            for name in ('forward', 'yaw', 'height', 'jump_vertical'):
+                positive[name] = torch.where(missed_jump, 0., positive[name])
+            cost['jump_missed'] = extensions.jump_missed * missed_jump.to(v_up.dtype)
     if extensions.jump_flight or extensions.jump_lift:
         # As SCUT's takeoff state machine, the flight window opens at the
         # physical takeoff event (not the reference clock), so late real

@@ -3,6 +3,8 @@ from __future__ import annotations
 
 import torch
 
+from ..reward_kernel import JUMP_PEAK_TOLERANCE_MAX_M, JUMP_PEAK_TOLERANCE_TARGET_FRACTION
+
 
 class JumpEvaluation:
     """Observe native decisions without changing their state, actions or RNG.
@@ -19,7 +21,8 @@ class JumpEvaluation:
               'left_wheel_load_n', 'right_wheel_load_n')
     CRITERIA = {'flight_max_wheel_load_n': 2., 'flight_confirm_ticks': 2,
                 'ascent_min_velocity_z_m_s': .15, 'ascent_min_rise_m': .01,
-                'peak_tolerance_max_m': .03, 'peak_tolerance_target_fraction': .5,
+                'peak_tolerance_max_m': JUMP_PEAK_TOLERANCE_MAX_M,
+                'peak_tolerance_target_fraction': JUMP_PEAK_TOLERANCE_TARGET_FRACTION,
                 'landing_min_wheel_load_n': 5., 'landing_max_vertical_speed_m_s': .15,
                 'landing_max_tilt_rad': .25, 'landing_max_angular_speed_rad_s': .5,
                 'landing_height_tolerance_m': .05, 'required_stable_landing_s': 2.}

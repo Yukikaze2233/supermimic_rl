@@ -22,7 +22,17 @@ def rebind_teacher_source(saved, source, target, source_path, target_path):
         raise ValueError('Source teacher artifact differs from the saved checkpoint')
     old, new = [torch.load(path, map_location='cpu', weights_only=True, mmap=True)
                 for path in (source_path, target_path)]
-    for payload, native in ((old, source), (new, target)):
+    # Sampling-only handoffs deliberately retained the original teacher and
+    # evaluation. Authenticate that lineage before rebinding its unchanged
+    # weights to a newly evaluated reward/task source.
+    course_migrations = tuple(entry['course_sampling'] for entry in saved.get('resume_migrations', ())
+                              if isinstance(entry, dict) and 'course_sampling' in entry)
+    original_source = source
+    if course_migrations:
+        from .course import compatible_course_source
+
+        original_source = compatible_course_source(old['source']['native_source'], source, course_migrations)
+    for payload, native in ((old, original_source), (new, target)):
         metadata = payload['source']
         report = metadata['qualification']['report']
         if (payload.get('format') != PPO_TEACHER_FORMAT or metadata.get('format') != PPO_TEACHER_FORMAT
