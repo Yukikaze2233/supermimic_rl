@@ -112,6 +112,16 @@ class CourseEnvironment:
             for name in ("physical_step_reward", "learning_reward"):
                 if hasattr(result, name):
                     diagnostics[f"reward_step/{name}"] = getattr(result, name).clone()
+            # Native moments already mask placeholder commands and integrate
+            # all physical substeps. Keep their exposure denominator instead
+            # of averaging per-interval RMS values or filling inactive rows.
+            for name, count in getattr(result, "scoped_error_counts", {}).items():
+                moments = (result.scoped_error_sums[name],
+                           result.scoped_error_square_sums[name], count)
+                measured = torch.stack(tuple(torch.isfinite(value) for value in moments)).all(0)
+                for field, value in zip(("sum", "square_sum", "count"), moments):
+                    diagnostics[f"tracking_scope/{field}/{name}"] = torch.where(
+                        measured, value, float("nan"))
         return Step(self._observation(), reward.float(), terminated.bool(), truncated.bool(),
                     self.env._terminal_critic_182.clone(), tracking,
                     extras["interval_observation_valid"].clone(),

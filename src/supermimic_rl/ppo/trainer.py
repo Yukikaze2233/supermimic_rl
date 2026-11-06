@@ -265,11 +265,30 @@ class EpisodeStatistics:
             result.update({"episode/return_mean": float(returns.mean()), "episode/length_mean": float(lengths.mean()),
                            "episode/count": int(returns.numel())})
         if self.diagnostics is not None:
+            totals = dict(zip(self.diagnostic_names, self.diagnostics.T.cpu().tolist()))
             result["tracking_diagnostics"] = {
                 name: {"samples": int(count), "mean": total / count if count else None,
                        "min": low if count else None, "max": high if count else None}
-                for name, (total, count, low, high) in zip(
-                    self.diagnostic_names, self.diagnostics.T.cpu().tolist())}
+                for name, (total, count, low, high) in totals.items()}
+            scopes = {}
+            prefix = "tracking_scope/count/"
+            for key, (exposure, _, _, _) in totals.items():
+                if not key.startswith(prefix):
+                    continue
+                name = key[len(prefix):]
+                error = totals[f"tracking_scope/sum/{name}"][0]
+                square = totals[f"tracking_scope/square_sum/{name}"][0]
+                scopes[name] = {
+                    "equivalent_policy_intervals": exposure,
+                    "mean_error": error / exposure if exposure > 0 else None,
+                    "rms_error": math.sqrt(square / exposure) if exposure > 0 else None,
+                }
+            if scopes:
+                result["tracking_scopes"] = scopes
+                result["tracking_scope_aggregation"] = (
+                    "native physical-substep error moments divided by their own task exposure; "
+                    "equivalent_policy_intervals sums active substep fractions over valid intervals, "
+                    "including terminal intervals; zero exposure has no error estimate")
             result["tracking_diagnostic_timing"] = (
                 "physical endpoint before reset versus command held during that interval; "
                 "velocity_height_gate is the native four-substep mean")
