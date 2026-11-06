@@ -77,6 +77,13 @@ def course_progress(native, curriculum):
     authored = metrics["authored_stair_completion"]
     for name in ("ended", "ended_complete"):
         counters[f"course/stair/authored_{name}"] = sum(authored[name + "_by_tile"])
+    # Already-materialized native counts: reset placements are exposure, never
+    # successful traversals. Older routers do not publish these named groups.
+    coverage = metrics.get("stair_coverage", {})
+    for source, label in (("authored_reset_counts", "authored_birth_placements"),
+                          ("foundation_rehearsal_reset_counts", "foundation_rehearsal_birth_placements")):
+        counters.update({f"course/terrain/{label}/{asset}": count
+                         for asset, count in coverage.get(source, {}).items()})
     counters.update({f"course/recovery/{name}": value
                      for name, value in metrics["recovery"]["counts"].items()})
     counters.update({f"course/births/{name}": value

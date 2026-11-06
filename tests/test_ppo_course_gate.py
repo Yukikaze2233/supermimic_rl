@@ -119,6 +119,29 @@ def test_native_course_counters_and_stage_starts_are_read_without_policy_inputs(
     assert counters["course/births/request"] == 4 and gauges["course/terrain/level_fraction"] == .5
     assert gauges["course/jump/height_cap_m"] == .2 and gauges["course/jump/height_level"] == 1.
     assert environment.course_stage_starts() == {"a": 0, "b": 10, "c": 30}
+    assert not any("birth_placements" in name for name in counters)
+
+    # The source groups are cumulative actual reset placements. Reuse the
+    # existing per-update delta path, keeping completion credit independent.
+    metrics["stair_coverage"] = {
+        "authored_reset_counts": {"road_step": 10, "central_steps": 12},
+        "foundation_rehearsal_reset_counts": {"road_step": 2, "central_steps": 3}}
+    counters, _ = environment.course_progress()
+    assert counters["course/terrain/authored_birth_placements/road_step"] == 10
+    assert counters["course/terrain/authored_birth_placements/central_steps"] == 12
+    assert counters["course/terrain/foundation_rehearsal_birth_placements/road_step"] == 2
+    assert counters["course/terrain/foundation_rehearsal_birth_placements/central_steps"] == 3
+    assert counters["course/stair/authored_ended_complete"] == 2
+    trainer = object.__new__(PPOTrainer)
+    trainer.environment, trainer._course_counters = environment, counters
+    metrics["stair_coverage"]["authored_reset_counts"].update(road_step=11, central_steps=14)
+    metrics["stair_coverage"]["foundation_rehearsal_reset_counts"].update(road_step=3, central_steps=4)
+    delta = trainer._course_progress()
+    assert delta["course/terrain/authored_birth_placements/road_step"] == 1
+    assert delta["course/terrain/authored_birth_placements/central_steps"] == 2
+    assert delta["course/terrain/foundation_rehearsal_birth_placements/road_step"] == 1
+    assert delta["course/terrain/foundation_rehearsal_birth_placements/central_steps"] == 1
+    assert delta["course/stair/authored_ended_complete"] == 0
 
 
 def test_restarting_the_hold_keeps_the_coordinate_and_clears_the_old_window():
