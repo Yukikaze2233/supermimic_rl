@@ -22,7 +22,8 @@ class JumpOutcomeMetrics:
         self.counts = torch.zeros(2, len(RISE_BINS), dtype=torch.long, device=self.rise.device)
 
     def _count(self, outcome, mask):
-        bins = torch.bucketize(self.rise, self.edges, right=True)
+        # Match JumpAssist's upper-inclusive curriculum height bins.
+        bins = torch.bucketize(self.rise, self.edges, right=False)
         self.counts[outcome].scatter_add_(0, bins, mask.long())
 
     def _track(self):

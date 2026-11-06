@@ -169,3 +169,30 @@ def test_unassisted_outcomes_capture_substep_success_and_reset_without_actuation
         assert values['course/jump_assist/unassisted_ended_rise_' + name] == 1
     assert values['course/jump_assist/unassisted_success_rise_0.00-0.10'] == 1
     assert torch.equal(rng, torch.get_rng_state())
+
+
+@pytest.mark.parametrize('offset', ['below', 'at', 'above'])
+def test_world_outcome_bins_include_the_current_height_cap(offset):
+    from supermimic_rl.course.jump_assist import RISE_BINS
+
+    rise = torch.tensor([.10, .20, .30])
+    if offset != 'at':
+        direction = torch.full_like(rise, float('-inf') if offset == 'below' else float('inf'))
+        rise = torch.nextafter(rise, direction)
+    tasks = SimpleNamespace(physical_id=torch.tensor([1, 2, 3]),
+        active_rise=rise, success_id=torch.full((3,), -1))
+
+    def observe():
+        tasks.success_id.copy_(tasks.physical_id)
+        tasks.physical_id.fill_(-1)
+
+    tasks.observe_physics = observe
+    native = SimpleNamespace(_terrain_course=SimpleNamespace(tasks=tasks))
+    install_jump_outcome_metrics(native)
+    tasks.observe_physics()
+    tasks.observe_physics()
+    counters, _ = native.supermimic_jump_outcomes.metrics()
+    expected = [0, 1, 1, 1] if offset == 'above' else [1, 1, 1, 0]
+    for name, count in zip(RISE_BINS, expected):
+        for outcome in ('ended', 'success'):
+            assert counters[f'course/jump_assist/unassisted_{outcome}_rise_{name}'] == count

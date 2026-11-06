@@ -207,6 +207,35 @@ def test_ended_requests_are_classified_against_the_native_peak_window():
     assert counters["course/jump_assist/unassisted_peak_high_rise_0.30-0.40"] == 1
 
 
+@pytest.mark.parametrize('offset', ['below', 'at', 'above'])
+def test_height_caps_belong_to_the_bin_that_unlocked_them(offset):
+    from supermimic_rl.course.jump_assist import RISE_BINS
+
+    native = Native()
+    rise = torch.tensor([.10, .20, .30])
+    if offset != 'at':
+        direction = torch.full_like(rise, float('-inf') if offset == 'below' else float('inf'))
+        rise = torch.nextafter(rise, direction)
+    native.tasks.active_rise.copy_(rise)
+    assist = install_jump_assist(native, curriculum(350), {'probability': 0.})
+    native.tasks.physical_id[:] = torch.tensor([4, 5, 6])
+    native._apply_action()
+
+    def decide():
+        native.tasks.success_id.copy_(native.tasks.physical_id)
+        native.tasks.physical_id.fill_(-1)
+
+    native.outcome = decide
+    native.observe()
+    native.observe()  # Ended requests must not be counted again.
+    counters, _ = assist.metrics()
+    expected = [0, 1, 1, 1] if offset == 'above' else [1, 1, 1, 0]
+    for name, count in zip(RISE_BINS, expected):
+        for outcome in ('ended', 'success', 'unassisted_ended', 'unassisted_success'):
+            assert counters[f'course/jump_assist/{outcome}_rise_{name}'] == count
+    assert not native.wrenches
+
+
 def test_settling_ticks_after_a_correct_jump_are_split_by_native_condition():
     native = Native()
     assist = install_jump_assist(native, curriculum(100), {"probability": 0.})

@@ -33,7 +33,9 @@ import torch
 
 # transformer_rl.formal.tasks.jump.ReferenceStage
 EXTENSION, BALLISTIC = 1, 2
-# Outcomes of all requests and of unassisted requests per requested-rise bin [m].
+# Requested-rise bins include their upper bound: (0, .10], (.10, .20], ... .
+# The sampler explicitly draws the current height cap; those requests must
+# contribute to the same bin whose performance unlocks the next cap.
 RISE_BIN_EDGES = (.10, .20, .30)
 RISE_BINS = tuple(f'{low:.2f}-{high:.2f}' for low, high in zip((.0, *RISE_BIN_EDGES), (*RISE_BIN_EDGES, .40)))
 # "liftoff": the ended request was airborne after real ascent (whether or not it then succeeded).
@@ -116,7 +118,7 @@ class JumpAssist:
         self.counts[index] += rows.sum()
 
     def _count_by_rise(self, kind, rows, helped):
-        bins = torch.bucketize(self.rise, self.edges, right=True)
+        bins = torch.bucketize(self.rise, self.edges, right=False)
         for index, name in enumerate(RISE_BINS):
             in_bin = rows & (bins == index)
             self._count(f'{kind}_rise_{name}', in_bin)
