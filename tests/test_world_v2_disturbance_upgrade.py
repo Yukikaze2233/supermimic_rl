@@ -7,7 +7,7 @@ import pytest
 import torch
 
 from supermimic_rl.contracts import Field, StateSchema
-from supermimic_rl.course.randomization import RequestedRandomizationConfig
+from supermimic_rl.course.randomization import CourseRandomization, RequestedRandomizationConfig
 from supermimic_rl.world_model_v2.auxiliary_data import AuxiliaryWorldData, WorldDatasetConfig
 from supermimic_rl.world_model_v2.disturbance import DISTURBANCE_RECORD_FIELDS, DISTURBANCE_STATE_FIELDS
 from supermimic_rl.world_model_v2.imagination import Critic
@@ -34,6 +34,10 @@ def fixture(tmp_path):
     saved['course_progression'] = {'coordinate': 800000000, 'passed': [True, False]}
     configs = [RequestedRandomizationConfig(), RequestedRandomizationConfig(
         external_force_n=15., external_torque_nm=1.5, push_linear_m_s=.5, push_yaw_rad_s=1.)]
+    randomization = CourseRandomization(2, seed=41, config=configs[0])
+    randomization.reset(torch.tensor([True, True]), 5000)
+    saved['environment'] = {'course': {'coordinate': 800000000}, 'control_timing': {
+        'episode_randomization': randomization.state_dict(), 'communication': {'untouched': torch.randn(3)}}}
     runtimes = [json.dumps({'physics': 'unchanged', 'requested_randomization': asdict(c)}).encode()
                 for c in configs]
     old = StateSchema.from_dict(saved['schema'])
@@ -81,8 +85,19 @@ def test_expansion_preserves_predictions_adam_statistics_and_training_state(tmp_
     rng = torch.get_rng_state().clone()
     upgraded, replay, report = upgrade_disturbances(saved, data, reference, **options)
     assert torch.equal(torch.get_rng_state(), rng)
-    for key in saved.keys() - {'schema', 'schema_fingerprint', 'learner', 'teacher_source', 'resume_migrations'}:
+    for key in saved.keys() - {'schema', 'schema_fingerprint', 'learner', 'teacher_source', 'resume_migrations', 'environment'}:
         assert upgraded[key] is saved[key], key
+    old_timing = saved['environment']['control_timing']
+    new_timing = upgraded['environment']['control_timing']
+    assert new_timing['communication'] is old_timing['communication']
+    assert upgraded['environment']['course'] is saved['environment']['course']
+    for key in old_timing['episode_randomization'].keys() - {'configuration'}:
+        assert new_timing['episode_randomization'][key] is old_timing['episode_randomization'][key]
+    restored = CourseRandomization(2, seed=41,
+        config=RequestedRandomizationConfig(**new_timing['episode_randomization']['configuration']))
+    restored.restore_after_physical_reset(new_timing['episode_randomization'])
+    assert torch.equal(restored.generator.get_state(), old_timing['episode_randomization']['rng'])
+    assert restored.reset_rows_consumed == old_timing['episode_randomization']['reset_rows_consumed']
     for key in ('updates', 'skipped', 'actor'):
         assert upgraded['learner'][key] is saved['learner'][key]
     assert report['additional_warmup_cycles'] == 0

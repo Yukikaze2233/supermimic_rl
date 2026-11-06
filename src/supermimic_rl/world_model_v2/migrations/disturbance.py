@@ -115,6 +115,15 @@ def upgrade_disturbances(saved, dataset, reference, *, source_runtime, target_ru
     pair, config = _runtime_pair(source_runtime, target_runtime, source, target)
     if not zero_disturbance_contract(before, after, (pair,)):
         raise ValueError('Only verified zero-disturbance history can migrate; other contracts must match')
+    environment = saved['environment']
+    timing = environment['control_timing']
+    randomization = timing['episode_randomization']
+    if (randomization['format'] != 'requested_course_randomization_v1'
+            or RequestedRandomizationConfig(**randomization['configuration'])
+            != RequestedRandomizationConfig(**source['randomization']['configuration'])):
+        raise ValueError('Saved environment randomization differs from the source runtime')
+    environment = {**environment, 'control_timing': {**timing,
+        'episode_randomization': {**randomization, 'configuration': asdict(config)}}}
     if saved.get('task_norm_pending') or saved.get('critic_norm_from') is not None:
         raise ValueError('Complete the existing feature migration before adding disturbances')
     for a, b in (('stair_scenario', 'stair_source_config'), ('jump_scenario', 'jump_task_config'),
@@ -158,9 +167,10 @@ def upgrade_disturbances(saved, dataset, reference, *, source_runtime, target_ru
         'old_physical_transitions_retained': storage['physical'].shape[0] * storage['physical'].shape[1],
         'legacy_conditions': 'verified zero push/wrench; unavailable scheduler states excluded from imagination',
         'new_weights_and_adam_columns': 'zero; all previous columns and optimization states preserved',
+        'environment_randomization': 'configuration migrated; RNG and reset count unchanged',
         'additional_warmup_cycles': 0, 'physics_resume': 'explicit cold reset; new episode namespace'}
     upgraded = {**saved, 'schema': new.to_dict(), 'schema_fingerprint': new.fingerprint,
-        'learner': learner, 'teacher_source': teacher,
+        'learner': learner, 'teacher_source': teacher, 'environment': environment,
         'resume_migrations': [*saved.get('resume_migrations', []), report]}
     replay = {**dataset, 'schema_fingerprint': new.fingerprint,
               'replay': {**dataset['replay'], 'storage': {**storage, **additions}}}
