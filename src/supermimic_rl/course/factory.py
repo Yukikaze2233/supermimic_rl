@@ -152,7 +152,8 @@ def create_course(configuration):
             from .jump_assist import install_jump_assist
 
             jump_assist_receipt = install_jump_assist(native, curriculum, configuration["jump_assist"]).receipt()
-        install_authored_routing(native)
+        install_authored_routing(native, rehearsal_curriculum=(
+            curriculum if curriculum.config.foundation_authored_rehearsal else None))
         provenance = {
             "upstream_commit": commit, "runtime_sha256": configuration["runtime_sha256"],
             "course_sha256": configuration["course_sha256"],

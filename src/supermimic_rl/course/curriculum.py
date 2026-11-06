@@ -85,6 +85,9 @@ class CourseCurriculumConfig:
     # may draw it}. Postures absent from the map use the first stage. Empty keeps
     # every configured posture from the first recovery birth on.
     recovery_posture_stages: dict = field(default_factory=dict)
+    # Reuse one fifth of the existing STEP_UP birth slots for the two named
+    # authored assets. This is a birth quota, not the native random ceiling mask.
+    foundation_authored_rehearsal: bool = False
 
     def __post_init__(self):
         budgets = tuple(self.stage_transition_budgets)
@@ -152,6 +155,8 @@ class CourseCurriculumConfig:
                 or any(stage not in STAGE_NAMES for stage in stages.values())):
             raise ValueError("recovery_posture_stages maps configured postures to course stages")
         object.__setattr__(self, "recovery_posture_stages", stages)
+        if type(self.foundation_authored_rehearsal) is not bool:
+            raise ValueError("foundation_authored_rehearsal must be boolean")
         if self.jump_standing_fraction_of_stage >= self.jump_full_motion_fraction_of_stage:
             raise ValueError("Jump moving exposure must follow standing exposure")
         object.__setattr__(self, "stage_transition_budgets", budgets)
@@ -169,7 +174,11 @@ class CourseCurriculumConfig:
         return cls(**value)
 
     def to_dict(self):
-        return json.loads(json.dumps(asdict(self)))
+        result = json.loads(json.dumps(asdict(self)))
+        # A disabled opt-in must preserve old checkpoint configuration identity.
+        if not self.foundation_authored_rehearsal:
+            result.pop("foundation_authored_rehearsal")
+        return result
 
 
 class _TransitionBudget:
@@ -231,6 +240,12 @@ class SuperMimicCurriculum(FormalTaskCurriculum):
             "family": [0] * len(TaskFamily), "terrain": [0] * len(TerrainKind),
             "recovery_posture": [0] * len(RECOVERY_NAMES), "jump_motion": [0, 0],
         }
+        # A reset samples then routes within the same call. This transient row
+        # receipt is never replayed across physical reset/checkpoint restore;
+        # the persisted terrain ordinal determines the next draw exactly.
+        self._foundation_authored_rows = (torch.zeros(num_envs, dtype=torch.bool, device=device)
+                                         if config.foundation_authored_rehearsal else None)
+        self._pending_foundation_authored = None
 
     def set_progress(self, real_transitions, actor_updates):
         for name, value in (("real_transitions", real_transitions), ("actor_updates", actor_updates)):
@@ -309,6 +324,8 @@ class SuperMimicCurriculum(FormalTaskCurriculum):
         posture, terrain = draw.recovery_posture.clone(), draw.terrain_kind.clone()
         command, nominal = draw.requested_command.clone(), draw.nominal.clone()
         trajectory, step = draw.trajectory_kind.clone(), draw.step_up_m.clone()
+        rehearsal = (torch.zeros_like(draw.family, dtype=torch.bool)
+                     if self.config.foundation_authored_rehearsal else None)
         for family in (TaskFamily.RECOVERY, TaskFamily.TERRAIN, TaskFamily.REQUEST):
             rows = (draw.family == int(family)).nonzero().flatten()
             if not len(rows):
@@ -335,6 +352,17 @@ class SuperMimicCurriculum(FormalTaskCurriculum):
                     ]))
                 if self.stage >= self.stage_names.index('authored_steps'):
                     step[rows[endpoint]] = self.domain.step_up_m[1]
+                if rehearsal is not None and self.stage_name == 'terrain_foundation':
+                    # The foundation cycle already gives STEP_UP one
+                    # slot. Every fifth such slot is shared equally by the two
+                    # real assets, without consuming another random draw.
+                    cycle = ordinal // len(pool)
+                    selected = ((terrain[rows] == int(TerrainKind.STEP_UP)) & (cycle % 5 == 0))
+                    chosen = rows[selected]
+                    terrain[chosen] = torch.where((cycle[selected] // 5) % 2 == 0,
+                                                 int(TerrainKind.STEP_UP), int(TerrainKind.TWO_PLATFORMS))
+                    step[chosen] = self.domain.step_up_m[1]
+                    rehearsal[chosen] = True
             else:
                 scale = self._request_motion_scale()
                 moving = (ordinal % 2 == 1) & (scale > 0)
@@ -353,6 +381,7 @@ class SuperMimicCurriculum(FormalTaskCurriculum):
                 nominal[rows], trajectory[rows] = False, 0
                 self.sample_counts["jump_motion"][0] += int((~moving).sum())
                 self.sample_counts["jump_motion"][1] += int(moving.sum())
+        self._pending_foundation_authored = rehearsal
         return replace(draw, recovery_posture=posture, terrain_kind=terrain,
                        requested_command=command, nominal=nominal,
                        trajectory_kind=trajectory, step_up_m=step)
@@ -365,6 +394,9 @@ class SuperMimicCurriculum(FormalTaskCurriculum):
                 or ids.unique().numel() != len(ids)):
             raise ValueError("Reset IDs must be unique in-range integer environment indices")
         draw = super().sample(ids)
+        if self._foundation_authored_rows is not None:
+            self._foundation_authored_rows[ids] = self._pending_foundation_authored
+            self._pending_foundation_authored = None
         for name, values in (
             ("family", draw.family),
             ("terrain", draw.terrain_kind[draw.family == int(TaskFamily.TERRAIN)]),
@@ -373,6 +405,29 @@ class SuperMimicCurriculum(FormalTaskCurriculum):
             counts = torch.bincount(values, minlength=len(self.sample_counts[name])).cpu().tolist()
             self.sample_counts[name] = [a + b for a, b in zip(self.sample_counts[name], counts)]
         return draw
+
+    def foundation_authored_rehearsal_receipt(self):
+        if not self.config.foundation_authored_rehearsal:
+            return None
+        return {
+            "contract": "foundation_authored_birth_rehearsal_v1",
+            "stage": self.stage_names.index('terrain_foundation'),
+            "source_slots": "STEP_UP in the configured foundation terrain cycle",
+            "slot_period": 5,
+            "asset_cycle": ["road_step", "central_steps"],
+            "requested_step_up_m": self.domain.step_up_m[1],
+            "selection": "persisted terrain-family ordinal; no extra random draws",
+            "other_routes": "native routing and its 20-percent ceiling exploration unchanged",
+            "cap_scope": "selected authored births only; ordinary level and step caps unchanged",
+        }
+
+    def foundation_authored_rehearsal_rows(self, ids):
+        """Rows certified by their latest birth draw before synchronous routing."""
+        if self._foundation_authored_rows is None:
+            raise ValueError("Foundation authored rehearsal is disabled")
+        if self.stage_name != 'terrain_foundation':
+            return torch.zeros(len(ids), dtype=torch.bool, device=self.device)
+        return self._foundation_authored_rows[ids].clone()
 
     def state_dict(self):
         return {
@@ -404,3 +459,6 @@ class SuperMimicCurriculum(FormalTaskCurriculum):
         self.real_transitions, self.actor_updates = prepared.real_transitions, prepared.actor_updates
         self.budget, self.sampler = prepared.budget, prepared.sampler
         self.sample_counts = {key: list(value) for key, value in counts.items()}
+        if self._foundation_authored_rows is not None:
+            self._foundation_authored_rows.zero_()
+            self._pending_foundation_authored = None
