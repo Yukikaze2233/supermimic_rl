@@ -129,7 +129,7 @@ compact 数据没有独立保存四个子步的原生 phase／reward reference�
 
 ## 跳跃目标修正的在线断点迁移
 
-`upgrade_online_reward_reference.py` 只处理 `4467228` 修正的提前 LANDING 目标问题。
+`upgrade_online_reward_reference.py` 默认处理 `4467228` 修正的提前 LANDING 目标问题。
 输入完整 checkpoint/replay、修正版本的原生参考数据，以及同一教师权重的新原生评价产物。
 物理、观测、任务参数、奖励数值权重和所有记录字段必须相同；只更新 reward kernel 来源。
 Actor、Critic、世界模型、估计器、Adam、归一化、课程及 RNG 全部保留，不追加 warmup。
@@ -148,3 +148,7 @@ python scripts/upgrade_online_reward_reference.py \
 标识这些历史行；不能将其用于新版奖励一致性检查。世界模型拟合使用物理子步监督，
 策略/价值目标在想象中按新版公式重新计算，不读取这些历史奖励作为目标。
 后续回放轮换会自然替换旧行；迁移本身不修改样本、任务记忆或模型权重。
+
+`--change recovery-quiet` 是独立的已知来源迁移，仅启用 1/s 恢复接稳扩展；
+要求输入已经包含上述 LANDING 修正，其他奖励权重不变。
+具体公式与使用边界见 [恢复任务说明](WORLD_MODEL_V2_RECOVERY_TASK.md#可选恢复接稳奖励)。
