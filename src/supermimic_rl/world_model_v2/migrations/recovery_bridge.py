@@ -63,28 +63,6 @@ def verify_saved_proof(proof):
     return checked
 
 
-def compatible_recovery_bridge_source(recorded, live, migrations):
-    """Undo this sampling identity only; every unrelated difference stays visible.
-
-    Callers still compare the complete returned source or pass it through their
-    explicit chronological lineage. This does not certify a teacher capability.
-    """
-    target = deepcopy(live)
-    for proof in reversed(migrations):
-        if all(recorded.get(key) == target.get(key) for key in IDENTITY_KEYS):
-            break
-        if (proof.get('format') != FORMAT
-                or any(target.get(key) != proof.get('after', {}).get(key) for key in IDENTITY_KEYS)):
-            continue
-        checked = verify_saved_proof(proof)
-        for key in IDENTITY_KEYS:
-            if key in checked['before']:
-                target[key] = deepcopy(checked['before'][key])
-            else:
-                target.pop(key, None)
-    return target
-
-
 def upgrade_recovery_roll_bridge(saved, dataset, target_schema, *, source_course,
                                  target_course, sampler_device='cpu'):
     """Preserve a complete pair; append six zero birth labels to the old ledger.

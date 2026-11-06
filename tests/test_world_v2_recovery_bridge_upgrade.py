@@ -12,7 +12,7 @@ from supermimic_rl.contracts import StateSchema
 from supermimic_rl.course.jump_first import make_course_curriculum
 from supermimic_rl.course.recovery_bridge import receipt as bridge_receipt
 from supermimic_rl.world_model_v2.migrations.recovery_bridge import (
-    FORMAT, compatible_recovery_bridge_source, upgrade_recovery_roll_bridge,
+    FORMAT, upgrade_recovery_roll_bridge,
     verify_recovery_bridge_sampling, verify_saved_proof,
 )
 from test_world_v2_course_sampling_upgrade import candidate as original_fixture, encoded
@@ -138,22 +138,17 @@ def test_teacher_and_auxiliary_metadata_remain_original_and_scope_is_not_expande
     assert upgraded['auxiliary_world'] is saved['auxiliary_world']
     old = upgraded['teacher_source']['native_source']
     live = json.loads(target.source)
-    proof = report['recovery_roll_bridge_sampling']
     assert old != live
-    assert compatible_recovery_bridge_source(old, live, (proof,)) == old
     assert upgraded['teacher_source']['qualified_for'] == ['original-data-domain']
 
 
-def test_proof_authentication_leaves_unrelated_differences_visible(candidate):
+def test_proof_authentication_keeps_the_complete_before_after_sources(candidate):
     saved, data, target, options = candidate
     _, _, report = upgrade_recovery_roll_bridge(saved, data, target, **options)
     proof = report['recovery_roll_bridge_sampling']
     assert proof['format'] == FORMAT and verify_saved_proof(proof) == proof
-    source, live = json.loads(saved['schema']['source']), json.loads(target.source)
-    assert compatible_recovery_bridge_source(source, live, ()) == live
-    different = {**live, 'runtime_sha256': 'not-the-same-runtime'}
-    undone = compatible_recovery_bridge_source(source, different, (proof,))
-    assert undone['runtime_sha256'] == 'not-the-same-runtime' and undone != source
+    assert proof['before'] == json.loads(saved['schema']['source'])
+    assert proof['after'] == json.loads(target.source)
     for modified in ({**proof, 'extra': True}, {**proof, 'source_course_utf8': proof['source_course_utf8'] + ' '}):
         with pytest.raises(ValueError):
             verify_saved_proof(modified)
