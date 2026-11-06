@@ -219,6 +219,63 @@ def test_success_event_extension_is_paid_and_recorded():
         install_shared_reward(setup('ordinary')[0], verify_native=True, extensions=RewardExtensions(jump_flight=1.))
 
 
+@pytest.mark.parametrize('mode', [CommandMode.NORMAL, CommandMode.SLOPE, CommandMode.STAIR,
+                                  CommandMode.JUMP, CommandMode.RECOVERY])
+def test_ordinary_acceleration_override_preserves_other_tasks_and_terms(mode):
+    from supermimic_rl.reward_kernel import RewardExtensions
+
+    case = 'jump_flight' if mode == CommandMode.JUMP else 'recovery' if mode == CommandMode.RECOVERY else 'ordinary'
+    composer, reference = setup(case)
+    reference = replace(reference, mode=torch.full((2,), int(mode)))
+    begin(composer, reference, torch.zeros(2, 6))
+    parameters = RewardParameters.from_composer(composer)
+    history = RewardHistory(composer._window['dq'], torch.zeros(2), torch.zeros(2), torch.ones(2))
+    physics = sample(composer, 1)
+    baseline = physical_reward_densities(physics, reference, history, parameters)
+    extension = RewardExtensions(ordinary_leg_acceleration=1e-7)
+    assert extension.active and not extension.needs_jump_progress
+    result = physical_reward_densities(physics, reference, history, replace(parameters, extensions=extension))
+    for name, value in baseline.components.items():
+        scale = .2 if name == 'cost.leg_acceleration' and mode not in (CommandMode.JUMP, CommandMode.RECOVERY) else 1.
+        torch.testing.assert_close(result.components[name], value * scale, atol=1e-8, rtol=1e-6)
+
+
+def test_ordinary_acceleration_cost_integrates_physical_seconds_and_keeps_gradients():
+    from supermimic_rl.reward_kernel import RewardExtensions
+
+    composer, reference = setup('ordinary')
+    receipt = install_shared_reward(composer, extensions=RewardExtensions(ordinary_leg_acceleration=1e-7))
+    assert receipt['extensions']['ordinary_leg_acceleration'] == 1e-7
+    begin(composer, reference, torch.zeros(2, 6))
+    for tick in range(1, 5):
+        # All four leg velocities rise at 10 rad/s^2 for the entire 20 ms.
+        velocity = torch.zeros(2, 6)
+        velocity[:, :4] = tick * .005 * 10
+        physics = replace(sample(composer, tick), policy_velocity_rad_s=velocity)
+        composer.observe(physics, reference)
+    result = finish(composer)
+    torch.testing.assert_close(result.component_densities['cost.leg_acceleration'],
+                               torch.full((2,), -4e-5, dtype=torch.float64))
+
+    parameters = RewardParameters.from_composer(composer)
+    history = RewardHistory(torch.zeros(2, 6), torch.zeros(2), torch.zeros(2), torch.ones(2))
+    velocity = torch.full((2, 6), .1, dtype=torch.float64, requires_grad=True)
+
+    def score(value):
+        return physical_reward_densities(replace(physics, policy_velocity_rad_s=value),
+            reference, history, parameters).components['cost.leg_acceleration'].sum()
+
+    gradient, = torch.autograd.grad(score(velocity), (velocity,))
+    direction = torch.tensor([[1., -2., 3., -1., 0., 0.]], dtype=torch.float64).expand(2, -1)
+    epsilon = 1e-5
+    numeric = (score(velocity + epsilon * direction) - score(velocity - epsilon * direction)) / (2 * epsilon)
+    torch.testing.assert_close((gradient * direction).sum(), numeric, atol=1e-10, rtol=1e-6)
+    assert (gradient[:, :4] < 0).all() and not gradient[:, 4:].any()
+    for invalid in (-1., float('nan'), float('inf')):
+        with pytest.raises(ValueError, match='finite and nonnegative'):
+            RewardExtensions(ordinary_leg_acceleration=invalid)
+
+
 @pytest.mark.parametrize('case', ['ordinary', 'terrain', 'gimbal', 'jump_takeoff', 'jump_flight', 'jump_landing'])
 def test_recovery_quiet_does_not_pay_other_tasks(case):
     from supermimic_rl.reward_kernel import RewardExtensions

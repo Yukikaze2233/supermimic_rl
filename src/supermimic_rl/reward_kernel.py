@@ -69,6 +69,10 @@ class RewardExtensions:
     smooth weight and the yaw tracking kernel's 0.25 (rad/s)^2 scale. This
     supplies a settling signal without damping the whole flip or changing the
     recovery handoff. It is not physical success or contact certification.
+
+    ``ordinary_leg_acceleration`` overrides the physical acceleration cost
+    only for normal, slope and stair locomotion. None retains the native
+    5e-7 coefficient; jump and recovery always retain their native cost.
     """
 
     jump_flight: float = 0.        # per second in the request's first real flight (after real ascent)
@@ -80,10 +84,12 @@ class RewardExtensions:
     jump_settle: float = 0.        # per second at a 2 s native stable-landing streak (25% at its start)
     jump_landing_rate: float = 0.  # per second and (rad/s)^2 of body angular speed above 0.4 rad/s after a real landing
     recovery_quiet: float = 0.    # per second at quiet, upright target height; default retains native parity
+    ordinary_leg_acceleration: float | None = None  # per second and (rad/s^2)^2, summed over four legs
 
     def __post_init__(self):
         values = (self.jump_flight, self.jump_lift, self.jump_lift_cap_m_s, self.jump_push, self.jump_missed,
                   self.jump_settle, self.jump_landing_rate, self.recovery_quiet,
+                  0. if self.ordinary_leg_acceleration is None else self.ordinary_leg_acceleration,
                   1. if self.success_event is None else self.success_event)
         if any(type(value) not in (int, float) or not math.isfinite(value) or value < 0 for value in values):
             raise ValueError("Reward extensions must be finite and nonnegative")
@@ -91,7 +97,8 @@ class RewardExtensions:
     @property
     def active(self) -> bool:
         return bool(self.jump_flight or self.jump_lift or self.jump_push or self.jump_missed or self.jump_settle
-                    or self.jump_landing_rate or self.recovery_quiet or self.success_event is not None)
+                    or self.jump_landing_rate or self.recovery_quiet or self.success_event is not None
+                    or self.ordinary_leg_acceleration is not None)
 
     @property
     def needs_jump_progress(self) -> bool:
@@ -413,6 +420,10 @@ def physical_reward_densities(sample: RewardPhysics, reference: RewardReference,
             'joint_boundary': 2 * (sample.joint_boundary_shortfall_rad / .05).square().sum(-1),
             'flight_wheel_effort': .2 * flight * (effort[:, 4:] / 4.5).square().sum(-1),
             'landing_impact': .5 * landing * h(excess_landing)}
+    if parameters.extensions.ordinary_leg_acceleration is not None:
+        cost['leg_acceleration'] = torch.where(ordinary,
+            parameters.extensions.ordinary_leg_acceleration * ddq[:, :4].square().sum(-1),
+            cost['leg_acceleration'])
     if reference.intentional_base_contact is not None and not rough_dash:
         base = parameters.base_index
         # Explicitly permitted terrain base contact exempts only the base.
