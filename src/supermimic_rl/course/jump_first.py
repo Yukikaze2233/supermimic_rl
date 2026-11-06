@@ -90,7 +90,8 @@ class JumpFirstCurriculum(SuperMimicCurriculum):
     opened_gates: frozenset[str] | None = None
 
     def set_opened_gates(self, keys) -> None:
-        self.opened_gates = frozenset(keys)
+        """Use measured gate openings, or None for the authored exposure schedule."""
+        self.opened_gates = None if keys is None else frozenset(keys)
 
     def ladder_gate_keys(self) -> tuple[str, ...]:
         """Performance gate keys (``stage@fraction``) of the jump height ladder, in order."""

@@ -270,6 +270,11 @@ def test_reported_height_ladder_follows_opened_gates_while_the_assist_fades_with
     curriculum.set_opened_gates(['active_jump@0.25', 'active_jump@0.5', 'active_jump@0.75'])
     assert curriculum._effective_domain().jump_m[1] == .40
     assert curriculum.ladder_gate_keys() == ('active_jump@0.25', 'active_jump@0.5', 'active_jump@0.75')
+    curriculum.set_opened_gates([])
+    assert curriculum._effective_domain().jump_m[1] == .10
+    curriculum.set_opened_gates(None)
+    assert curriculum.jump_height_level() is None
+    assert curriculum._effective_domain().jump_m == (.03, .40)
     assist.curriculum = make_course_curriculum(4, 'cpu', 7, json.loads((root / 'ppo-course-gated-v5.json').read_text()))
     assist.curriculum.set_progress(assist.stage_start + assist.stage_budget // 4, 0)   # a quarter into the stage
     assist.curriculum.set_opened_gates([])

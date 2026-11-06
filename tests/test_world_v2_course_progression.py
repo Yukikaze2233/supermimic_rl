@@ -44,7 +44,7 @@ def curriculum():
     result = SimpleNamespace(stage_names=('flat', 'jump', 'terrain', 'combined'),
         stage_budgets=(100, 100, 100, 100),
         ladder_gate_keys=lambda: ('jump@0.25', 'jump@0.5'), opened=())
-    result.set_opened_gates = lambda keys: setattr(result, 'opened', tuple(keys))
+    result.set_opened_gates = lambda keys: setattr(result, 'opened', None if keys is None else tuple(keys))
     return result
 
 
@@ -109,6 +109,44 @@ def test_activation_preserves_existing_training_recipe_and_absolute_warmup():
     assert trainer.config.policy_start_cycle < saved['cycle']
     assert trainer.config.learning == OnlineConfig.from_dict(saved['config']).learning
     assert OnlineConfig.from_dict(asdict(trainer.config)) == trainer.config
+
+
+def test_scheduled_height_keeps_failed_gate_evidence_and_can_resume_without_rewinding(monkeypatch):
+    counters = {'success': 0, 'ended': 0}
+    monkeypatch.setattr('supermimic_rl.world_model_v2.course_progression.course_progress',
+        lambda native, course: (dict(counters), {}))
+    original = CourseProgression(progression_config(), curriculum())
+    for _ in range(3):
+        before = original.snapshot_counters(None)
+        counters['ended'] += 1
+        original.observe(None, {'course_coordinate': 350}, before)
+    state = deepcopy(original.state_dict())
+    course = curriculum()
+    schedule = replace(progression_config(), jump_height_progression='schedule')
+    resumed = CourseProgression(schedule, course)
+    resumed.load_state_dict(state)
+    assert course.opened is None and resumed.gates.opened == []
+    assert resumed.state_dict() == state
+    before = resumed.snapshot_counters(None)
+    counters['ended'] += 1
+    report = resumed.observe(None, {'course_coordinate': 350}, before)
+    assert report['jump_height_progression'] == 'schedule'
+    assert report['waiting']['jump@0.25'] > state['waiting']['jump@0.25']
+    assert not report['gates']['jump@0.25']['passed']
+
+    saved, trainer = resume_fixture()
+    saved['config'] = asdict(trainer.config)
+    saved['config']['course_progression'].pop('jump_height_progression')  # Legacy default.
+    trainer.config = replace(trainer.config, course_progression=schedule)
+    snapshot = deepcopy(saved)
+    trainer._check_saved(saved)
+    assert not trainer.course_progression_activated and saved == snapshot
+    assert trainer.jump_height_progression_changed == {'before': 'performance', 'after': 'schedule'}
+    trainer.config = replace(trainer.config, course_progression=replace(schedule, end_coordinate=399))
+    with pytest.raises(ValueError, match='cannot be replaced'):
+        trainer._check_saved(saved)
+    with pytest.raises(ValueError, match='jump_height_progression'):
+        replace(schedule, jump_height_progression='skip')
 
 
 @pytest.mark.parametrize('damage', ['data_clock', 'course_clock', 'optimizer', 'replace_active', 'missing_ladder'])

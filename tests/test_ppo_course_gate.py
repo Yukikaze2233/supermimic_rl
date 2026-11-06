@@ -244,12 +244,13 @@ def test_report_mode_never_holds_or_stops_and_opens_a_stage_ladder_in_order():
     assert restored.waiting == {}
 
 
-def test_report_mode_trainer_keeps_training_and_applies_opened_gates(tmp_path):
+@pytest.mark.parametrize('height_progression', ['performance', 'schedule'])
+def test_report_mode_trainer_keeps_training_and_applies_opened_gates(tmp_path, height_progression):
     class LadderEnvironment(GatedEnvironment):
         opened = None
 
         def set_opened_course_gates(self, keys):
-            self.opened = list(keys)
+            self.opened = None if keys is None else list(keys)
 
         def check_course_gates(self, keys):
             self.checked = list(keys)
@@ -260,13 +261,34 @@ def test_report_mode_trainer_keeps_training_and_applies_opened_gates(tmp_path):
                "criteria": [{"metric": "rms/forward_error_m_s", "max": -1.}]}]
     environment = LadderEnvironment()
     trainer = PPOTrainer(environment, config(updates=12, steps_per_update=10, course_gates=course,
-                                             course_gate_mode="report"), tmp_path)
-    assert environment.opened == []
+                                             course_gate_mode="report",
+                                             jump_height_progression=height_progression), tmp_path)
+    assert environment.opened == ([] if height_progression == 'performance' else None)
     result = trainer.train()
     assert result["status"] == "complete" and trainer.curriculum_transitions == 480
-    assert environment.opened == ["jump"]
+    assert environment.opened == (["jump"] if height_progression == 'performance' else None)
+    assert trainer.course.opened == ['jump']
+    assert trainer.course.waiting['terrain'] > 0
+    record = json.loads((tmp_path / 'metrics.jsonl').read_text().splitlines()[-1])
+    assert record['course']['jump_height_progression'] == height_progression
+    following = 'schedule' if height_progression == 'performance' else 'performance'
+    resumed = PPOTrainer(LadderEnvironment(), config(updates=13, steps_per_update=10, course_gates=course,
+        course_gate_mode='report', jump_height_progression=following), tmp_path / 'resumed',
+        resume=tmp_path / 'checkpoint.pt')
+    assert resumed.course.state_dict() == trainer.course.state_dict()
+    assert resumed.updates == trainer.updates and resumed.transitions == trainer.transitions
+    assert resumed.resume_migrations[-1]['jump_height_progression'] == {
+        'before': height_progression, 'after': following}
+    import torch
+    for key, value in trainer.actor.state_dict().items():
+        torch.testing.assert_close(resumed.actor.state_dict()[key], value, rtol=0, atol=0)
+    for key, state in trainer.optimizer.state_dict()['state'].items():
+        for field, value in state.items():
+            torch.testing.assert_close(resumed.optimizer.state_dict()['state'][key][field], value, rtol=0, atol=0)
     with pytest.raises(ValueError, match="never stops"):
         config(course_gates=course, course_gate_mode="report", stop_after_gate=True)
+    with pytest.raises(ValueError, match='jump_height_progression'):
+        config(jump_height_progression='skip')
 
 
 def test_report_mode_ladder_needs_a_fresh_window_per_step_and_rewind_restarts_it():

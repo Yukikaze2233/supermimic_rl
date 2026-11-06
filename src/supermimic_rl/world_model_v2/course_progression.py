@@ -12,6 +12,7 @@ class CourseProgressionConfig:
     start_coordinate: int
     end_coordinate: int
     jump_height_gates: tuple[dict, ...] = field(default_factory=tuple)
+    jump_height_progression: str = 'performance'
 
     def __post_init__(self):
         for name in ('start_collection_step', 'end_collection_step', 'start_coordinate', 'end_coordinate'):
@@ -24,6 +25,8 @@ class CourseProgressionConfig:
         for gate in gates:
             StageGate(**gate)
         object.__setattr__(self, 'jump_height_gates', gates)
+        if self.jump_height_progression not in ('performance', 'schedule'):
+            raise ValueError('jump_height_progression must be performance or schedule')
 
     def coordinate(self, collection_step: int) -> int:
         """Map a collected vector-step clock to a sampling coordinate, exactly."""
@@ -46,7 +49,8 @@ class CourseProgression:
 
     Native task records describe each issued command/terrain. The clock only
     affects future sampling; recorded histories and imagined task state retain
-    their actual conditions. Skill counters, not time, open the height ladder.
+    their actual conditions. Skill counters always determine gate verdicts;
+    the explicit progression option selects whether those verdicts cap sampling.
     """
 
     def __init__(self, config: CourseProgressionConfig, curriculum):
@@ -63,7 +67,8 @@ class CourseProgression:
         self.gates.coordinate = config.start_coordinate
 
     def apply_difficulty(self):
-        self.curriculum.set_opened_gates(self.gates.opened)
+        keys = self.gates.opened if self.config.jump_height_progression == 'performance' else None
+        self.curriculum.set_opened_gates(keys)
 
     def snapshot_counters(self, native):
         return course_progress(native, self.curriculum)[0]
@@ -80,6 +85,7 @@ class CourseProgression:
         result = self.gates.advance(record, 0)
         self.apply_difficulty()
         result.update(stage=self.gates.stage(), counters=delta, gauges=gauges,
+                      jump_height_progression=self.config.jump_height_progression,
                       semantics='sampling schedule, not real transitions or demonstrated skills')
         return result
 

@@ -349,6 +349,10 @@ class OnlineTrainer:
             self.resume_migrations.append({'course_progression_activated': asdict(config.course_progression),
                 'learner_replay_rng_preserved': True, 'additional_warmup_cycles': 0,
                 'scope': 'sampling schedule only; skill progress remains independently evaluated'})
+        if getattr(self, 'jump_height_progression_changed', None):
+            self.resume_migrations.append({'jump_height_progression': self.jump_height_progression_changed,
+                'learner_replay_rng_preserved': True, 'additional_warmup_cycles': 0,
+                'scope': 'Future height sampling only; gate verdicts and course clocks preserved'})
         self.task_norm_pending = bool(saved.get('task_norm_pending', False)) if saved is not None else False
         self.critic_norm_from = saved.get('critic_norm_from') if saved is not None else None
         self.collector = Collector(environment, self.mixing, capacity_steps=config.replay_steps, replay=replay,
@@ -447,6 +451,14 @@ class OnlineTrainer:
         if self.chassis_commands_activated and (before, after) != (LEGACY_COMMANDS, HEADING_COMMANDS):
             raise ValueError('Resume only activates the versioned chassis command projection')
         old_progression, new_progression = configuration.pop('course_progression'), requested.pop('course_progression')
+        self.jump_height_progression_changed = None
+        if old_progression is not None and new_progression is not None:
+            # A sampling-clock choice does not replace the coordinate mapping
+            # or its gate evidence. All other progression changes stay checked.
+            before = old_progression.pop('jump_height_progression')
+            after = new_progression.pop('jump_height_progression')
+            if before != after:
+                self.jump_height_progression_changed = {'before': before, 'after': after}
         self.course_progression_activated = old_progression != new_progression
         if self.course_progression_activated:
             if old_progression is not None or self.config.course_progression is None:

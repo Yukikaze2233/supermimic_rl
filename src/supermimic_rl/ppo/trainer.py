@@ -84,9 +84,12 @@ class PPOConfig:
     # course change; coordinate and opened gates are kept. "continue" keeps it.
     course_gate_resume: str = "continue"
     # "hold" waits at each closed gate and stops at its timeout; "report" never
-    # waits or stops: gates are judged and logged for review, and opened jump
-    # height gates set the jump difficulty (see course_gate.CourseGates).
+    # waits or stops: gates are judged and logged for review. Height sampling
+    # is selected independently by jump_height_progression.
     course_gate_mode: str = "hold"
+    # In report mode, sampling can follow the authored height schedule while
+    # capability gates keep reporting their actual (possibly failed) verdicts.
+    jump_height_progression: str = "performance"
     # Hand control to the native evaluation orchestrator at each newly opened gate.
     stop_after_gate: bool = False
     # Repeat a stage after a fix: on resume from a checkpoint written without
@@ -134,6 +137,8 @@ class PPOConfig:
             raise ValueError("course_gate_resume must be continue or restart_hold")
         if self.course_gate_mode not in GATE_MODES or self.course_gate_mode == "report" and self.stop_after_gate:
             raise ValueError(f"course_gate_mode must be one of {GATE_MODES}; report mode never stops at a gate")
+        if self.jump_height_progression not in ("performance", "schedule"):
+            raise ValueError("jump_height_progression must be performance or schedule")
         if type(self.stop_after_gate) is not bool or self.stop_after_gate and not self.course_gates:
             raise ValueError("stop_after_gate requires a boolean and a gated course")
         if self.course_rewind_stage is not None and not self.course_gates:
@@ -584,6 +589,7 @@ class PPOTrainer:
                     except GateTimeout as error:
                         timeout = str(error)
                         record["course"] = {"timeout": timeout}
+                    record["course"]["jump_height_progression"] = config.jump_height_progression
                     self._apply_opened_gates()
                 log.write(json.dumps(record) + "\n")
                 log.flush()
@@ -627,12 +633,13 @@ class PPOTrainer:
         return {"status": "complete", "updates": self.updates, "transitions": self.transitions}
 
     def _apply_opened_gates(self) -> None:
-        """Report mode: opened gates (not the coordinate) set the difficulty tied to them."""
+        """Keep capability verdicts separate from the selected height sampling clock."""
         if self.course is not None and self.course.mode == "report":
             if not getattr(self, "_course_gates_checked", False):
                 self.environment.check_course_gates([gate.key for gate in self.course.gates])
                 self._course_gates_checked = True
-            self.environment.set_opened_course_gates(self.course.opened)
+            keys = self.course.opened if self.config.jump_height_progression == "performance" else None
+            self.environment.set_opened_course_gates(keys)
 
     def _raise_stage_action_std(self) -> str | None:
         """Raise action-std floors once when the course coordinate is inside a configured stage."""
@@ -694,6 +701,11 @@ class PPOTrainer:
         if before != after and (before, after) != (LEGACY_COMMANDS, HEADING_COMMANDS):
             raise ValueError("Resume only activates the versioned chassis command projection")
         self.resume_migrations = list(payload.get("resume_migrations", []))
+        if saved.jump_height_progression != self.config.jump_height_progression:
+            self.resume_migrations.append({'jump_height_progression': {
+                'before': saved.jump_height_progression, 'after': self.config.jump_height_progression},
+                'resumed_update': payload['updates'], 'learner_rng_preserved': True,
+                'scope': 'Future height sampling only; gate verdicts, course clock and optimizer preserved'})
         if saved.actor_features != self.config.actor_features:
             if saved.actor_features is not None or self.config.actor_features is None:
                 raise ValueError('Resume may activate actor reference features, not silently replace them')

@@ -9,9 +9,14 @@
 - `start_collection_step` / `end_collection_step`：实际采集步区间。
 - `start_coordinate` / `end_coordinate`：对应的原生采样坐标区间。
 - `jump_height_gates`：完整的原生跳跃高度阶梯，复用当前 PPO 的门槛、窗口和最少事件数。
+- `jump_height_progression`：默认 `performance`，通过门槛才提高采样上限；显式设为
+  `schedule` 时，上限跟随既有课程坐标和高度阶梯，成功门槛只报告真实能力。
+  PPO 的同名字段位于训练配置顶层，配合 `course_gate_mode=report` 使用。
 
 首次接续必须从完整 checkpoint 的采集步数及课程坐标开始。此后完整 checkpoint 同时保存
 高度阶梯和事件窗口；普通续训不得悄悄更换映射。想延长训练预算时可以继续在末阶段采样。
+可显式切换 `jump_height_progression` 并记录续训迁移；保留原坐标、失败窗口、模型、优化器
+及 replay，不把采样到更高请求记为能力通过。旧 checkpoint 缺少该字段时仍按 `performance` 解释。
 配置终点应放在预算内最后一次采集的步序号，即
 `saved_collection_steps + (cycles - saved_cycle) * collection_steps - 1`。
 

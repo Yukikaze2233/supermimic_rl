@@ -134,7 +134,7 @@ class CourseEnvironment:
                  "command_height_m": command[:, 3], "actual_height_m": height})
 
     def set_opened_course_gates(self, keys) -> None:
-        """Performance gates opened by the trainer; the course derives gated difficulty from them."""
+        """Apply performance openings, or None to use the authored height schedule."""
         self.adapter.curriculum.set_opened_gates(keys)
 
     def check_course_gates(self, configured_keys) -> None:
