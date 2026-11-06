@@ -39,7 +39,7 @@ def zero_disturbance_contract(recorded, live, runtime_pairs):
                    for pair in runtime_pairs):
             return False
         for group, names, shapes in (
-                ('state_fields', DISTURBANCE_STATE_FIELDS, ((1,), (1,), (6,), (1,))),
+                ('state_fields', DISTURBANCE_STATE_FIELDS, ((), (), (6,), ())),
                 ('substep_fields', SUBSTEP_FIELDS, ((3,), (6,)))):
             if any(f['name'] in names for f in before.get(group, ())):
                 return False

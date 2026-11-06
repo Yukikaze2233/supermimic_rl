@@ -51,7 +51,7 @@ def fixture(tmp_path):
         sources.append(json.loads(json.dumps(source)))
         schemas.append(replace(old, source=json.dumps(source)))
     new = replace(schemas[1], state_fields=old.state_fields + tuple(
-        Field(name, shape) for name, shape in zip(DISTURBANCE_STATE_FIELDS, ((1,), (1,), (6,), (1,)))),
+        Field(name, shape) for name, shape in zip(DISTURBANCE_STATE_FIELDS, ((), (), (6,), ()))),
         substep_fields=old.substep_fields + (Field('velocity_push_world', (3,)), Field('external_wrench_body', (6,))))
     saved.update(schema=schemas[0].to_dict(), schema_fingerprint=schemas[0].fingerprint)
     dataset['schema_fingerprint'] = schemas[0].fingerprint
