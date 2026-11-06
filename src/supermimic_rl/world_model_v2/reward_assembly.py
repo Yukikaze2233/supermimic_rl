@@ -210,13 +210,16 @@ class RewardAssembly:
             progress = JumpProgress.cat(tick.jump_progress for tick in ticks)
             densities = physical_reward_densities(physics, references, self._stack_rows(histories), parameters,
                                                   jump_progress=progress)
-            # Keep the exact original double-precision tick accumulation order.
-            # Only the stateless elementwise densities share one larger batch.
-            for name, values in densities.components.items():
-                accumulated = 0.
-                for value in values.reshape(expected, action.shape[0]).unbind(0):
-                    accumulated = accumulated + value.double() * self.parameters.physics_dt_s
-                components[name] = accumulated
+            # Batch components as well as rows to avoid separate cast/multiply/
+            # add kernels for every reward term. Keep the original four-tick
+            # double-precision accumulation order; a reduction would reorder it.
+            names = tuple(densities.components)
+            values = torch.stack(tuple(densities.components.values())).reshape(
+                len(names), expected, action.shape[0]).double()
+            accumulated = 0.
+            for value in values.unbind(1):
+                accumulated = accumulated + value * self.parameters.physics_dt_s
+            components = dict(zip(names, accumulated.unbind(0)))
             invalid |= densities.invalid.reshape(expected, action.shape[0]).any(0)
             failure_scale = densities.failure_scale.reshape(expected, action.shape[0])[-1]
         next_memory = RewardMemory(action, memory.previous_action, (memory.action_count + 1).clamp_max(2), support)

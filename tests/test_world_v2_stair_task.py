@@ -128,6 +128,56 @@ def test_height_hint_retains_latched_command_gradient_and_stops_at_exact_tick():
         state = result.state
 
 
+def test_empty_stair_reset_is_skipped_and_only_unreleased_finished_rows_reset(monkeypatch):
+    from transformer_rl.formal.lab_env.skill_fsm import StairFSM, StairState
+    from transformer_rl.formal.tasks.protocol import RequestEnd
+
+    native = native_stairs(4, labels=True, assist=True)
+    task = StairTask(StairTaskConfig.capture(native))
+    state = StairTaskState.capture(native)
+    captured_start = state
+    original = {key: value.clone() for key, value in state.record().items()}
+    reset_calls = []
+    reset = StairFSM.reset
+
+    def recorded_reset(fsm, ids=None):
+        reset_calls.append(ids.clone())
+        reset(fsm, ids)
+        assert (fsm.state[ids] == int(StairState.NORMAL)).all()
+        assert (fsm.state_time[ids] == 0).all()
+        assert (fsm.target_height[ids] == 0).all()
+
+    monkeypatch.setattr(StairFSM, 'reset', recorded_reset)
+    for step in range(4):
+        packet = StairPacket.empty(4, 'cpu')
+        now = torch.full((4,), (.02, .04, .06, .26)[step], dtype=torch.float64)
+        if step == 1:
+            packet.request_id.fill_(7)
+            packet.height_m.fill_(.20)
+        elif step == 2:
+            packet.cancel_id[0] = 7
+            packet.completed_id[1] = 7
+            packet.safety_abort[2] = True
+        result = task.advance(state, packet, now_s=now, estimate=estimate_at(now - .02, 4),
+            admitted=torch.tensor([[.5, 0., 0., .26]]).repeat(4, 1),
+            base_mode=torch.zeros(4, dtype=torch.long), jump_active=torch.zeros(4, dtype=torch.bool))
+        if step <= 1:
+            assert reset_calls == []  # Idle and accepted requests have nothing to reset.
+        elif step == 2:
+            assert len(reset_calls) == 1
+            torch.testing.assert_close(reset_calls[0], torch.tensor([0, 2]), atol=0, rtol=0)
+            assert result.end_reason.tolist() == [int(RequestEnd.CANCELLED),
+                int(RequestEnd.ESTIMATED_COMPLETE), int(RequestEnd.SAFETY_ABORT), int(RequestEnd.NONE)]
+            assert result.state.ids[:, 1].tolist() == [-1, -1, -1, 7]
+        else:
+            assert len(reset_calls) == 2
+            torch.testing.assert_close(reset_calls[1], torch.tensor([3]), atol=0, rtol=0)
+            assert result.end_reason[3] == int(RequestEnd.TIMEOUT)
+        state = result.state
+    for key, value in original.items():
+        torch.testing.assert_close(captured_start.record()[key], value, atol=0, rtol=0)
+
+
 def test_compact_replay_keeps_large_request_ids_and_precise_clocks(tmp_path):
     native = native_stairs(2)
     native.time.fill_(1_000_000.01)

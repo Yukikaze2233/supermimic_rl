@@ -329,7 +329,9 @@ def test_terrain_reward_and_termination_height_match_native_task_family_rules(ki
 
 @pytest.mark.parametrize('profile', ['legacy', 'rough_dash'])
 @pytest.mark.parametrize('skills', [False, True])
-def test_tick_batching_retains_targets_masses_static_limits_and_gradients(monkeypatch, profile, skills):
+@pytest.mark.parametrize('weighted_components', [False, True])
+def test_tick_batching_retains_targets_masses_static_limits_and_gradients(
+        monkeypatch, profile, skills, weighted_components):
     import supermimic_rl.world_model_v2.reward_assembly as module
     from transformer_rl.formal.tasks.reward import CommandMode
 
@@ -383,7 +385,11 @@ def test_tick_batching_retains_targets_masses_static_limits_and_gradients(monkey
     torch.testing.assert_close(parameters.mass_kg, mass.repeat(4), atol=0, rtol=0)
     torch.testing.assert_close(reference.admitted_body_command,
                                torch.cat([tick.reference.admitted_body_command for tick in ticks]), atol=0, rtol=0)
-    gradients = torch.autograd.grad(batched.physical_reward.sum(), (action, perturbation, mass),
+    # Unequal per-component weights also check the individual dictionary views;
+    # the summed reward alone could hide a swapped or disconnected component.
+    loss = (sum((index + 1) * value.sum() for index, value in enumerate(batched.components.values()))
+            if weighted_components else batched.physical_reward.sum())
+    gradients = torch.autograd.grad(loss, (action, perturbation, mass),
                                     retain_graph=True, allow_unused=True)
     # Exercise the preserved serial kernel path on exactly the same states,
     # targets, controller history and graph leaves; only batching differs.
@@ -393,7 +399,9 @@ def test_tick_batching_retains_targets_masses_static_limits_and_gradients(monkey
     calls.clear()
     serial = assembly.integrate(*args)
     assert len(calls) == 4
-    expected_gradients = torch.autograd.grad(serial.physical_reward.sum(), (action, perturbation, mass),
+    expected_loss = (sum((index + 1) * value.sum() for index, value in enumerate(serial.components.values()))
+                     if weighted_components else serial.physical_reward.sum())
+    expected_gradients = torch.autograd.grad(expected_loss, (action, perturbation, mass),
                                             allow_unused=True)
     assert batched.components.keys() == serial.components.keys()
     for name in batched.components:

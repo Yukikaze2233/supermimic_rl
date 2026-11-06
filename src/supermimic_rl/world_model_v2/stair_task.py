@@ -251,7 +251,10 @@ class StairTask:
                                   ready=ready & ~packet.safety_abort, completed_id=packet.completed_id)
         finished = condition.finished_id >= 0
         released = finished & (condition.end_reason == int(RequestEnd.ESTIMATED_COMPLETE))
-        fsm.reset((finished & ~released).nonzero().flatten())
+        reset_rows = (finished & ~released).nonzero().flatten()
+        # Empty indexed resets still launch writes and validate ranges on CUDA.
+        if reset_rows.numel():
+            fsm.reset(reset_rows)
         ordinary = (base_mode != int(CommandMode.JUMP)) & (base_mode != int(CommandMode.RECOVERY))
         output = fsm.deployment_step(
             step_height_m=condition.height_m, wheel_contact_probability=contact, tilt_rad=tilt,
