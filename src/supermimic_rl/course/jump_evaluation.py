@@ -41,6 +41,12 @@ class JumpEvaluation:
         self.physical_s = torch.zeros_like(self.landing_candidate_s)
         self.max_landed = torch.zeros_like(self.landing_candidate_s)
         self.max_upward_speed = torch.zeros_like(self.landing_candidate_s)
+        self.unloaded_s = torch.zeros_like(self.landing_candidate_s)
+        self.max_unloaded_s = torch.zeros_like(self.landing_candidate_s)
+        self.total_unloaded_s = torch.zeros_like(self.landing_candidate_s)
+        self.clearance_ticks = torch.zeros(n, dtype=torch.long, device=device)
+        self.max_minimum_clearance = torch.full((n,), -torch.inf, device=device)
+        self.max_unloaded_clearance = torch.full_like(self.max_minimum_clearance, -torch.inf)
         self.target = torch.zeros(n, device=device)
         self.peak = torch.zeros_like(self.target)
         self.landed = torch.zeros_like(self.target)
@@ -133,8 +139,11 @@ class JumpEvaluation:
         self.request[row] = request
         for tensor in (self.counts, self.failed, self.only_failed, self.landing_failed,
                        self.landing_candidate_s, self.physical_s, self.max_landed,
-                       self.max_upward_speed, self.success, self.impulse, self.last_good):
+                       self.max_upward_speed, self.success, self.impulse, self.last_good,
+                       self.unloaded_s, self.max_unloaded_s, self.total_unloaded_s, self.clearance_ticks):
             tensor[row] = 0
+        self.max_minimum_clearance[row] = -torch.inf
+        self.max_unloaded_clearance[row] = -torch.inf
         self.last[row] = float('nan')
         self.target[row] = tasks.active_rise[row]
         self.peak[row], self.landed[row] = tasks.peak_rise[row], tasks.landed_s[row]
@@ -177,6 +186,7 @@ class JumpEvaluation:
         owned = getattr(self.env, '_interval_policy_owned', None)
         if isinstance(owned, torch.Tensor):
             self.counts[:, 3] += (active & ~owned).long()
+        self._observe_unloading(valid, owned, force, dt)
         self.physical_s += active * dt
         self.failed += (valid[:, None] & missed) * dt
         self.only_failed += (valid[:, None] & missed & (missed.sum(-1) == 1)[:, None]) * dt
@@ -194,6 +204,41 @@ class JumpEvaluation:
         self.last = torch.where(active[:, None], values, self.last)
         self.last_good = torch.where(active[:, None], good, self.last_good)
         self.success |= active & (tasks.success_id == self.request) & (tasks.physical_id < 0)
+
+    def _observe_unloading(self, valid, owned, force, dt):
+        """Report request-scoped physics without changing native success decisions.
+
+        The native support observer has already measured the current tick's
+        wheel cylinders before tasks.observe_physics runs. Its geometry is
+        distinct from its terrain-only airborne flag, which excludes JUMP.
+        """
+        measured = valid & (force >= 0).all(-1)
+        if isinstance(owned, torch.Tensor):
+            measured &= owned
+        unloaded = measured & (force <= self.CRITERIA['flight_max_wheel_load_n']).all(-1)
+        self.unloaded_s = torch.where(unloaded, self.unloaded_s + dt, 0.)
+        self.max_unloaded_s = torch.maximum(self.max_unloaded_s, self.unloaded_s)
+        self.total_unloaded_s += unloaded.to(self.total_unloaded_s.dtype) * dt
+        course = self.env._terrain_course
+        support = getattr(course, '_support_sample', None)
+        bottom = getattr(support, 'wheel_bottom_world_z_m', None)
+        support_valid = getattr(support, 'valid', None)
+        ground = getattr(course, 'wheel_ground', None)
+        if (not isinstance(bottom, torch.Tensor) or not isinstance(ground, torch.Tensor)
+                or not isinstance(support_valid, torch.Tensor)
+                or bottom.shape != force.shape or ground.shape != force.shape
+                or support_valid.shape != valid.shape):
+            return
+        clearance = bottom - ground
+        geometry_valid = measured & support_valid & torch.isfinite(clearance).all(-1)
+        self.clearance_ticks += geometry_valid.long()
+        # The lower of the two wheel clearances prevents a lifted single wheel
+        # from being reported as whole-vehicle clearance.
+        minimum = clearance.amin(-1)
+        self.max_minimum_clearance = torch.where(geometry_valid,
+            torch.maximum(self.max_minimum_clearance, minimum), self.max_minimum_clearance)
+        self.max_unloaded_clearance = torch.where(geometry_valid & unloaded,
+            torch.maximum(self.max_unloaded_clearance, minimum), self.max_unloaded_clearance)
 
     def _protocol_end(self, row, request, reason):
         if request < 0:
@@ -227,6 +272,11 @@ class JumpEvaluation:
                                       abs(peak - target) <= tolerance + 1e-6),
             'max_landed_s': float(self.max_landed[row]), 'landed_at_end_s': float(self.landed[row]),
             'max_upward_com_velocity_m_s': float(self.max_upward_speed[row]),
+            'max_continuous_both_wheels_unloaded_s': float(self.max_unloaded_s[row]),
+            'total_both_wheels_unloaded_s': float(self.total_unloaded_s[row]),
+            'wheel_clearance_observed_ticks': int(self.clearance_ticks[row]),
+            'max_minimum_wheel_clearance_m': self._number(self.max_minimum_clearance[row]),
+            'max_minimum_wheel_clearance_while_unloaded_m': self._number(self.max_unloaded_clearance[row]),
             'actual_assist_impulse_n_s': impulse,
             'assisted': None if impulse is None else impulse > 0,
             'native_verified_physical_success': bool(self.success[row]),
@@ -299,5 +349,6 @@ class JumpEvaluation:
             'by_scenario': groups, 'requests': requests,
             'scope': 'Observed native physical requests keyed by environment, episode and request ID. Protocol endings and physical certification are separate; active requests at evaluation end are incomplete, not failed.',
             'condition_units': 'Seconds of finite active physical samples; conditions can overlap. Landing-candidate seconds additionally require supported start, flight, ascent and peak within tolerance. Maxima include every observed substep.',
+            'unloading_scope': 'Request-scoped consecutive finite policy-owned physics ticks with both wheel support loads <=2 N. Invalid, unowned or supported ticks break the run. Duration and measured cylinder-bottom clearance are descriptive, not additional success gates. Clearance is the lower of the two wheels above their current terrain columns; missing geometry is null. Neither metric alone rules out other body contacts.',
             'validity': 'Raw native outcomes are retained. Validated boundaries require an observed valid ending interval and no earlier invalid interval/nonfinite physical sample. Initial active snapshots have partial history.',
             'assist_scope': 'Zero impulse is known when no assist module is installed; installed modules require matching request and finite nonnegative impulse metadata.'}
