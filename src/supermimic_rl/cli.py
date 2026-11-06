@@ -9,6 +9,7 @@ import json
 import os
 from pathlib import Path
 import sys
+import time
 import traceback
 
 import torch
@@ -29,8 +30,16 @@ def native_logs(directory: Path):
     sys.stdout.flush()
     sys.stderr.flush()
     try:
-        with (directory / "native.stdout.log").open("ab", buffering=0) as stdout, \
-                (directory / "native.stderr.log").open("ab", buffering=0) as stderr:
+        # The native health reader starts at byte zero. Previous workers'
+        # output must stay available without becoming this worker's physics
+        # evidence or exceeding its per-boundary read budget on resume.
+        generation = f"{time.time_ns()}-{os.getpid()}"
+        for stream in ("stdout", "stderr"):
+            previous = directory / f"native.{stream}.log"
+            if previous.exists():
+                previous.rename(directory / f"native.{stream}.previous-{generation}.log")
+        with (directory / "native.stdout.log").open("xb", buffering=0) as stdout, \
+                (directory / "native.stderr.log").open("xb", buffering=0) as stderr:
             os.dup2(stdout.fileno(), 1)
             os.dup2(stderr.fileno(), 2)
             yield
