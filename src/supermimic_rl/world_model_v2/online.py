@@ -367,6 +367,15 @@ class OnlineTrainer:
                 'additional_warmup_cycles': 0,
                 'scope': 'Policy imagination and critic return horizon only; model fitting, '
                          'networks, optimizer state, sampling and task/reward contracts preserved'})
+        if getattr(self, 'imagination_microbatch_changed', None):
+            self.resume_migrations.append({
+                'imagination_microbatch_size': self.imagination_microbatch_changed,
+                'resumed_cycle': self.cycle, 'learner_replay_rng_preserved': True,
+                'additional_warmup_cycles': 0,
+                'imagination_batch_size': config.imagination_batch_size,
+                'actor_updates': config.actor_updates,
+                'scope': 'Policy gradient accumulation partition only; total batch, update counts, '
+                         'networks, optimizer state, replay and task/reward contracts preserved'})
         self.task_norm_pending = bool(saved.get('task_norm_pending', False)) if saved is not None else False
         self.critic_norm_from = saved.get('critic_norm_from') if saved is not None else None
         self.collector = Collector(environment, self.mixing, capacity_steps=config.replay_steps, replay=replay,
@@ -471,6 +480,11 @@ class OnlineTrainer:
         before = configuration['learning'].pop('imagination_horizon')
         after = requested['learning'].pop('imagination_horizon')
         self.imagination_horizon_changed = None if before == after else {'before': before, 'after': after}
+        # The full start batch and its random realization are drawn before
+        # partitioning; only the graph held during gradient accumulation changes.
+        before = configuration.pop('imagination_microbatch_size')
+        after = requested.pop('imagination_microbatch_size')
+        self.imagination_microbatch_changed = None if before == after else {'before': before, 'after': after}
         before, after = configuration.pop('world_datasets'), requested.pop('world_datasets')
         self.world_datasets_changed = None if before == after else {'before': before, 'after': after}
         before, after = configuration.pop('actor_features'), requested.pop('actor_features')

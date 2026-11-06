@@ -49,15 +49,25 @@ def test_stair_rollout_refreshes_goal_contact_permission_and_critic_state():
         assert torch.equal(value, original[key]), key
 
 
-def test_same_source_realization_keeps_actor_microbatch_gradient_and_restore():
+@pytest.mark.parametrize('horizon', [16, 32])
+def test_same_source_realization_keeps_actor_microbatch_gradient_and_restore(horizon):
     learner, start, frames = fixture(sensor_noise=True)
     other, _, _ = fixture(sensor_noise=True)
+    learner.config = replace(learner.config, imagination_horizon=horizon)
+    other.config = replace(other.config, imagination_horizon=horizon)
+    # Online starts have no pre-drawn horizon-specific noise. Exercise the
+    # learner's full-batch preparation instead of the fixture's H16 draws.
+    for name in ('observation_noise', 'tof_latency', 'tof_uniform'):
+        start.pop(name)
     other.load_state_dict(deepcopy(learner.state_dict()))
     torch.manual_seed(19)
     full = learner.update_policy(start, frames, microbatch_size=2)
+    full_rng = torch.get_rng_state().clone()
     torch.manual_seed(19)
     split = other.update_policy(start, frames, microbatch_size=1)
+    torch.testing.assert_close(torch.get_rng_state(), full_rng, rtol=0, atol=0)
     assert full['actor/updated'] and split['actor/updated']
+    assert learner.updates == other.updates
     for a, b in zip(learner.actor.decoder.parameters(), other.actor.decoder.parameters()):
         torch.testing.assert_close(a, b, rtol=0, atol=2e-6)
     restored, _, _ = fixture()

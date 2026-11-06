@@ -103,7 +103,11 @@ def assert_retained(actual, expected):
         assert actual == expected
 
 
-def test_complete_online_restore_preserves_adam_replay_rng_and_records_horizon_once(tmp_path, monkeypatch):
+@pytest.mark.parametrize('before_horizon,after_horizon,before_microbatch,after_microbatch', [
+    (16, 32, 512, 512), (16, 32, 4096, 2048), (32, 32, 4096, 2048),
+])
+def test_complete_online_restore_preserves_adam_replay_rng_and_records_recipe_once(
+        tmp_path, monkeypatch, before_horizon, after_horizon, before_microbatch, after_microbatch):
     # Reuse genuine compact data and a small genuine dynamics model. Only the
     # native snapshot adapter and asset-backed constructor are replaced: the
     # online restore, learner, four Adams, replay and RNG restoration are real.
@@ -111,9 +115,10 @@ def test_complete_online_restore_preserves_adam_replay_rng_and_records_horizon_o
     schema = StateSchema.from_dict(torch.load(checkpoint, weights_only=True)['schema'])
     previous = OnlineConfig(cycles=100, replay_steps=10, replay_device='cpu', model_hidden=(16,),
         actor_frame_dim=35, actor_hidden=(16,), estimator_hidden=(8,), critic_hidden=(16,),
+        imagination_batch_size=4096, imagination_microbatch_size=before_microbatch, actor_updates=24,
         model_batch_size=4, validation_fraction=.5, guard_drop_fraction=.1, guard_mode='report',
         initial_actor='existing-initialization.pt', initial_actor_sha256='a' * 64,
-        learning=LearningConfig(imagination_horizon=16, bootstrap_gradient=False,
+        learning=LearningConfig(imagination_horizon=before_horizon, bootstrap_gradient=False,
                                 actor_learning_rate=5e-5, anchor_coefficient=.1,
                                 model_fit_precision='bfloat16'))
 
@@ -171,7 +176,8 @@ def test_complete_online_restore_preserves_adam_replay_rng_and_records_horizon_o
     monkeypatch.setattr('supermimic_rl.world_model_v2.collection.SnapshotLayout',
                         lambda schema: SimpleNamespace(record_disturbances=False))
     monkeypatch.setattr(torch.cuda, 'is_available', lambda: False)
-    requested = replace(previous, learning=replace(previous.learning, imagination_horizon=32))
+    requested = replace(previous, imagination_microbatch_size=after_microbatch,
+                        learning=replace(previous.learning, imagination_horizon=after_horizon))
     output = tmp_path / 'resumed'
     trainer = OnlineTrainer(Environment(), lambda: None, requested, output,
         runtime={}, linkage_path=None, asset_directory=None, identified_bundle=None,
@@ -180,7 +186,10 @@ def test_complete_online_restore_preserves_adam_replay_rng_and_records_horizon_o
     assert_retained(trainer.collector.replay.state_dict(), dataset_before)
     assert_retained(trainer.env.restored, environment_state)
     assert_retained(trainer.mixing.state_dict(), saved['mixing'])
-    assert trainer.learner.config.imagination_horizon == 32
+    assert trainer.learner.config.imagination_horizon == after_horizon
+    assert trainer.config.imagination_microbatch_size == after_microbatch
+    assert trainer.config.imagination_batch_size == 4096
+    assert trainer.config.actor_updates == 24
     assert trainer.learner.imagination.bootstrap_gradient is False
     assert trainer.learner.config.anchor_coefficient == .1
     assert trainer.cycle == 78 and trainer.collector.steps == 1872
@@ -192,10 +201,23 @@ def test_complete_online_restore_preserves_adam_replay_rng_and_records_horizon_o
                            ('collection', trainer.collector.generator)]:
         torch.testing.assert_close(generator.get_state(), saved[key + '_rng'], atol=0, rtol=0)
     torch.testing.assert_close(torch.get_rng_state(), saved['torch_rng'], atol=0, rtol=0)
-    receipt = trainer.resume_migrations[-1]
-    assert trainer.resume_migrations[:-1] == saved['resume_migrations']
-    assert receipt['imagination_horizon'] == {'before': 16, 'after': 32}
-    assert receipt['resumed_cycle'] == 78 and receipt['additional_warmup_cycles'] == 0
+    receipts = trainer.resume_migrations[len(saved['resume_migrations']):]
+    expected_changes = {}
+    if before_horizon != after_horizon:
+        expected_changes['imagination_horizon'] = {'before': before_horizon, 'after': after_horizon}
+    if before_microbatch != after_microbatch:
+        expected_changes['imagination_microbatch_size'] = {
+            'before': before_microbatch, 'after': after_microbatch}
+    assert trainer.resume_migrations[:len(saved['resume_migrations'])] == saved['resume_migrations']
+    assert len(receipts) == len(expected_changes)
+    for field, change in expected_changes.items():
+        receipt = next(receipt for receipt in receipts if field in receipt)
+        assert receipt[field] == change
+        assert receipt['resumed_cycle'] == 78 and receipt['additional_warmup_cycles'] == 0
+        assert receipt['learner_replay_rng_preserved'] is True
+        if field == 'imagination_microbatch_size':
+            assert receipt['imagination_batch_size'] == 4096
+            assert receipt['actor_updates'] == 24
     assert json.loads((output / 'resume-migrations.json').read_text()) == trainer.resume_migrations
 
     # The next complete pair carries the requested recipe, original weights,
@@ -204,7 +226,8 @@ def test_complete_online_restore_preserves_adam_replay_rng_and_records_horizon_o
     trainer.save(with_replay=True)
     pointer = json.loads((output / 'resume.json').read_text())
     target = torch.load(output / pointer['checkpoint'], weights_only=True)
-    assert target['config']['learning']['imagination_horizon'] == 32
+    assert target['config']['learning']['imagination_horizon'] == after_horizon
+    assert target['config']['imagination_microbatch_size'] == after_microbatch
     torch.testing.assert_close(target['learner'], saved['learner'], atol=0, rtol=0)
     assert_retained(torch.load(output / pointer['replay_file'], weights_only=True)['replay'], dataset_before)
     restored = OnlineTrainer(Environment(), lambda: None, requested, tmp_path / 'again',
@@ -212,6 +235,7 @@ def test_complete_online_restore_preserves_adam_replay_rng_and_records_horizon_o
         resume=output / pointer['checkpoint'], teacher_source=source)
     assert restored.resume_migrations == trainer.resume_migrations
     assert restored.imagination_horizon_changed is None
+    assert restored.imagination_microbatch_changed is None
     torch.testing.assert_close(restored.learner.state_dict(), trainer.learner.state_dict(), atol=0, rtol=0)
     expected = trainer.collector.replay.sample_windows(2, 2, env_ids=trainer.train_ids,
                                                      generator=trainer.generator)
