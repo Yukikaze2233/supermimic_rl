@@ -193,7 +193,8 @@ def main():
     model = WorldModelV2(MotionInputs(LegLinkage.load(args.linkage,
         expected_asset_manifest_sha256=data_source.get('asset_manifest_sha256'))),
         WheelExecution.from_bundle(args.identified_bundle, schema.policy_dt_s / schema.substeps_per_step),
-        hidden=tuple(hidden), terrain=terrain).to(device)
+        hidden=tuple(hidden), terrain=terrain,
+        disturbances=any(field.name == 'velocity_push_world' for field in schema.substep_fields)).to(device)
     fit = WorldModelFit(model, wheel_contact_weight=wheel_contact_weight)
     optimizer = torch.optim.Adam(model.parameters(), lr=learning_rate)
     contract = {'version': MODEL_CONTRACT, 'input_dim': model.motion.input_norm.mean.numel(),

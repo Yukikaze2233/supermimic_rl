@@ -41,6 +41,12 @@ class Collector:
         self.environment, self.decision = environment, decision
         self.layout = (SnapshotLayout(environment.schema, record_terrain=True) if record_terrain
                        else SnapshotLayout(environment.schema))
+        if replay is not None:
+            from .disturbance import DISTURBANCE_RECORD_FIELDS
+
+            records_disturbances = getattr(self.layout, 'record_disturbances', False)
+            if any((name in replay.data) != records_disturbances for name in DISTURBANCE_RECORD_FIELDS):
+                raise ValueError('Collector disturbance records differ from replay; migrate explicitly')
         if replay is not None and ('terrain_tile' in replay.data) != record_terrain:
             raise ValueError('Collector terrain record layout differs from its replay')
         if replay is not None and record_terrain and 'task_family' not in replay.data:

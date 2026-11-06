@@ -81,12 +81,13 @@ def frozen_parameters(*modules):
 class Learner:
     def __init__(self, model: WorldModelV2, actor: EstimatorActor, critic: Critic,
                  termination: PoseContactTermination, config: LearningConfig, *, reward,
-                 stair_task=None, stair_source=None, jump_task=None, recovery_task=None):
+                 stair_task=None, stair_source=None, jump_task=None, recovery_task=None, disturbance_config=None):
         self.model, self.actor, self.critic, self.config = model, actor, critic, config
         self.fit = WorldModelFit(model)
         self.imagination = Imagination(model, actor, critic, termination, reward=reward, gamma=config.gamma,
                                        stair_task=stair_task, stair_source=stair_source, jump_task=jump_task,
-                                       recovery_task=recovery_task, bootstrap_gradient=config.bootstrap_gradient)
+                                       recovery_task=recovery_task, bootstrap_gradient=config.bootstrap_gradient,
+                                       disturbance_config=disturbance_config)
         self.optimizers = {
             "model": torch.optim.Adam(model.parameters(), lr=config.model_learning_rate),
             "actor": torch.optim.Adam(actor.decoder.parameters(), lr=config.actor_learning_rate),

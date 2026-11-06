@@ -20,6 +20,7 @@ from .execution import WheelExecution
 from .features import MotionInputs
 from .records import CONTACT_BODIES, FORBIDDEN_BODIES, RESULTANT_BODIES, WHEEL_BODIES, Memory
 from .physical import INCREMENT_DIM, PhysicalState, apply
+from .disturbance import apply_velocity_push, shift_tick_reference
 
 SIM_CONTEXT_DIM = 44 + 21  # mass/controller/material/COM plus actual inertia traces
 INPUT_DIM = 30 + 12 + 19 + 6 + SIM_CONTEXT_DIM + 77
@@ -126,20 +127,43 @@ class FlatTerrain:
 
 class WorldModelV2(nn.Module):
     def __init__(self, inputs: MotionInputs, wheels: WheelExecution, *,
-                 hidden: tuple[int, ...] = (2048, 2048, 2048), physics_dt_s: float = .005, terrain=None):
+                 hidden: tuple[int, ...] = (2048, 2048, 2048), physics_dt_s: float = .005, terrain=None,
+                 disturbances: bool = False):
         super().__init__()
         self.inputs, self.wheels, self.physics_dt_s = inputs, wheels, physics_dt_s
         self.terrain = FlatTerrain() if terrain is None else terrain
-        self.motion = MotionModel(INPUT_DIM, hidden)
+        self.disturbances = disturbances
+        self.motion = MotionModel(INPUT_DIM + 24 * disturbances, hidden)
 
-    def features(self, state, height, scan, memory, sim_context, action):
-        return self.inputs(state, height, scan, memory, sim_context, action)
+    def physical_start(self, state, sim_context, velocity_push):
+        if self.disturbances != (velocity_push is not None):
+            raise ValueError('Motion model and recorded velocity-push contract differ')
+        return (apply_velocity_push(state, velocity_push, sim_context[..., 41:44])
+                if self.disturbances else state)
+
+    def features(self, state, height, scan, memory, sim_context, action, *, external_wrench=None):
+        features, inside = self.inputs(state, height, scan, memory, sim_context, action)
+        if self.disturbances != (external_wrench is not None):
+            raise ValueError('Motion model and four-tick external-wrench contract differ')
+        if self.disturbances:
+            if external_wrench.shape != (*action.shape[:-1], 4, 6):
+                raise ValueError('Motion conditions require all four base-frame wrenches')
+            features = torch.cat((features, external_wrench.flatten(-2)), -1)
+        return features, inside
 
     def step(self, state: PhysicalState, height: Tensor, scan: Tensor, memory: Memory, sim_context: Tensor,
-             motor_strength: Tensor, action: Tensor, *, terrain_tile: Tensor | None = None) -> Prediction:
-        features, inside = self.features(state, height, scan, memory, sim_context, action)
+             motor_strength: Tensor, action: Tensor, *, terrain_tile: Tensor | None = None,
+             velocity_push: Tensor | None = None, external_wrench: Tensor | None = None) -> Prediction:
+        motion_start = self.physical_start(state, sim_context, velocity_push)
+        features, inside = self.features(motion_start, height, scan, memory, sim_context, action,
+                                         external_wrench=external_wrench)
         increment, relative = self.motion(features)
-        ticks = Ticks.decode(relative, state)
+        ticks = Ticks.decode(relative, motion_start)
+        if self.disturbances:
+            # Public predictions retain the original interval-start convention.
+            # Sensor/reward histories must not consume the push a second time.
+            relative = shift_tick_reference(relative, state, motion_start)
+            increment = relative[..., -1, :INCREMENT_DIM]
         end = ticks.state.tick(-1)
         next_memory = self.advance_memory(memory, state, ticks, motor_strength, action)
         tick_height, tick_scan = self.terrain.advance(height[..., None, :], scan[..., None, :],

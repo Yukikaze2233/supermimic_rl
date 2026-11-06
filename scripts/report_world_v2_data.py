@@ -71,7 +71,8 @@ def _model(schema, args, hidden, state, device):
     model = WorldModelV2(
         MotionInputs(LegLinkage.load(args.linkage, expected_asset_manifest_sha256=source.get("asset_manifest_sha256"))),
         WheelExecution.from_bundle(args.identified_bundle, schema.policy_dt_s / schema.substeps_per_step),
-        hidden=tuple(hidden), terrain=terrain).to(device)
+        hidden=tuple(hidden), terrain=terrain,
+        disturbances=any(field.name == 'velocity_push_world' for field in schema.substep_fields)).to(device)
     model.load_state_dict(state)
     return WorldModelFit(model.eval())
 

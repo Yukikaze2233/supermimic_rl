@@ -330,7 +330,8 @@ class OnlineTrainer:
             record_stair_source=config.record_stair_source, record_jumps=config.record_jumps,
             record_recovery=config.record_recovery,
             record_jump_trigger=jump_task is not None and jump_task.config.trigger is not None,
-            record_jump_flight_latch=jump_task is not None and jump_task.config.flight_latch)
+            record_jump_flight_latch=jump_task is not None and jump_task.config.flight_latch,
+            record_disturbances=self.learner.model.disturbances)
         if any(name not in replay.data or tuple(replay.data[name].shape[2:]) != shape for name, shape in expected.items()):
             raise ValueError('Online replay field layout differs from the current compact contract')
         self.mixing = MixedDecision(environment, self.learner.actor, teacher_decision, seed=config.seed + 2,

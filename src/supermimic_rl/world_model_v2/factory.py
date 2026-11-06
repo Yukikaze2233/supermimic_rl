@@ -25,10 +25,16 @@ def make_learner(schema, runtime, config, *, linkage_path, asset_directory, iden
     from .imagined_reward import OrdinaryFlatReward, TerrainLocomotionReward
 
     source = json.loads(schema.source)
+    from ..course.randomization import RequestedRandomizationConfig
+
+    disturbances = any(field.name == 'velocity_push_world' for field in schema.substep_fields)
+    disturbance_config = (RequestedRandomizationConfig(**source['randomization']['configuration'])
+                          if disturbances else None)
     dt = schema.policy_dt_s / schema.substeps_per_step
     linkage = LegLinkage.load(linkage_path, expected_asset_manifest_sha256=source['asset_manifest_sha256'])
     model = WorldModelV2(MotionInputs(linkage), WheelExecution.from_bundle(identified_bundle, dt),
-                         hidden=tuple(model_hidden), physics_dt_s=dt, terrain=terrain).to(device)
+                         hidden=tuple(model_hidden), physics_dt_s=dt, terrain=terrain,
+                         disturbances=disturbances).to(device)
     actor = EstimatorActor(estimator_hidden=tuple(estimator_hidden), actor_hidden=tuple(actor_hidden),
                            frame_dim=actor_frame_dim, action_bounds=action_bounds_from_source(source),
                            chassis_command_contract=chassis_command_contract,
@@ -37,6 +43,7 @@ def make_learner(schema, runtime, config, *, linkage_path, asset_directory, iden
     task_dim = MOTION_TASK_DIM if record_tasks else 0
     routes = {'terrain': terrain is not None, 'stairs': stair_source is not None, 'jumps': jump_task is not None,
               'recovery': recovery_task is not None,
+              'disturbances': disturbances,
               'jump_trigger': jump_task is not None and jump_task.config.trigger is not None}
     critic = Critic(Critic.feature_size(schema.goal_dim, SIM_CONTEXT_DIM, task_dim=task_dim, **routes),
                     tuple(critic_hidden), task_dim=task_dim, input_clip=config.critic_input_clip, **routes).to(device)
@@ -45,4 +52,5 @@ def make_learner(schema, runtime, config, *, linkage_path, asset_directory, iden
                          jump_task=jump_task, recovery_task=recovery_task, **({} if terrain is None else {'terrain': terrain}))
     termination = PoseContactTermination(PoseContactLimits.from_runtime(runtime), dt)
     return Learner(model, actor, critic, termination, config, reward=reward,
-                    stair_task=stair_task, stair_source=stair_source, jump_task=jump_task, recovery_task=recovery_task)
+                    stair_task=stair_task, stair_source=stair_source, jump_task=jump_task, recovery_task=recovery_task,
+                    disturbance_config=disturbance_config)
