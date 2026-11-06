@@ -248,6 +248,32 @@ def test_v5_height_caps_wait_for_unassisted_bin_gates_at_exact_integer_boundarie
         assert curriculum._effective_domain().jump_m[1] == expected_after
 
 
+def test_v6_keeps_practising_reachable_jumps_through_every_later_stage():
+    from supermimic_rl.ppo.course_gate import CourseGates
+    from support import REPO_ROOT
+
+    root = REPO_ROOT / 'configs/gpufree'
+    curriculum = make_course_curriculum(4, 'cpu', 7, json.loads((root / 'ppo-course-gated-v6.json').read_text()))
+    request = 4  # HEIGHT, MOTION, ROTATION, TERRAIN, REQUEST, RECOVERY
+    for name in ('terrain_foundation', 'authored_steps', 'full_recovery', 'combined_dr'):
+        weights = curriculum.stage_weights[curriculum.stage_names.index(name)]
+        assert weights[request] >= .2 and sum(weights) == pytest.approx(1.)
+
+    # The first height band needs real flight yet stays within reach; further
+    # bands wait for measured success, however far the coordinate has moved.
+    curriculum.set_progress(sum(curriculum.stage_budgets[:5]), 0)
+    starts, total = {}, 0
+    for name, budget in zip(curriculum.stage_names, curriculum.stage_budgets):
+        starts[name] = total
+        total += budget
+    gates = CourseGates(json.loads((root / 'ppo-gated5-fullturn-resume-r6.json').read_text())['course_gates'], starts)
+    assert set(curriculum.ladder_gate_keys()) <= {gate.key for gate in gates.gates}
+    for opened, cap in (([], .2), (['active_jump@0.25'], .25), (['active_jump@0.25', 'active_jump@0.5'], .3),
+                        (['active_jump@0.25', 'active_jump@0.5', 'active_jump@0.75'], .4)):
+        curriculum.set_opened_gates(opened)
+        assert curriculum._effective_domain().jump_m == (.03, cap)
+
+
 def test_reported_height_ladder_follows_opened_gates_while_the_assist_fades_with_the_stage():
     from supermimic_rl.course.jump_assist import JumpAssist, JumpAssistConfig
     from support import REPO_ROOT

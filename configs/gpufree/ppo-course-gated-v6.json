@@ -1,0 +1,237 @@
+{
+  "schedule": "jump_first_v1",
+  "base": {
+    "stage_transition_budgets": [
+      10485760,
+      481034240,
+      196608000,
+      983040000,
+      983040000,
+      196608000,
+      491520000,
+      491520000
+    ],
+    "stage_weights": [
+      [
+        0.1,
+        0.75,
+        0.15,
+        0.0,
+        0.0,
+        0.0
+      ],
+      [
+        0.1,
+        0.75,
+        0.15,
+        0.0,
+        0.0,
+        0.0
+      ],
+      [
+        0.1,
+        0.55,
+        0.15,
+        0.0,
+        0.1,
+        0.1
+      ],
+      [
+        0.03,
+        0.2,
+        0.07,
+        0.3,
+        0.3,
+        0.1
+      ],
+      [
+        0.03,
+        0.2,
+        0.07,
+        0.3,
+        0.3,
+        0.1
+      ],
+      [
+        0.05,
+        0.25,
+        0.05,
+        0.2,
+        0.4,
+        0.05
+      ],
+      [
+        0.03,
+        0.17,
+        0.05,
+        0.15,
+        0.2,
+        0.4
+      ],
+      [
+        0.03,
+        0.2,
+        0.05,
+        0.25,
+        0.22,
+        0.25
+      ]
+    ],
+    "source_schedule_coordinates": [
+      0,
+      0,
+      1000,
+      5000,
+      10000,
+      18000,
+      24000,
+      30000,
+      35000
+    ],
+    "domain": {
+      "height_m": [
+        0.23,
+        0.4
+      ],
+      "forward_m_s": [
+        -2.7,
+        2.7
+      ],
+      "yaw_rad_s": [
+        -18.84955592153876,
+        18.84955592153876
+      ],
+      "jump_m": [
+        0.03,
+        0.4
+      ],
+      "slope_rad": [
+        -0.2617993877991494,
+        0.2617993877991494
+      ],
+      "roughness_m": [
+        0.0,
+        0.02
+      ],
+      "step_up_m": [
+        0.0,
+        0.2
+      ],
+      "step_down_m": [
+        0.0,
+        0.15
+      ],
+      "nominal_height_m": 0.32,
+      "nominal_fraction": 0.2
+    },
+    "initial_domain": {
+      "height_m": [
+        0.23,
+        0.4
+      ],
+      "forward_m_s": [
+        -1.0,
+        1.0
+      ],
+      "yaw_rad_s": [
+        -18.84955592153876,
+        18.84955592153876
+      ],
+      "jump_m": [
+        0.03,
+        0.2
+      ],
+      "slope_rad": [
+        -0.05235987755982988,
+        0.05235987755982988
+      ],
+      "roughness_m": [
+        0.0,
+        0.005
+      ],
+      "step_up_m": [
+        0.0,
+        0.05
+      ],
+      "step_down_m": [
+        0.0,
+        0.03
+      ],
+      "nominal_height_m": 0.32,
+      "nominal_fraction": 0.2
+    },
+    "recovery_postures": [
+      "upright",
+      "crouched",
+      "upright_release",
+      "crouched_release",
+      "left_side_90",
+      "right_side_90",
+      "pitch_forward_45",
+      "pitch_backward_45",
+      "front_down_90",
+      "back_down_90",
+      "front_down_left_forward_right_back_90",
+      "front_down_left_back_right_forward_90",
+      "back_down_left_forward_right_back_90",
+      "back_down_left_back_right_forward_90",
+      "prone_belly_legs_above",
+      "prone_back_legs_above"
+    ],
+    "foundation_terrain_kinds": [
+      "FLAT",
+      "SLOPE",
+      "ROUGH",
+      "STEP_UP",
+      "STEP_DOWN",
+      "MATERIAL"
+    ],
+    "full_terrain_kinds": [
+      "FLAT",
+      "SLOPE",
+      "ROUGH",
+      "STEP_UP",
+      "STEP_DOWN",
+      "STAIRS",
+      "MATERIAL",
+      "TWO_PLATFORMS"
+    ],
+    "mixture_blend_fraction": 0.25,
+    "jump_standing_fraction_of_stage": 0.25,
+    "jump_full_motion_fraction_of_stage": 0.8,
+    "moving_jump_min_fraction": 0.1,
+    "jump_height_stage": "active_jump",
+    "recovery_posture_stages": {
+      "upright": "active_jump",
+      "crouched": "active_jump",
+      "upright_release": "active_jump",
+      "crouched_release": "active_jump",
+      "pitch_forward_45": "active_jump",
+      "pitch_backward_45": "active_jump",
+      "left_side_90": "dynamic_commands",
+      "right_side_90": "dynamic_commands",
+      "front_down_90": "terrain_foundation",
+      "back_down_90": "terrain_foundation",
+      "front_down_left_forward_right_back_90": "authored_steps",
+      "front_down_left_back_right_forward_90": "authored_steps",
+      "back_down_left_forward_right_back_90": "authored_steps",
+      "back_down_left_back_right_forward_90": "authored_steps",
+      "prone_belly_legs_above": "authored_steps",
+      "prone_back_legs_above": "authored_steps"
+    },
+    "jump_height_gates": [
+      [
+        0.25,
+        0.25
+      ],
+      [
+        0.5,
+        0.3
+      ],
+      [
+        0.75,
+        0.4
+      ]
+    ]
+  }
+}

@@ -36,7 +36,7 @@ tests/               无 Isaac 的单元/合同测试；共享构造器在 tests
 | 域随机化 | `randomization`、`materials` | requested-v2：质量/惯量/质心、电机强度、编码器与 IMU 偏置、传感器噪声；可选持续机身外力与速度冲击（原生 EpisodeRandomization 语义） |
 | 动作合同 | `action_contract` | 以 runtime `task.action_bounds` 对齐原生控制器与 ownership 校验（腿 ±4π 即公共转角 ±π，支持整圈回转） |
 | 奖励 | `reward` | 把 `reward_kernel` 装入原生 composer；扩展项（`jump_flight`、`jump_lift`、`jump_push`、`jump_missed`、`success_event`）写入回执 |
-| 课程 | `curriculum`、`jump_first` | 按真实转移坐标推进的八阶段课程；jump-first 顺序：平地 → 小跳 → 动态指令 → 地形 → 台阶 → 翻正 → 混合 DR |
+| 课程 | `curriculum`、`jump_first` | 按真实转移坐标推进的八阶段课程；jump-first 顺序：平地 → 小跳 → 动态指令 → 地形 → 台阶 → 翻正 → 混合 DR。`ppo-course-gated-v6.json` 在地形之后的阶段保留 20–30% REQUEST 出生，防止跳跃在后续阶段遗忘；跳高初始上限 0.2 m（够得着且必须真实腾空），更高档位等对应门槛打开 |
 | 路由与评价 | `routing`、`evaluation`、`adapter` | 台阶终点路由到实际地图块；固定场景评价套件；`CourseAdapter` 采集原生传感器与任务所有权 |
 | 技能任务 | `jump_takeoff`、`stair_label` | 跳跃：到期的自动请求等待原生支撑站姿、最短回合时间与冷却后才发出（进行中的请求与外部请求不受影响），参考改为 10 cm/0.3 s 下蹲 + 0.2 s 伸展的长蹬伸；台阶：STAIR 模式只由 ToF 台阶状态机置位。属于任务定义，训练、评价、采集都安装 |
 | 训练专用 | `jump_assist` | 跳跃请求推送窗口内的竖直助力（概率衰减或力幅衰减），持续到真实离地（真实上升后腾空）；按实际是否施加冲量区分有/无助力，并按请求高度分档统计结束、成功与真实离地次数；门槛为报告模式时，助力强度随已打开的高度门槛逐级减弱；评价与世界模型 factory 不安装 |
