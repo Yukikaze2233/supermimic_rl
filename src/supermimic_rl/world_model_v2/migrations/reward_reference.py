@@ -1,4 +1,4 @@
-"""Keep learned dynamics and task memory when correcting a jump reward target."""
+"""Keep learned dynamics and task memory across explicit analytic reward changes."""
 import inspect
 import json
 
@@ -16,9 +16,11 @@ from .teacher import rebind_teacher_source
 # The first-flight HOLD fix, before commit 4467228 corrected premature LANDING targets.
 SOURCE_KERNEL_SHA256 = '9ebd10778d84c4aa7ab987648ee283e9dcde4154f1ba60646c36807b61b41902'
 TARGET_REFERENCE = 'first_real_flight_landing_v1'
+# Shared first-real-flight kernel before the opt-in recovery settling term.
+RECOVERY_SOURCE_KERNEL_SHA256 = '10ac1a471ef34100ba2828d871a6f08cf7cd8992908b57d6f02e757d55bd52ce'
 
 
-def upgrade_reward_reference(saved, dataset, reference, *, source_teacher_path, target_teacher_path):
+def _upgrade_reward(saved, dataset, reference, *, source_teacher_path, target_teacher_path, change):
     """Change only the analytic target contract; retain all tensors and learning state.
 
     Stored rewards remain historical measurements. Model fitting consumes physical
@@ -44,13 +46,23 @@ def upgrade_reward_reference(saved, dataset, reference, *, source_teacher_path, 
             != {k: v for k, v in target.items() if k != 'reward_kernel'}):
         raise ValueError('Reward-reference migration cannot change physical, observation or task contracts')
     before, after = source['reward_kernel'], target['reward_kernel']
-    expected = {**before, 'kernel_sha256': file_sha256(inspect.getfile(physical_reward_densities)),
-                'jump_tracking_reference': TARGET_REFERENCE}
-    if (before.get('kernel_sha256') != SOURCE_KERNEL_SHA256
-            or 'jump_tracking_reference' in before or after != expected
-            or before.get('implementation') != 'shared_physical_reward_densities'
-            or not RewardExtensions(**before['extensions']).needs_jump_progress):
-        raise ValueError('Only the known premature-landing reference correction is supported')
+    expected = {**before, 'kernel_sha256': file_sha256(inspect.getfile(physical_reward_densities))}
+    if change == 'jump-reward-reference-v1':
+        expected['jump_tracking_reference'] = TARGET_REFERENCE
+        if (before.get('kernel_sha256') != SOURCE_KERNEL_SHA256
+                or 'jump_tracking_reference' in before
+                or not RewardExtensions(**before['extensions']).needs_jump_progress):
+            raise ValueError('Only the known premature-landing reference correction is supported')
+    elif change == 'recovery-quiet-reward-v1':
+        expected['extensions'] = {**before['extensions'], 'recovery_quiet': 1.}
+        if (before.get('kernel_sha256') != RECOVERY_SOURCE_KERNEL_SHA256
+                or before.get('jump_tracking_reference') != TARGET_REFERENCE
+                or before['extensions'].get('recovery_quiet', 0.) != 0.):
+            raise ValueError('Recovery settling migration needs the known unextended flight kernel')
+    else:
+        raise ValueError('Unknown analytic reward migration')
+    if after != expected or before.get('implementation') != 'shared_physical_reward_densities':
+        raise ValueError('Analytic reward migration cannot change unrelated weights or kernel contracts')
     jump = JumpTaskConfig.from_dict(saved['jump_scenario'])
     if (not jump.flight_latch or jump != JumpTaskConfig.from_dict(reference['jump_task_config'])
             or saved['stair_scenario'] != reference['stair_source_config']
@@ -66,7 +78,7 @@ def upgrade_reward_reference(saved, dataset, reference, *, source_teacher_path, 
         raise ValueError('Reward-reference correction needs recorded first-flight memory')
     teacher_source = rebind_teacher_source(saved, source, target, source_teacher_path, target_teacher_path)
     report = {
-        'migration': 'jump-reward-reference-v1', 'cycle': saved['cycle'],
+        'migration': change, 'cycle': saved['cycle'],
         'source_schema': schema.fingerprint, 'target_schema': target_schema.fingerprint,
         'source_reward_kernel': before, 'target_reward_kernel': after,
         'legacy_reward_sequence_before': dataset['replay']['total_steps'],
@@ -84,3 +96,15 @@ def upgrade_reward_reference(saved, dataset, reference, *, source_teacher_path, 
     if 'schema' in dataset:
         replay['schema'] = target_schema.to_dict()
     return upgraded, replay, report
+
+
+def upgrade_reward_reference(saved, dataset, reference, *, source_teacher_path, target_teacher_path):
+    """Apply the first-real-flight LANDING reference correction to a complete pair."""
+    return _upgrade_reward(saved, dataset, reference, source_teacher_path=source_teacher_path,
+                           target_teacher_path=target_teacher_path, change='jump-reward-reference-v1')
+
+
+def upgrade_recovery_quiet(saved, dataset, reference, *, source_teacher_path, target_teacher_path):
+    """Enable the reviewed 1/s RECOVERY settling term without changing learning state."""
+    return _upgrade_reward(saved, dataset, reference, source_teacher_path=source_teacher_path,
+                           target_teacher_path=target_teacher_path, change='recovery-quiet-reward-v1')

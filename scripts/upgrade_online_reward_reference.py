@@ -7,7 +7,7 @@ from pathlib import Path
 import torch
 
 from supermimic_rl.runtime import atomic_save
-from supermimic_rl.world_model_v2.migrations.reward_reference import upgrade_reward_reference
+from supermimic_rl.world_model_v2.migrations.reward_reference import upgrade_recovery_quiet, upgrade_reward_reference
 from supermimic_rl.world_model_v2.teacher import file_sha256
 
 
@@ -15,6 +15,7 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     for name in ('checkpoint', 'reference-dataset', 'source-teacher', 'target-teacher', 'output'):
         parser.add_argument('--' + name, type=Path, required=True)
+    parser.add_argument('--change', choices=('jump-reference', 'recovery-quiet'), default='jump-reference')
     args = parser.parse_args()
     if args.output.exists():
         raise FileExistsError('Reward-reference migration requires a new output directory')
@@ -22,7 +23,8 @@ def main():
     source_replay = (args.checkpoint.parent / saved['replay_file']).resolve(strict=True)
     dataset = torch.load(source_replay, map_location='cpu', weights_only=True, mmap=True)
     reference = torch.load(args.reference_dataset, map_location='cpu', weights_only=True, mmap=True)
-    upgraded, replay, receipt = upgrade_reward_reference(saved, dataset, reference,
+    migrate = upgrade_recovery_quiet if args.change == 'recovery-quiet' else upgrade_reward_reference
+    upgraded, replay, receipt = migrate(saved, dataset, reference,
         source_teacher_path=args.source_teacher, target_teacher_path=args.target_teacher)
     for name in ('checkpoint', 'reference_dataset', 'source_teacher', 'target_teacher'):
         path = getattr(args, name)

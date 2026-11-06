@@ -3,6 +3,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 import hashlib
+import json
 import math
 from pathlib import Path
 
@@ -52,6 +53,7 @@ class AuxiliaryWorldData:
         self.generator = torch.Generator().manual_seed(seed)
         self.validation_generator = torch.Generator().manual_seed(seed + 1)
         self.sources = []
+        self.source_schemas = {}
         self.sampled = {}
         self.fields = WorldModelFit.RECORD_FIELDS + tuple(
             name for name in WorldModelFit.OPTIONAL_RECORD_FIELDS if name in live_replay.data)
@@ -62,10 +64,11 @@ class AuxiliaryWorldData:
             if checksum != config.sha256:
                 raise ValueError('Auxiliary world dataset SHA256 differs: ' + config.name)
             payload = torch.load(path, map_location='cpu', weights_only=True, mmap=True)
+            recorded_schema = StateSchema.from_dict(payload['schema'])
             if (payload.get('format') != 'supermimic-world-v2-dataset-v1'
                     or payload.get('model_contract') != MODEL_CONTRACT
-                    or payload.get('schema_fingerprint') != schema.fingerprint
-                    or StateSchema.from_dict(payload['schema']).fingerprint != schema.fingerprint):
+                    or payload.get('schema_fingerprint') != recorded_schema.fingerprint
+                    or not self._same_dynamics_contract(recorded_schema, schema)):
                 raise ValueError('Auxiliary world dataset contract differs: ' + config.name)
             replay = CompactReplay.from_state_dict(payload['replay'], 'cpu', read_only=True)
             if max((*config.train_env_ids, *config.validation_env_ids)) >= replay.num_envs:
@@ -80,7 +83,36 @@ class AuxiliaryWorldData:
             if not len(candidates) or not len(replay.window_candidates(1, config.validation_env_ids)):
                 raise ValueError('Auxiliary world dataset has no eligible training/validation windows')
             self.sources.append((config, replay))
+            self.source_schemas[config.name] = recorded_schema.fingerprint
             self.sampled[config.name] = 0
+
+    @staticmethod
+    def _same_dynamics_contract(recorded, live):
+        """Reward labels are unused here; keep their original provenance intact.
+
+        Only the analytic kernel hash and extension weights may differ. Physical
+        parameters, task clocks, observation/execution contracts and record layout
+        still match exactly. This exception does not apply to online Actor starts.
+        """
+        if recorded.fingerprint == live.fingerprint:
+            return True
+        contracts = []
+        for schema in (recorded, live):
+            fields = schema.to_dict()
+            try:
+                source = json.loads(fields['source'])
+            except (TypeError, ValueError):
+                return False
+            if not isinstance(source, dict):
+                return False
+            kernel = source.get('reward_kernel')
+            if not isinstance(kernel, dict) or kernel.get('implementation') != 'shared_physical_reward_densities':
+                return False
+            source['reward_kernel'] = {key: value for key, value in kernel.items()
+                                       if key not in ('kernel_sha256', 'extensions')}
+            fields['source'] = source
+            contracts.append(fields)
+        return contracts[0] == contracts[1]
 
     def mix(self, windows):
         batch, horizon = windows['action'].shape[:2]
@@ -127,6 +159,8 @@ class AuxiliaryWorldData:
                 # otherwise valid online optimizer/collector cycle.
                 prediction = {'error': str(error)}
             report[source.name] = {'sha256': source.sha256,
+                'recorded_schema_fingerprint': self.source_schemas[source.name],
+                'reward_labels_used': False,
                 'validation_env_ids': list(source.validation_env_ids),
                 'sampled_training_windows': self.sampled[source.name], 'prediction': prediction}
         return report

@@ -12,14 +12,15 @@ from supermimic_rl.contracts import StateSchema
 from supermimic_rl.reward_kernel import RewardExtensions, physical_reward_densities
 from supermimic_rl.world_model_v2.migrations.recovery import upgrade_recovery_tasks
 from supermimic_rl.world_model_v2.migrations.reward_reference import (
-    SOURCE_KERNEL_SHA256, TARGET_REFERENCE, upgrade_reward_reference,
+    RECOVERY_SOURCE_KERNEL_SHA256, SOURCE_KERNEL_SHA256, TARGET_REFERENCE,
+    upgrade_recovery_quiet, upgrade_reward_reference,
 )
 from supermimic_rl.world_model_v2.online import OnlineConfig, OnlineTrainer
 from supermimic_rl.world_model_v2.teacher import PPO_TEACHER_FORMAT, file_sha256
 from support.world_v2.recovery_upgrade import fixture as recovery_fixture
 
 
-def fixture(tmp_path):
+def fixture(tmp_path, recovery_quiet=False):
     saved, dataset, reference, options, _ = recovery_fixture()
     saved, dataset, _ = upgrade_recovery_tasks(saved, dataset, reference, **options)
     saved['jump_scenario']['flight_latch'] = True
@@ -36,9 +37,15 @@ def fixture(tmp_path):
         'kernel_sha256': SOURCE_KERNEL_SHA256,
         'extensions': asdict(RewardExtensions(jump_push=2., jump_missed=1.)),
     }
+    if recovery_quiet:
+        source['reward_kernel']['kernel_sha256'] = RECOVERY_SOURCE_KERNEL_SHA256
+        source['reward_kernel']['jump_tracking_reference'] = TARGET_REFERENCE
+        source['reward_kernel']['extensions'].pop('recovery_quiet')
     target = {**source, 'reward_kernel': {**source['reward_kernel'],
         'kernel_sha256': file_sha256(inspect.getfile(physical_reward_densities)),
         'jump_tracking_reference': TARGET_REFERENCE}}
+    if recovery_quiet:
+        target['reward_kernel']['extensions'] = {**source['reward_kernel']['extensions'], 'recovery_quiet': 1.}
     for item, provenance in ((saved, source), (reference, target)):
         schema = StateSchema.from_dict({**saved['schema'], 'source': json.dumps(provenance)})
         item.update(schema=schema.to_dict(), schema_fingerprint=schema.fingerprint)
@@ -61,10 +68,15 @@ def fixture(tmp_path):
     return saved, dataset, reference, dict(source_teacher_path=paths[0], target_teacher_path=paths[1])
 
 
-def test_reward_fix_retains_learning_and_historical_measurements(tmp_path):
-    saved, dataset, reference, options = fixture(tmp_path)
+@pytest.mark.parametrize('recovery_quiet', [False, True])
+def test_reward_fix_retains_learning_and_historical_measurements(tmp_path, recovery_quiet):
+    saved, dataset, reference, options = fixture(tmp_path, recovery_quiet)
+    saved['auxiliary_world'] = {'sample_rng': torch.Generator().manual_seed(71).get_state(),
+                              'sampled_windows': {'flight': 288780}}
+    saved['course_progression'] = {'coordinate': 900000000, 'passed': [True, False]}
     rng = torch.get_rng_state().clone()
-    upgraded, replay, receipt = upgrade_reward_reference(saved, dataset, reference, **options)
+    migrate = upgrade_recovery_quiet if recovery_quiet else upgrade_reward_reference
+    upgraded, replay, receipt = migrate(saved, dataset, reference, **options)
     assert torch.equal(torch.get_rng_state(), rng)
     for key in saved.keys() - {'schema', 'schema_fingerprint', 'teacher_source', 'resume_migrations'}:
         assert upgraded[key] is saved[key], key
@@ -84,8 +96,9 @@ def test_reward_fix_retains_learning_and_historical_measurements(tmp_path):
 
 
 @pytest.mark.parametrize('damage', ['physical', 'weight', 'clock', 'records', 'pair', 'kernel', 'teacher'])
-def test_migration_does_not_hide_an_incompatible_change(tmp_path, damage):
-    saved, dataset, reference, options = fixture(tmp_path)
+@pytest.mark.parametrize('recovery_quiet', [False, True])
+def test_migration_does_not_hide_an_incompatible_change(tmp_path, damage, recovery_quiet):
+    saved, dataset, reference, options = fixture(tmp_path, recovery_quiet)
     if damage in ('physical', 'weight', 'kernel'):
         source = json.loads(reference['schema']['source'])
         if damage == 'physical':
@@ -108,4 +121,15 @@ def test_migration_does_not_hide_an_incompatible_change(tmp_path, damage):
         payload['actor']['weights'].add_(1.)
         torch.save(payload, path)
     with pytest.raises(ValueError):
-        upgrade_reward_reference(saved, dataset, reference, **options)
+        migrate = upgrade_recovery_quiet if recovery_quiet else upgrade_reward_reference
+        migrate(saved, dataset, reference, **options)
+
+
+def test_recovery_migration_is_not_a_general_reward_override(tmp_path):
+    saved, dataset, reference, options = fixture(tmp_path, recovery_quiet=True)
+    source = json.loads(reference['schema']['source'])
+    source['reward_kernel']['extensions']['recovery_quiet'] = 2.
+    schema = StateSchema.from_dict({**reference['schema'], 'source': json.dumps(source)})
+    reference.update(schema=schema.to_dict(), schema_fingerprint=schema.fingerprint)
+    with pytest.raises(ValueError, match='unrelated weights'):
+        upgrade_recovery_quiet(saved, dataset, reference, **options)

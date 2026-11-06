@@ -1,6 +1,7 @@
 """Independent skill records retain their boundaries, splits and resume RNGs."""
 from dataclasses import asdict, replace
 import hashlib
+import json
 from types import SimpleNamespace
 
 import pytest
@@ -146,3 +147,32 @@ def test_config_roundtrip_and_explicit_resume_activation_preserve_training_recip
     trainer.config = replace(config, model_batch_size=1024)
     with pytest.raises(ValueError, match='training recipe'):
         trainer._check_saved(saved)
+
+
+def test_reward_only_change_keeps_original_dynamics_samples_and_provenance(tmp_path):
+    schema, replay, config = dataset(tmp_path)
+    source = {'asset': 'unchanged', 'task_clock': .02, 'reward_kernel': {
+        'implementation': 'shared_physical_reward_densities', 'physics_dt_s': .005,
+        'kernel_sha256': 'before', 'extensions': {'jump_push': 2.}}}
+    recorded = replace(schema, source=json.dumps(source))
+    path = tmp_path / 'native.pt'
+    payload = torch.load(path, weights_only=True)
+    payload.update(schema=recorded.to_dict(), schema_fingerprint=recorded.fingerprint)
+    torch.save(payload, path)
+    config = replace(config, sha256=hashlib.sha256(path.read_bytes()).hexdigest())
+    source['reward_kernel'].update(kernel_sha256='after', extensions={'jump_push': 2., 'recovery_quiet': 1.})
+    live = replace(schema, source=json.dumps(source))
+    aux = AuxiliaryWorldData((config,), live, replay, 2, seed=19)
+    assert aux.source_schemas == {'flight': recorded.fingerprint}
+    assert recorded.fingerprint != live.fingerprint
+    assert 'reward' not in aux.fields
+    result = aux.mix(windows(replay))['action']
+    assert (result[:, 0, 0] >= 100).any()
+    assert hashlib.sha256(path.read_bytes()).hexdigest() == config.sha256
+    for key, value in (('asset', 'another'), ('task_clock', .01)):
+        different = replace(live, source=json.dumps({**source, key: value}))
+        with pytest.raises(ValueError, match='contract differs'):
+            AuxiliaryWorldData((config,), different, replay, 2, seed=19)
+    source['reward_kernel']['physics_dt_s'] = .01
+    with pytest.raises(ValueError, match='contract differs'):
+        AuxiliaryWorldData((config,), replace(live, source=json.dumps(source)), replay, 2, seed=19)
