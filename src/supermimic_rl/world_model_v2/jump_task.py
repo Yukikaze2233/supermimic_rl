@@ -17,6 +17,7 @@ from torch import Tensor
 from .physical import PhysicalState
 
 if TYPE_CHECKING:
+    from supermimic_rl.course.jump_physics import PlatformLandingEvidence, PlatformLandingState
     from supermimic_rl.course.jump_takeoff import JumpTakeoffConfig
     from transformer_rl.formal.lab_env.course_tasks import RequestCommand
     from transformer_rl.formal.tasks.jump import JumpReferenceConfig
@@ -278,6 +279,7 @@ class JumpInterval:
     peak_rise: Tensor | None = None       # continuous running root rise, outside the detached FSM
     requested_rise: Tensor | None = None
     physical_active: Tensor | None = None  # derived per tick from the existing physical request ID
+    platform_state: PlatformLandingState | None = None
 
 
 class JumpTask:
@@ -416,7 +418,9 @@ class JumpTask:
     def observe_interval(self, state: JumpTaskState, *, physical: PhysicalState,
                          wheel_support_load: Tensor, base_com_offset: Tensor, base_mode: Tensor,
                          command_height: Tensor, ground_z: Tensor,
-                         retain_peak_gradient: bool = False) -> JumpInterval:
+                         retain_peak_gradient: bool = False,
+                         platform_state: PlatformLandingState | None = None,
+                         platform_evidence: PlatformLandingEvidence | None = None) -> JumpInterval:
         """Integrate four physical samples and return their native reward targets.
 
         ``wheel_support_load`` is the two wheels' upward patch-normal support
@@ -425,8 +429,7 @@ class JumpTask:
         count horizontal riser and friction forces as support. Physical event transitions are deliberately
         detached; the caller's continuous motion/reward graph remains intact.
         """
-        from transformer_rl.formal.lab_env.course_tasks import LabCourseTasks
-        from transformer_rl.formal.tasks.reward import RewardPhase
+        from supermimic_rl.course.jump_physics import observe_jump_physics
         from ..reward_kernel import advance_flight_latch, jump_tracking_targets
 
         n = len(state.ids)
@@ -434,6 +437,10 @@ class JumpTask:
             raise ValueError('Jump evidence requires four physical ticks and two wheel support loads')
         if ground_z.shape != (n, 4) or command_height.shape != (n,) or base_com_offset.shape != (n, 3):
             raise ValueError('Jump reference requires four ground heights and one native base COM offset')
+        if (platform_state is None) != (platform_evidence is None):
+            raise ValueError('Platform landing needs both request history and physical evidence')
+        if platform_evidence is not None:
+            platform_evidence.validate((n, 4), state.ids.device)
         with torch.no_grad():
             protocol, owner = state._restore(self.config)
             owner.base_mode = base_mode
@@ -448,9 +455,10 @@ class JumpTask:
             for tick in range(4):
                 if retain_peak_gradient:
                     peak_active.append((owner.physical_id >= 0).clone())
-                LabCourseTasks.observe_physics(owner, wheel_support_load[:, tick], velocity_z[:, tick],
+                platform_state = observe_jump_physics(owner, wheel_support_load[:, tick], velocity_z[:, tick],
                     tilt[:, tick], physical.position[:, tick, 2], angular_speed_rad_s=speed[:, tick],
-                    dt=self.config.physics_dt_s)
+                    dt=self.config.physics_dt_s, platform_state=platform_state,
+                    platform_evidence=None if platform_evidence is None else platform_evidence.tick(tick))
                 phases.append(owner.phase.clone())
                 ascents.append(owner.ascent_seen.clone())
                 stable_ticks.append(owner.landed_s.clone())
@@ -494,4 +502,4 @@ class JumpTask:
                             curve.clock_stage[:, None].expand(-1, 4), torch.stack(ascents, -1),
                             torch.stack(closed_ticks, -1) if closed_ticks else None, torch.stack(stable_ticks, -1),
                             torch.stack(lifted_ticks, -1) if lifted_ticks else None, peaks, requested,
-                            torch.stack(active_ticks, -1))
+                            torch.stack(active_ticks, -1), platform_state)
