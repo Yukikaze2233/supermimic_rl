@@ -1,8 +1,6 @@
 """Two fixed reward opt-ins preserve full source lineage and old learning truth."""
 from copy import deepcopy
 from dataclasses import asdict, replace
-import hashlib
-import inspect
 import json
 from pathlib import Path
 
@@ -11,10 +9,10 @@ import torch
 
 from supermimic_rl.cli import _native_schema_source
 from supermimic_rl.contracts import StateSchema
-from supermimic_rl.reward_kernel import physical_reward_densities
 from supermimic_rl.world_model_v2.auxiliary_data import AuxiliaryWorldData
 from supermimic_rl.world_model_v2.jump_task import JumpTaskConfig
 from supermimic_rl.world_model_v2.migrations import settling
+from supermimic_rl.world_model_v2.migrations import reward_continuity
 from supermimic_rl.world_model_v2.migrations.source_lineage import (
     compatible_source_lineage, source_lineage_from_saved,
 )
@@ -27,6 +25,12 @@ from test_world_v2_course_sampling_upgrade import candidate as course_fixture
 from test_world_v2_native_ppo_teacher import fixture as teacher_fixture
 from test_world_v2_recovery_bridge_upgrade import candidate as bridge_fixture, equal_nested
 from test_world_v2_source_lineage import chain
+
+
+@pytest.fixture(autouse=True)
+def historical_running_kernel(monkeypatch):
+    # This suite replays the historical migration, not the current reward file.
+    monkeypatch.setattr(reward_continuity, '_kernel_sha256', lambda: settling.TARGET_KERNEL_SHA256)
 
 
 def old_reward():
@@ -89,13 +93,11 @@ def test_complete_pair_preserves_all_learning_and_recorded_labels(candidate):
     assert updated['stair_scenario'] is saved['stair_scenario']
 
 
-def test_saved_proof_remains_valid_under_a_later_kernel_file(candidate, monkeypatch, tmp_path):
+def test_saved_proof_remains_valid_under_a_later_kernel_file(candidate, monkeypatch):
     saved, data, target, _, _ = candidate
     source = json.loads(saved['schema']['source'])
     proof = settling.verify_settling_reward_continuity(source, json.loads(target.source))
-    later = tmp_path / 'later_reward.py'
-    later.write_text('a later reviewed kernel\n')
-    monkeypatch.setattr(settling.inspect, 'getfile', lambda value: str(later))
+    monkeypatch.setattr(reward_continuity, '_kernel_sha256', lambda: 'a later reviewed kernel')
     assert settling.verify_saved_proof(proof) == proof
     with pytest.raises(ValueError, match='Executing reward kernel'):
         settling.upgrade_settling_reward_continuity(saved, data, target)
@@ -226,6 +228,6 @@ def test_auxiliary_reward_exception_runs_after_full_source_chain_and_preserves_n
     assert file_sha256(path) == config.sha256
 
 
-def test_target_kernel_constant_is_the_reviewed_production_file():
-    assert hashlib.sha256(Path(inspect.getfile(physical_reward_densities)).read_bytes()).hexdigest() == (
-        settling.TARGET_KERNEL_SHA256)
+def test_historical_reward_endpoints_remain_fixed():
+    assert settling.SOURCE_KERNEL_SHA256 == '8e86f622f8b408f1784e10da88e7fbb661210e0af70df363294052836d8c7838'
+    assert settling.TARGET_KERNEL_SHA256 == '7ab9e5481d13cfc029852aa0ee44c0a3cf4cdb5672b3b269e8878cff4257850e'

@@ -14,6 +14,7 @@ _PROOF_KEYS = {
     'stair-timeout-retry-v1': 'stair_timeout_retry',
     'recovery-roll-bridge-sampling-v1': 'recovery_roll_bridge_sampling',
     'settling-reward-continuity-v1': 'settling_reward_continuity',
+    'jump-extension-height-floor-v1': 'jump_extension_height_floor',
 }
 
 
@@ -44,6 +45,10 @@ def verify_source_proof(proof):
             checked = verify_saved_proof(proof)
         elif kind == 'settling-reward-continuity-v1':
             from .settling import verify_saved_proof
+
+            checked = verify_saved_proof(proof)
+        elif kind == 'jump-extension-height-floor-v1':
+            from .extension_height import verify_saved_proof
 
             checked = verify_saved_proof(proof)
         else:
