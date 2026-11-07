@@ -30,7 +30,7 @@ SUPERMIMIC_SCRIPT=scripts/<script>.py bash scripts/run_gpufree.sh <script argume
 
 ## PPO 教师
 
-当前连续训练使用 `course_gate_mode="report"`、`stop_after_gate=false`：记录课程表现，普通失败和未达标继续学习。跳跃高度阶梯仍按各高度档的实际表现控制难度。不要把下文可选的逐门槛停训编排用于这条连续训练线。
+当前连续训练使用 `course_gate_mode="report"`、`stop_after_gate=false`：记录课程表现，普通失败和未达标继续学习。跳跃高度推进由实际运行配置的 `jump_height_progression` 决定；当前已使用 `schedule` 开放至 0.4 m，同时继续记录各高度档表现，不将门槛通过等同于已掌握高跳。不要把下文历史版本的逐门槛停训编排用于这条连续训练线。
 
 ```bash
 # 训练（新运行或 --resume 完整 checkpoint）
@@ -48,7 +48,7 @@ SUPERMIMIC_SCRIPT=scripts/evaluate_ppo_skills.py bash scripts/run_gpufree.sh \
 python scripts/train_ppo.py export --checkpoint <checkpoint.pt> --output teacher.onnx
 ```
 
-输出：`training/metrics.jsonl`（每更新一行，含门槛状态与原生技能计数增量）、`training/checkpoint.pt`（完整可恢复）、`training/checkpoints/update-*.pt`（轻量）。门槛超时会保存后以 `gate_timeout` 结束，必须先诊断再续训。
+输出：`training/metrics.jsonl`（每更新一行，含门槛状态与原生技能计数增量）、`training/checkpoint.pt`（完整可恢复）、`training/checkpoints/update-*.pt`（轻量）。历史 `hold` 模式可因门槛超时保存后以 `gate_timeout` 结束；当前 `report` 连续训练不因此停止。
 
 固定场景评价默认使用 Actor 均值；`--action-sampling ppo-gaussian --sampling-seed <seed>` 可单独检查 checkpoint 的训练探索噪声，动作 RNG 与环境 RNG 分开。`recovery_diagnostics` 按回合记录交接/超时、各物理和估计判据及最长稳定时间；`recovery_phases` 将实际恢复与交接后的跟踪分开。`jump_diagnostics` 按请求记录峰高、上升/离地证据、实际助力冲量和最长落地静稳，并分开协议结束与物理认证。不完整或无效区间保留诊断标记，不计作成功。
 
