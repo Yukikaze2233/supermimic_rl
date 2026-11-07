@@ -154,10 +154,18 @@ class PhysxCourseBackend:
 
 
 def select_course_backend(backend, runtime, configuration):
+    friction_mode = configuration.get("identified_friction_mode", "software_dynamic")
+    if friction_mode not in ("software_dynamic", "native_floor"):
+        raise ValueError("identified_friction_mode must be software_dynamic or native_floor")
     if backend.name == "kamino":
-        return KaminoCourseBackend(backend, configuration)
-    if backend.name == "physx":
+        if friction_mode != "software_dynamic":
+            raise ValueError("Kamino cannot express the identified independent static/dynamic friction pair")
+        strategy = KaminoCourseBackend(backend, configuration)
+    elif backend.name == "physx":
         if configuration.get("kamino_constraints") is not None:
             raise ValueError("kamino_constraints applies only to the Kamino backend")
-        return PhysxCourseBackend(backend, runtime["physics"])
-    raise ValueError("Unknown course physics backend: " + backend.name)
+        strategy = PhysxCourseBackend(backend, runtime["physics"])
+    else:
+        raise ValueError("Unknown course physics backend: " + backend.name)
+    strategy.identified_friction_mode = friction_mode
+    return strategy

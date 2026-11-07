@@ -7,6 +7,7 @@ native effort write. Numerically rejected rows are parked until normal reset.
 from __future__ import annotations
 
 from dataclasses import dataclass
+import hashlib
 import json
 import math
 from types import SimpleNamespace
@@ -61,6 +62,56 @@ not native readback. Passive-joint damping and auxiliary actuators stay intact.
                 modified_actuator_groups=list(dict.fromkeys(name for name, _, _ in selected)),
                 declarative_scene_copy_updated=len(robot_configs) == 2,
                 native_readback_required=True)
+
+
+def read_identified_native_friction(robot, execution: IdentifiedExecution, *, backend: str) -> dict:
+    """Verify the solver's properties, not the actuator configuration/cache.
+
+    The current PhysX tensor API reports [static effort, dynamic effort,
+    viscous coefficient] in backend joint order. The first two are N.m for
+    these revolute axes (Isaac Sim 5+), not legacy dimensionless coefficients.
+    This reads all six active axes so an unintended leg friction term is also
+    detected. Passive joints and the independent gimbal remain unmodified.
+    """
+    if backend != "physx" or execution.friction_mode != "native_floor":
+        raise ValueError("Native-floor readback requires the explicit PhysX friction mode")
+    view = robot.root_view
+    names = tuple(view.shared_metatype.dof_names)
+    if len(set(names)) != len(names) or set(names) != set(robot.joint_names):
+        raise ValueError("PhysX friction readback joint names differ from the articulation")
+    values = view.get_dof_friction_properties()
+    values = getattr(values, "torch", values)
+    if not isinstance(values, Tensor):
+        import warp
+
+        values = warp.to_torch(values)
+    if values.shape != (execution.count, len(names), 3):
+        raise ValueError("PhysX friction readback requires all environments, joints and three components")
+    indices = torch.tensor([names.index(name) for name in ACTION_ORDER], device=values.device)
+    actual = values.index_select(1, indices).detach().clone()
+    fields = ("friction", "dynamic_friction", "viscous_friction")
+    parameters = execution.native_parameters()
+    expected = actual.new_tensor([[parameters[name][field] for field in fields] for name in ACTION_ORDER])
+    if (not torch.isfinite(actual).all()
+            or not torch.allclose(actual, expected.expand_as(actual), rtol=1e-6, atol=1e-8)):
+        raise RuntimeError("PhysX identified joint friction readback differs from the pinned model")
+    actual = actual.cpu().contiguous()
+    return {
+        "contract": "physx_identified_native_friction_readback_v1", "verified": True,
+        "reader": "robot.root_view.get_dof_friction_properties",
+        "joint_order": list(ACTION_ORDER), "component_order": list(fields),
+        "units": ["N.m", "N.m", "N.m/(rad/s)"], "environment_count": execution.count,
+        "requested": expected.cpu().tolist(),
+        "actual_min": actual.amin(0).tolist(), "actual_max": actual.amax(0).tolist(),
+        "actual_sha256": hashlib.sha256(actual.numpy().tobytes()).hexdigest(),
+        "static_identification": [{
+            "joint": name, "nominal_nm": row["static_breakaway_nominal_nm"],
+            "observed_interval_nm": row["static_breakaway_observed_interval_nm"],
+            "exactly_identified": row["static_breakaway_exactly_identified"],
+        } for name, row in zip(ACTION_ORDER[4:], execution.wheel_rows)],
+        "scope": "Wheel static/dynamic solver ownership; leg static friction remains unidentified and zero",
+        "dynamics_validated": False,
+    }
 
 
 @dataclass(frozen=True)

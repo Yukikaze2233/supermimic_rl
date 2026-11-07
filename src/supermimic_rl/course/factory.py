@@ -100,7 +100,7 @@ def create_course(configuration):
         import torch
         from transformer_rl.formal.lab_env.cfg import build_course_env_cfg, configure_course_physics
         from transformer_rl.formal.lab_env.env import WheeledLabEnv
-        from .execution import configure_identified_actuators, make_environment
+        from .execution import configure_identified_actuators, make_environment, read_identified_native_friction
         from .twist import RECEIPT as ROOT_TWIST_RECEIPT, make_root_twist_corrected_environment
         from .adapter import CourseAdapter
         from .routing import install_authored_routing
@@ -112,7 +112,7 @@ def create_course(configuration):
         execution = IdentifiedExecution(
             configuration["num_envs"], configuration["device"], sensors.physics_dt_s,
             asset_directory=asset_directory, bundle_directory=configuration["identified_bundle"],
-            friction_mode="software_dynamic")
+            friction_mode=strategy.identified_friction_mode)
         cfg = build_course_env_cfg(
             asset, atlas, num_envs=configuration["num_envs"], device=configuration["device"],
             seed=configuration.get("seed", 7), environment_spacing_m=runtime["environment_spacing_m"],
@@ -130,6 +130,8 @@ def create_course(configuration):
         randomized_type = strategy.environment_type(WheeledLabEnv, randomization, execution)
         environment_type = make_environment(make_root_twist_corrected_environment(randomized_type), execution)
         native = environment_type(cfg)
+        friction_readback = (read_identified_native_friction(native.robot, execution, backend=strategy.name)
+                             if execution.friction_mode == "native_floor" else None)
         from .action_contract import install_action_bounds
 
         action_contract = install_action_bounds(native, runtime["task"]["action_bounds"])
@@ -247,12 +249,20 @@ def create_course(configuration):
             provenance['recovery_roll_bridge'] = recovery_bridge_receipt
         if platform_owner is not None:
             provenance['platform_task'] = platform_owner.receipt()
+        if friction_readback is not None:
+            # Instance counts/readback tensors are setup evidence, not a new
+            # per-environment schema identity. The execution receipt already
+            # binds the friction mode and the pinned native coefficients.
+            provenance['identified_friction_readback'] = {
+                key: friction_readback[key] for key in ('contract', 'reader', 'verified')}
         (log / "course-provenance.json").write_text(json.dumps(provenance, indent=2) + "\n")
         setup = {"action_contract": action_contract,
                  "materials": getattr(native._wheel_materials, "receipt", None),
                  "dynamics": getattr(native._startup_dynamics, "receipt", None),
                  "coordinates": getattr(native, "continuous_coordinate_receipt", None),
                  "physics_health": health.receipt}
+        if friction_readback is not None:
+            setup['identified_friction'] = friction_readback
         (log / "native-setup-readback.json").write_text(json.dumps(setup, indent=2) + "\n")
         return CourseAdapter(native, launcher, health, curriculum, provenance, log,
                              mechanics_backend=strategy.mechanics_backend,
