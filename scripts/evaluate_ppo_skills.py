@@ -92,7 +92,12 @@ def main():
     if output.exists() and any(output.iterdir()):
         raise FileExistsError("Use a new evaluation output directory")
     output.mkdir(parents=True, exist_ok=True)
-    factory["record_substeps"] = True
+    if args.record_dataset:
+        factory["record_substeps"] = True
+    else:
+        # The native skill observers read physical ticks directly. An unused
+        # world-model substep recorder adds packing work to every physics step.
+        factory.update(record_substeps=False, substep_audit=False, record_disturbances=False)
     factory["native_log_directory"] = str(output / "native")
     (output / "factory-config.json").write_text(json.dumps(factory, indent=2) + "\n")
 
