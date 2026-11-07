@@ -304,6 +304,11 @@ class FixedCourseScenarios:
             return result
 
         self._install(self.curriculum, 'sample', self.sample)
+        motion_owner = getattr(self.env, '_motion_trajectory_owner', None)
+        if motion_owner is not None:
+            # Fixed scenarios own their requested waveform and may explicitly
+            # test special gimbal translation on the MOTION family.
+            self._install(motion_owner, 'training_commands_enabled', False)
         self._install(self.env._task_sampler, 'curriculum', self.curriculum)
         self._install(self.adapter, 'curriculum', self.curriculum)
         self._install(tasks, '_draw_segments', self.draw_segments)

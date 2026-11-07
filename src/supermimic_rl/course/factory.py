@@ -23,6 +23,9 @@ def _read_pinned(path, digest):
 
 def create_course(configuration):
     """Full45 history MLP course using the source FSM and exact static terrain."""
+    motion_trajectory_owner = configuration.get('motion_trajectory_owner', False)
+    if type(motion_trajectory_owner) is not bool:
+        raise ValueError('Motion trajectory owner must be a boolean')
     stair_timeout_retry = configuration.get("stair_timeout_retry", False)
     if type(stair_timeout_retry) is not bool:
         raise ValueError('Stair timeout retry must be a boolean')
@@ -175,6 +178,9 @@ def create_course(configuration):
 
         gimbal_arbitration_receipt = install_request_gimbal_exclusion(
             native, enabled=configuration.get('request_gimbal_exclusion', False))
+        from .motion_trajectory import install_motion_trajectory_owner
+
+        motion_trajectory_receipt = install_motion_trajectory_owner(native, enabled=motion_trajectory_owner)
         jump_takeoff_receipt = stair_label_receipt = None
         if configuration.get("jump_takeoff") is not None:
             from .jump_takeoff import install_jump_takeoff
@@ -235,6 +241,8 @@ def create_course(configuration):
             provenance['stair_timeout_retry'] = stair_retry_receipt
         if gimbal_arbitration_receipt is not None:
             provenance['request_gimbal_exclusion'] = gimbal_arbitration_receipt
+        if motion_trajectory_receipt is not None:
+            provenance['motion_trajectory_owner'] = motion_trajectory_receipt
         if recovery_bridge_receipt is not None:
             provenance['recovery_roll_bridge'] = recovery_bridge_receipt
         if platform_owner is not None:
