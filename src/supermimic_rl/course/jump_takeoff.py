@@ -60,11 +60,16 @@ class JumpTriggerGate:
         return (t._last_supported & height & (t.elapsed + t.policy_dt_s >= c.min_episode_s)
                 & (now - self.last_end_s >= c.cooldown_s))
 
-    def defer(self, now, ground):
+    def defer(self, now, ground, *, automatic_mask=None):
         """Before the native step: a request that would become due now waits one more interval."""
         t = self.tasks
         due = ((t.family == self.request_family) & (t.elapsed + t.policy_dt_s >= t.next_request_s)
                & (t.protocol.active_id < 0))
+        if automatic_mask is not None:
+            if (not isinstance(automatic_mask, torch.Tensor) or automatic_mask.shape != due.shape
+                    or automatic_mask.dtype != torch.bool or automatic_mask.device != due.device):
+                raise ValueError('Automatic request ownership requires one bool per native row')
+            due &= automatic_mask
         postpone = due & ~self.ready(now, ground)
         t.next_request_s.copy_(torch.where(postpone, t.elapsed + 2 * t.policy_dt_s, t.next_request_s))
         self.deferred += postpone.sum()
@@ -89,7 +94,14 @@ def install_jump_takeoff(native, configuration: dict) -> dict:
     gate = JumpTriggerGate(tasks, config)
     native_step = tasks.step
 
-    def step(now, estimate, ground, *, command=None, **kwargs):
+    def step(now, estimate, ground, *, command=None, packet_owned=None, **kwargs):
+        if packet_owned is not None:
+            from .request_selection import validate_packet_owned
+
+            validate_packet_owned(packet_owned, packet=command,
+                                  count=len(tasks.elapsed), device=tasks.elapsed.device)
+            gate.defer(now, ground, automatic_mask=~packet_owned)
+            kwargs['packet_owned'] = packet_owned
         if command is None:
             gate.defer(now, ground)
         result = native_step(now, estimate, ground, command=command, **kwargs)
