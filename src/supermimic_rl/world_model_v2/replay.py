@@ -21,10 +21,11 @@ from .stair_source import TOF_RECORD_DTYPES
 from .jump_task import JUMP_FLIGHT_LATCH_RECORD_DTYPES, JUMP_RECORD_DTYPES, JUMP_TRIGGER_RECORD_DTYPES
 from .recovery_task import RECOVERY_RECORD_DTYPES
 from .physical import INCREMENT_DIM
+from .platform_records import PLATFORM_RECORD_DTYPES, PLATFORM_RECORD_FIELDS, validate_platform_fields
 
 _NATIVE_RECORD_DTYPES = {**STAIR_RECORD_DTYPES, **TOF_RECORD_DTYPES, **JUMP_RECORD_DTYPES,
                          **JUMP_TRIGGER_RECORD_DTYPES, **JUMP_FLIGHT_LATCH_RECORD_DTYPES,
-                         **RECOVERY_RECORD_DTYPES}
+                         **RECOVERY_RECORD_DTYPES, **PLATFORM_RECORD_DTYPES}
 
 _BOOL_FIELDS = ("valid", "terminated", "truncated", "policy_owned", "end_policy_owned")
 _ID_FIELDS = ("start_episode_id", "end_episode_id", "start_control_epoch", "end_control_epoch")
@@ -35,6 +36,7 @@ class CompactReplay:
                  device: str | torch.device):
         if num_envs < 1 or capacity_steps < 1:
             raise ValueError("Replay requires positive environment count and capacity")
+        validate_platform_fields(fields)
         self.num_envs, self.capacity, self.device = num_envs, capacity_steps, torch.device(device)
         self.data = {name: torch.zeros(capacity_steps, num_envs, *shape, device=self.device,
                                       dtype=_NATIVE_RECORD_DTYPES.get(name, torch.float32))
@@ -90,6 +92,7 @@ class CompactReplay:
         if payload.get('format') != 'supermimic-compact-replay-v1':
             raise ValueError('Unknown compact replay format')
         data, sequence = payload['storage'], payload['sequence']
+        validate_platform_fields({name: value.shape[2:] for name, value in data.items()})
         n, size, capacity = payload['num_envs'], len(sequence), payload['capacity']
         if n < 1 or capacity < 1:
             raise ValueError('Replay requires positive environment count and capacity')
@@ -150,6 +153,10 @@ class CompactReplay:
         sequence_id = self.total_steps if sequence_id is None else sequence_id
         if sequence_id < self.total_steps:
             raise ValueError("Replay sequence IDs must strictly increase")
+        if 'platform_record_valid' in self.data:
+            if any(name not in record or record[name].shape != (self.num_envs, *shape)
+                   for name, shape in PLATFORM_RECORD_FIELDS.items()):
+                raise ValueError('Appending platform replay requires every typed field with its exact shape')
         for name, dtype in _NATIVE_RECORD_DTYPES.items():
             if name in record and record[name].dtype != dtype:
                 raise ValueError('Task IDs/clocks must retain their native replay dtype: ' + name)

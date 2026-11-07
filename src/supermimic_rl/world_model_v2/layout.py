@@ -53,7 +53,8 @@ class SnapshotLayout:
     CONTEXT_FIELDS = ("body_mass_kg", "requested.motor_strength", "requested.pd_encoder_bias_rad",
                       "wheel_material", "identified.wheel_total_inertia_kg_m2")
 
-    def __init__(self, schema: StateSchema, *, record_terrain: bool = False):
+    def __init__(self, schema: StateSchema, *, record_terrain: bool = False,
+                 record_platform: bool = False):
         if not schema.substep_fields:
             raise ValueError("v2 requires recorded substep truth (record_substeps=true)")
         self.schema = schema
@@ -62,6 +63,11 @@ class SnapshotLayout:
         if record_terrain and any(name not in self.state for name in ('course.terrain_tile', 'course.tasks.family')):
             raise ValueError('Terrain records require the actual native tile assignment and task family')
         self.substep = _Fields(schema.substep_fields)
+        self.record_platform = record_platform
+        contact = self.substep.slices.get('contact_measurement_valid')
+        if type(record_platform) is not bool or (record_platform and (
+                schema.substeps_per_step != 4 or contact is None or contact[1] != (1,))):
+            raise ValueError('Platform collection needs four scalar native contact-valid ticks')
         disturbance_fields = [name in self.state for name in DISTURBANCE_STATE_FIELDS]
         disturbance_fields += [name in self.substep for name in ("velocity_push_world", "external_wrench_body")]
         if any(disturbance_fields) and not all(disturbance_fields):
@@ -153,7 +159,7 @@ class SnapshotLayout:
 
     # -- compact records ------------------------------------------------------------
     def encode(self, transition) -> dict[str, Tensor]:
-        """One packed ``Transition`` -> the compact v2 record (all float32 ``[N, ...]``)."""
+        """One packed transition -> compact records, including opt-in typed evidence."""
         start, end = transition.start, transition.end
         state, context = start.state, start.context
         physical = self.physical(state)
@@ -219,6 +225,9 @@ class SnapshotLayout:
         if self.record_terrain:
             record['terrain_tile'] = get('course.terrain_tile').reshape(-1, 1)
             record['task_family'] = get('course.tasks.family').reshape(-1, 1)
+        if self.record_platform:
+            record['contact_valid_ticks'] = self.substep(
+                transition.substeps, 'contact_measurement_valid').eq(1)
         if self.record_disturbances:
             record['disturbance'] = self.state.flat(state, DISTURBANCE_STATE_FIELDS)
             record['end_disturbance'] = self.state.flat(end.state, DISTURBANCE_STATE_FIELDS)

@@ -16,6 +16,7 @@ from .stair_source import TOF_RECORD_FIELDS, StairSourceState
 from .jump_task import (JUMP_FLIGHT_LATCH_RECORD_FIELDS, JUMP_RECORD_FIELDS, JUMP_TRIGGER_RECORD_FIELDS,
                         JumpTaskState)
 from .recovery_task import RECOVERY_RECORD_FIELDS, RecoveryTaskState
+from .platform_records import PLATFORM_RECORD_FIELDS, PlatformRecordState
 
 
 def _schema_action_bounds(schema) -> tuple[float, ...]:
@@ -29,7 +30,8 @@ class Collector:
                  replay: CompactReplay | None = None, advance_training_progress: bool = True,
                  record_terrain: bool = False, record_tasks: bool = False, record_stairs: bool = False,
                  record_stair_source: bool = False, record_jumps: bool = False, record_recovery: bool = False,
-                 course_coordinate: int | None = None, course_coordinate_at=None):
+                 course_coordinate: int | None = None, course_coordinate_at=None,
+                 record_platform: bool = False, platform_landing_capture=None):
         if environment.current is None:
             raise ValueError('Reset the native environment before constructing its collector')
         if action_noise_std < 0 or history_length < 1 or capacity_steps < 1:
@@ -39,8 +41,21 @@ class Collector:
         if course_coordinate_at is not None and (not callable(course_coordinate_at) or not advance_training_progress):
             raise ValueError('A course sampling clock must be callable and explicitly applied')
         self.environment, self.decision = environment, decision
-        self.layout = (SnapshotLayout(environment.schema, record_terrain=True) if record_terrain
-                       else SnapshotLayout(environment.schema))
+        if type(record_platform) is not bool or (record_platform and not record_jumps):
+            raise ValueError('Platform collection requires an explicit opt-in and complete jump task records')
+        if not record_platform and platform_landing_capture is not None:
+            raise ValueError('A platform landing capture requires opt-in platform collection')
+        if record_platform:
+            caller = getattr(environment.adapter.env, 'supermimic_platform_intent', None)
+            if not callable(getattr(caller, 'capture', None)) or not callable(platform_landing_capture):
+                raise ValueError('Platform collection requires the native caller and actual landing owner capture')
+        self.record_platform, self.platform_landing_capture = record_platform, platform_landing_capture
+        layout_options = {'record_platform': True} if record_platform else {}
+        if record_terrain:
+            layout_options['record_terrain'] = True
+        self.layout = SnapshotLayout(environment.schema, **layout_options)
+        if replay is not None and any((name in replay.data) != record_platform for name in PLATFORM_RECORD_FIELDS):
+            raise ValueError('Collector platform records differ from replay; legacy state is not known inactive')
         if replay is not None:
             from .disturbance import DISTURBANCE_RECORD_FIELDS
 
@@ -133,6 +148,8 @@ class Collector:
             source = StairSourceState.capture(env.adapter.env) if self.record_stair_source else None
             jump = JumpTaskState.capture(env.adapter.env) if self.record_jumps else None
             recovery = RecoveryTaskState.capture(env.adapter.env) if self.record_recovery else None
+            platform = (PlatformRecordState.capture(env.adapter.env, self.platform_landing_capture,
+                        count=env.num_envs, device=env.device) if self.record_platform else None)
             action, estimate = self.decision(self.history)
             teacher_rows = getattr(self.decision, 'teacher_rows', None)
             if action.shape != (env.num_envs, 6) or estimate.shape != (env.num_envs, 5):
@@ -163,6 +180,8 @@ class Collector:
             if recovery is not None:
                 record.update(recovery.record())
                 record['recovery_record_valid'] = task_estimate.new_ones(env.num_envs, 1)
+            if platform is not None:
+                record.update(platform.record())
             if self.replay is None:
                 self.replay = CompactReplay({name: tuple(value.shape[1:]) for name, value in record.items()},
                                              env.num_envs, self.capacity, env.device)

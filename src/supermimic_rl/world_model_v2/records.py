@@ -121,7 +121,10 @@ class RecordSpec:
                record_jumps: bool = False, record_recovery: bool = False,
                record_jump_trigger: bool = False,
                record_jump_flight_latch: bool = False,
-               record_disturbances: bool = False) -> dict[str, tuple[int, ...]]:
+               record_disturbances: bool = False,
+               record_platform: bool = False) -> dict[str, tuple[int, ...]]:
+        if type(record_platform) is not bool or (record_platform and not record_jumps):
+            raise ValueError('Platform records require an explicit opt-in and complete jump task records')
         if record_stair_source and not (record_terrain and record_tasks and record_stairs):
             raise ValueError('Ideal stair-source records require terrain, command and stair task records')
         if record_jumps and not record_stair_source:
@@ -170,4 +173,8 @@ class RecordSpec:
             from .disturbance import DISTURBANCE_RECORD_FIELDS
 
             result.update(DISTURBANCE_RECORD_FIELDS)
+        if record_platform:
+            from .platform_records import PLATFORM_RECORD_FIELDS
+
+            result.update(PLATFORM_RECORD_FIELDS)
         return result
