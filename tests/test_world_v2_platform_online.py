@@ -199,6 +199,38 @@ def test_recipe_does_not_silently_upgrade_legacy_platform_history():
         obj._check_saved(saved)
 
 
+@pytest.mark.parametrize('source', [
+    {'manual_platform_jump': {'data_use': {'joint_imagination_forbidden': True}}},
+    {'manual_platform_jump': {'data_use': {'joint_task_imagination_supported': False}}},
+    {'contact_collection': {'joint_actor_starts_allowed': False}},
+    {},
+])
+def test_fresh_seed_honors_dataset_use_even_with_matching_schema_and_typed_fields(tmp_path, monkeypatch, source):
+    from supermimic_rl.contracts import Field, StateSchema
+    from supermimic_rl.world_model_v2.records import MODEL_CONTRACT, RecordSpec
+
+    schema = StateSchema((Field('fixture', (1,)),), (), goal_dim=16, observation_dim=45,
+        substep_fields=(Field('fixture_tick', (1,)),), substeps_per_step=4, source='{}')
+    fields = RecordSpec(16, 65).fields(record_tasks=True, record_terrain=True,
+        record_stairs=True, record_stair_source=True, record_jumps=True, record_platform=True)
+    replay = CompactReplay(fields, 2, 1, 'cpu')
+    dataset = {'format': 'supermimic-world-v2-dataset-v1', 'model_contract': MODEL_CONTRACT,
+        'schema': schema.to_dict(), 'schema_fingerprint': schema.fingerprint,
+        'source': source, 'replay': replay.state_dict()}
+    path = tmp_path / 'seed.pt'
+    torch.save(dataset, path)
+    env = SimpleNamespace(device=torch.device('cpu'), current=object(), schema=schema)
+    monkeypatch.setattr('supermimic_rl.world_model_v2.online.make_learner', lambda *a, **kw: object())
+    # The boundary also applies without the platform opt-in: unknown future
+    # commands cannot become ordinary policy starts by switching the flag off.
+    error, match = ((ValueError, 'cannot seed online policy') if source else
+                    (FileNotFoundError, 'world-not-read.pt'))
+    with pytest.raises(error, match=match):
+        OnlineTrainer(env, lambda: None, OnlineConfig(), tmp_path / 'online', runtime={},
+            linkage_path=None, asset_directory=None, identified_bundle=None,
+            seed_dataset=path, world_checkpoint=tmp_path / 'world-not-read.pt')
+
+
 def test_real_factory_reuses_reward_geometry_and_platform_atlas(tmp_path):
     from supermimic_rl.contracts import Field, StateSchema
     from supermimic_rl.world_model_v2.factory import make_learner

@@ -327,6 +327,16 @@ class OnlineTrainer:
             if seed_dataset is None or world_checkpoint is None:
                 raise ValueError('A fresh online run requires native seed data and its fitted world model')
             dataset = torch.load(seed_dataset, map_location='cpu', weights_only=True, mmap=True)
+            # Manual evaluation can share a schema while using future commands
+            # that were never recorded. Such data still support dynamics fitting,
+            # but cannot seed policy imagination, even with complete tensor fields.
+            source = dataset.get('source') or {}
+            manual = source.get('manual_platform_jump', {}).get('data_use', {})
+            contact = source.get('contact_collection', {})
+            if (manual.get('joint_imagination_forbidden') is True
+                    or manual.get('joint_task_imagination_supported') is False
+                    or contact.get('joint_actor_starts_allowed') is False):
+                raise ValueError('Dynamics/contact-only data cannot seed online policy imagination')
             if dataset.get('format') != 'supermimic-world-v2-dataset-v1' or dataset['model_contract'] != MODEL_CONTRACT:
                 raise ValueError('Online seed data must use the current compact world-model contract')
             if (dataset['schema_fingerprint'] != environment.schema.fingerprint
