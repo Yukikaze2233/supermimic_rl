@@ -58,7 +58,12 @@ class RewardExtensions:
     first flight. From first touchdown or HOLD, tracking rewards are scaled
     by attained peak / the native acceptable lower peak, and the existing
     missed-jump weight costs the remaining fraction. The landing reference
-    stays at the baseline. This option only changes JUMP-mode rewards.
+    stays at the baseline. On its own this only changes JUMP-mode rewards.
+
+    ``jump_physical_tail`` retains peak completion, missed and settling terms
+    after the protocol releases to NORMAL while the same physical request
+    remains alive. Terrain and special gimbal tasks keep their own rewards.
+    It does not prolong the request or add takeoff/flight terms to NORMAL.
 
     The native success needs 2 s of uninterrupted stable landing (contact,
     quiet, near the start height, peak inside the target window). The single
@@ -101,10 +106,13 @@ class RewardExtensions:
     ordinary_leg_acceleration: float | None = None  # per second and (rad/s^2)^2, summed over four legs
     jump_peak_completion: bool = False  # reuse missed-jump weight with continuous requested-peak completion
     stationary_quiet: float = 0.  # per second at upright target height and quiet supported NORMAL standstill
+    jump_physical_tail: bool = False  # retain existing completion/landing terms until physical request ends
 
     def __post_init__(self):
         if type(self.jump_peak_completion) is not bool or self.jump_peak_completion and self.jump_missed <= 0:
             raise ValueError('Jump peak completion requires a boolean flag and positive jump_missed weight')
+        if type(self.jump_physical_tail) is not bool or self.jump_physical_tail and not self.jump_peak_completion:
+            raise ValueError('Jump physical tail requires a boolean flag and enabled jump_peak_completion')
         values = (self.jump_flight, self.jump_lift, self.jump_lift_cap_m_s, self.jump_push, self.jump_missed,
                   self.jump_settle, self.jump_landing_rate, self.recovery_quiet, self.stationary_quiet,
                   0. if self.ordinary_leg_acceleration is None else self.ordinary_leg_acceleration,
@@ -537,6 +545,13 @@ def physical_reward_densities(sample: RewardPhysics, reference: RewardReference,
             jump_progress.validate(reference.mode)
             stage, ascended, closed, landed = (jump_progress.reference_stage, jump_progress.ascent_seen,
                                                jump_progress.flight_closed, jump_progress.landed_s)
+    physical_tail = torch.zeros_like(jump)
+    if extensions.jump_physical_tail:
+        if jump_progress is None or jump_progress.physical_active is None:
+            raise ValueError('Jump physical tail requires explicit per-tick physical jump activity')
+        physical_tail = (jump_progress.physical_active & (reference.mode == int(CommandMode.NORMAL))
+                         & ~terrain_active & ~terrain_airborne & ~rough_active & ~gimbal_active)
+    settling_scope = jump | physical_tail
     if extensions.jump_missed:
         from transformer_rl.formal.tasks.jump import ReferenceStage
 
@@ -562,11 +577,13 @@ def physical_reward_densities(sample: RewardPhysics, reference: RewardReference,
                                       requested * JUMP_PEAK_TOLERANCE_TARGET_FRACTION)
             # Inactive rows carry a zero request. Keep their division defined
             # without altering any admitted jump target or success tolerance.
-            lower = torch.where(jump, requested - tolerance, torch.ones_like(requested))
-            if (jump & (lower <= 0)).any():
+            lower = torch.where(settling_scope, requested - tolerance, torch.ones_like(requested))
+            if (settling_scope & (lower <= 0)).any():
                 raise ValueError('Jump peak completion requires a positive admitted rise')
             completion = started.to(peak.dtype) * (peak / lower).clamp(0, 1)
-            late = jump & ((stage == int(ReferenceStage.HOLD)) | closed)
+            # Protocol completion can reset its clock before physical peak or
+            # landing qualification. The still-live request owns this tail.
+            late = (jump & ((stage == int(ReferenceStage.HOLD)) | closed)) | physical_tail
             gain = torch.where(late, completion, 1.)
             for name in ('forward', 'yaw', 'height', 'jump_vertical'):
                 positive[name] = positive[name] * gain
@@ -612,7 +629,7 @@ def physical_reward_densities(sample: RewardPhysics, reference: RewardReference,
                     raise ValueError('Jump settle rewards require the native stable-landing time')
             else:
                 streak = (landed.to(v_up.dtype) / JUMP_SETTLE_STREAK_S).clamp(0, 1)
-                settled = torch.where(jump & (landed > 0), .25 + .75 * streak, 0.)
+                settled = torch.where(settling_scope & (landed > 0), .25 + .75 * streak, 0.)
         positive['jump_settle'] = extensions.jump_settle * settled
     if extensions.jump_landing_rate:
         landed_after_flight = torch.zeros_like(jump)
@@ -621,7 +638,7 @@ def physical_reward_densities(sample: RewardPhysics, reference: RewardReference,
                 if jump.any():
                     raise ValueError('Jump landing-rate costs require the first-flight latch of the request')
             else:
-                landed_after_flight = jump & closed & (phase != int(RewardPhase.FLIGHT))
+                landed_after_flight = settling_scope & closed & (phase != int(RewardPhase.FLIGHT))
         excess = (sample.angular_velocity_body_rad_s.norm(dim=-1) - JUMP_LANDING_RATE_FREE_RAD_S).clamp_min(0)
         cost['jump_landing_rate'] = extensions.jump_landing_rate * landed_after_flight.to(v_up.dtype) * excess.square()
     if extensions.recovery_quiet:

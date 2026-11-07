@@ -196,6 +196,8 @@ def install_shared_reward(composer, *, verify_native=False, extensions: RewardEx
             receipt['extensions'].pop('jump_peak_completion')
         if not extensions.stationary_quiet:
             receipt['extensions'].pop('stationary_quiet')
+        if not extensions.jump_physical_tail:
+            receipt['extensions'].pop('jump_physical_tail')
     return receipt
 
 
