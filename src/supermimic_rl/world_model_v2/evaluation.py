@@ -20,6 +20,14 @@ def evaluate_native(environment, actor, steps, *, on_progress=None,
     if environment.current is None:
         environment.reset()
     owner = environment.adapter
+    platform = getattr(owner.env, 'supermimic_platform_course', None)
+    platform_rows = None
+    if platform is not None:
+        rows = platform.platform_rows
+        if (not isinstance(rows, torch.Tensor) or rows.shape != (environment.num_envs,)
+                or rows.dtype != torch.bool):
+            raise ValueError('Platform evaluation requires explicit planned native rows')
+        platform_rows = rows.nonzero().flatten().cpu().tolist()
     features = getattr(actor, 'features', None)
     if features is not None and features.configuration is not None:
         features.validate_reference(owner.env._terrain_course.tasks.reference.config)
@@ -66,10 +74,13 @@ def evaluate_native(environment, actor, steps, *, on_progress=None,
         from .stair_source import StairScenario
 
         source_config = StairScenario.capture(owner.env).to_dict()
+    recording_options = ({'record_terrain': True, 'record_tasks': True, 'record_stairs': True,
+        'record_stair_source': True, 'record_jumps': True, 'record_recovery': True} if recording else {})
+    if recording and platform is not None:
+        recording_options.update(platform.recording_options())
     collector = Collector(environment, decision, capacity_steps=steps if recording else 1,
         action_noise_std=0., advance_training_progress=False,
-        **({'record_terrain': True, 'record_tasks': True, 'record_stairs': True,
-            'record_stair_source': True, 'record_jumps': True, 'record_recovery': True} if recording else {}))
+        **recording_options)
     try:
         collector.collect(steps, on_progress=progress, on_transition=measured,
             on_source_rng=((lambda sequence, state: source_rng.append((sequence, state.cpu())))
@@ -90,6 +101,29 @@ def evaluate_native(environment, actor, steps, *, on_progress=None,
                        'action sampling follows the caller'}
     if fixed_suite:
         report['task_suite'] = owner.evaluation_summary()
+    if platform is not None:
+        summary = getattr(platform, 'summary', None)
+        report['platform_diagnostics'] = (summary() if callable(summary) else {
+            'status': 'unknown', 'reason': 'The native platform owner has no diagnostic summary'})
+        report['platform_evaluation_scope'] = {
+            'planned_env_ids': platform_rows, 'recorded_physics_ticks': recording,
+            'capability_source': 'platform_diagnostics only; final snapshots are not a success rate',
+            'legacy_jump_events': 'Unchanged native jump pulses and aggregate counters are not '
+                                  'an all-task or selected-platform success numerator'}
+        if fixed_suite:
+            suite = dict(report['task_suite'])
+            if 'jump_diagnostics' in suite:
+                diagnostic = dict(suite.pop('jump_diagnostics'))
+                diagnostic['platform_interpretation'] = {
+                    'planned_env_ids': platform_rows, 'includes_platform_rows': bool(platform_rows),
+                    'scope': 'Flat-anchor jump conditions include selected-platform rows; '
+                             'they do not qualify platform flight, landing or success. '
+                             'Original values are retained without recomputing outcomes.'}
+                suite['flat_anchor_jump_diagnostics'] = diagnostic
+            suite['success_semantics'] = (suite.get('success_semantics', '') +
+                ' Selected-platform capability is reported separately in platform_diagnostics; '
+                'legacy jump events and mixed counters do not certify all-task success.')
+            report['task_suite'] = suite
     if recording:
         from .dataset import save_native_dataset
 

@@ -49,3 +49,105 @@ def test_native_evaluation_excludes_invalid_physics_from_tracking_and_failures(m
     assert report['rms/forward_error_m_s'] == 1.
     assert report['rms/yaw_rate_error_rad_s'] == 2.
     assert report['rms/height_error_m'] == 3.
+
+
+def platform_evaluation_fixture(monkeypatch, *, enabled=True, fixed=True, summary=True):
+    calls = {}
+    platform = SimpleNamespace(platform_rows=torch.tensor([False, True]), landing=object())
+    platform.recording_options = lambda: {'record_platform': True, 'platform_landing': platform.landing}
+    if summary:
+        platform.summary = lambda: {'scope': 'actual final state only', 'phase': [0, 3], 'success_rate': None}
+    native = SimpleNamespace()
+    if enabled:
+        native.supermimic_platform_course = platform
+    current = SimpleNamespace(state=torch.zeros(2, 1))
+    original_suite = {'jump_diagnostics': {'requests': [{'env_id': 1}], 'totals': {'success': 0}},
+                      'success_semantics': 'Native pulses', 'buckets': {'stand': {'samples': 1}}}
+    owner = SimpleNamespace(env=native, current=current)
+    if fixed:
+        owner._evaluation_configuration = object()
+        owner.evaluation_begin = lambda schema: calls.update(begin=True)
+        owner.evaluation_step = lambda *args: calls.update(measured=True)
+        owner.evaluation_end = lambda: calls.update(end=True)
+        owner.evaluation_summary = lambda: original_suite
+    env = SimpleNamespace(num_envs=2, device='cpu', policy_dt_s=.02, adapter=owner, current=current,
+        _pack=lambda value: value, schema=SimpleNamespace(state_fields=[]))
+    monkeypatch.setattr(evaluation, 'native_tracking_sample', lambda _: SimpleNamespace(
+        actual=torch.zeros(2, 3), target=torch.zeros(2, 3)))
+    monkeypatch.setattr(evaluation, 'terminal_failure_masks', lambda *args: {})
+    monkeypatch.setattr('supermimic_rl.world_model_v2.stair_source.StairScenario.capture',
+        lambda _: SimpleNamespace(to_dict=lambda: {'scenario': 'actual'}))
+
+    def save(collector, path, report, **kwargs):
+        calls['saved_report'], calls['saved_source'] = report, kwargs
+        return {'path': str(path)}
+
+    monkeypatch.setattr('supermimic_rl.world_model_v2.dataset.save_native_dataset', save)
+
+    class Collector:
+        def __init__(self, environment, decision, **kwargs):
+            calls['collector_options'] = kwargs
+            self.decision = decision
+            self.layout = SimpleNamespace(physical=lambda _: SimpleNamespace(
+                gravity_body=torch.tensor([[0., 0., -1.]] * 2)))
+
+        def collect(self, steps, **kwargs):
+            self.decision(torch.zeros(2, 5, 35))
+            kwargs['on_transition'](SimpleNamespace(reward=torch.zeros(2), valid=torch.ones(2, dtype=torch.bool),
+                terminated=torch.zeros(2, dtype=torch.bool), truncated=torch.zeros(2, dtype=torch.bool),
+                end=SimpleNamespace(state=torch.zeros(2, 1))))
+
+    monkeypatch.setattr(evaluation, 'Collector', Collector)
+
+    class Actor:
+        def eval(self):
+            pass
+
+        def __call__(self, frames):
+            return torch.zeros(2, 6)
+
+        def estimate(self, frames):
+            return torch.zeros(2, 5)
+
+    return env, Actor(), platform, calls, original_suite
+
+
+def test_platform_evaluation_records_single_owner_and_labels_flat_diagnostics(monkeypatch, tmp_path):
+    env, actor, platform, calls, original = platform_evaluation_fixture(monkeypatch)
+    report = evaluation.evaluate_native(env, actor, 1, record_dataset=tmp_path / 'dataset.pt')
+    assert calls['collector_options']['record_platform'] is True
+    assert calls['collector_options']['platform_landing'] is platform.landing
+    assert calls['collector_options']['record_jumps'] and calls['collector_options']['record_recovery']
+    assert calls['collector_options']['advance_training_progress'] is False
+    assert report['platform_diagnostics'] == platform.summary()
+    assert report['platform_diagnostics']['success_rate'] is None
+    assert report['platform_evaluation_scope']['planned_env_ids'] == [1]
+    suite = report['task_suite']
+    assert 'jump_diagnostics' not in suite
+    assert 'jump_diagnostics' in original  # Do not mutate the native diagnostic owner.
+    flat = suite['flat_anchor_jump_diagnostics']
+    assert flat['requests'] == original['jump_diagnostics']['requests']
+    assert flat['totals'] == original['jump_diagnostics']['totals']
+    assert flat['platform_interpretation']['includes_platform_rows'] is True
+    assert calls['saved_report']['platform_diagnostics'] == report['platform_diagnostics']
+    assert calls['begin'] and calls['end'] and calls['measured']
+
+
+def test_platform_evaluation_without_dataset_does_not_record_ticks(monkeypatch):
+    env, actor, _, calls, _ = platform_evaluation_fixture(monkeypatch, fixed=False, summary=False)
+    report = evaluation.evaluate_native(env, actor, 1)
+    assert 'record_platform' not in calls['collector_options']
+    assert 'platform_landing' not in calls['collector_options']
+    assert report['platform_diagnostics']['status'] == 'unknown'
+    assert report['platform_evaluation_scope']['recorded_physics_ticks'] is False
+    assert 'task_suite' not in report
+
+
+def test_legacy_evaluation_retains_original_summary_and_record_options(monkeypatch, tmp_path):
+    env, actor, _, calls, original = platform_evaluation_fixture(monkeypatch, enabled=False)
+    report = evaluation.evaluate_native(env, actor, 1, record_dataset=tmp_path / 'dataset.pt')
+    assert report['task_suite'] is original
+    assert 'platform_diagnostics' not in report and 'platform_evaluation_scope' not in report
+    assert 'record_platform' not in calls['collector_options']
+    assert 'platform_landing' not in calls['collector_options']
+    assert calls['collector_options']['record_jumps'] is True
