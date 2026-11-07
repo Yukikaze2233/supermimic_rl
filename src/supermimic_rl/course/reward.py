@@ -198,6 +198,8 @@ def install_shared_reward(composer, *, verify_native=False, extensions: RewardEx
             receipt['extensions'].pop('stationary_quiet')
         if not extensions.jump_physical_tail:
             receipt['extensions'].pop('jump_physical_tail')
+        if not extensions.jump_extension_height_floor:
+            receipt['extensions'].pop('jump_extension_height_floor')
     return receipt
 
 

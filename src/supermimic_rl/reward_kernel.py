@@ -65,6 +65,11 @@ class RewardExtensions:
     remains alive. Terrain and special gimbal tasks keep their own rewards.
     It does not prolong the request or add takeoff/flight terms to NORMAL.
 
+    ``jump_extension_height_floor`` treats the clock's EXTENSION height as a
+    lower bound until the first real touchdown. Height above that reference
+    does not ask the body to compress again while vertical tracking asks it
+    to rise. Compression, later clock stages and physical success stay intact.
+
     The native success needs 2 s of uninterrupted stable landing (contact,
     quiet, near the start height, peak inside the target window). The single
     success event gives a policy that never succeeded no gradient toward it, so
@@ -107,8 +112,11 @@ class RewardExtensions:
     jump_peak_completion: bool = False  # reuse missed-jump weight with continuous requested-peak completion
     stationary_quiet: float = 0.  # per second at upright target height and quiet supported NORMAL standstill
     jump_physical_tail: bool = False  # retain existing completion/landing terms until physical request ends
+    jump_extension_height_floor: bool = False  # release only above-reference height in pre-touchdown EXTENSION
 
     def __post_init__(self):
+        if type(self.jump_extension_height_floor) is not bool:
+            raise ValueError('Jump extension height floor requires a boolean flag')
         if type(self.jump_peak_completion) is not bool or self.jump_peak_completion and self.jump_missed <= 0:
             raise ValueError('Jump peak completion requires a boolean flag and positive jump_missed weight')
         if type(self.jump_physical_tail) is not bool or self.jump_physical_tail and not self.jump_peak_completion:
@@ -124,12 +132,13 @@ class RewardExtensions:
     def active(self) -> bool:
         return bool(self.jump_flight or self.jump_lift or self.jump_push or self.jump_missed or self.jump_settle
                     or self.jump_landing_rate or self.recovery_quiet or self.success_event is not None
-                    or self.ordinary_leg_acceleration is not None or self.stationary_quiet)
+                    or self.ordinary_leg_acceleration is not None or self.stationary_quiet
+                    or self.jump_extension_height_floor)
 
     @property
     def needs_jump_progress(self) -> bool:
         return bool(self.jump_flight or self.jump_lift or self.jump_push or self.jump_missed or self.jump_settle
-                    or self.jump_landing_rate or self.stationary_quiet)
+                    or self.jump_landing_rate or self.stationary_quiet or self.jump_extension_height_floor)
 
 
 @dataclass(frozen=True)
@@ -374,6 +383,20 @@ def physical_reward_densities(sample: RewardPhysics, reference: RewardReference,
             ((zero - ordinary_eh.abs()) / (zero - full)).clamp(0, 1), velocity_gate)
     jump_eh = sample.root_world_z_m - reference.jump_height_world_z_m
     eh = torch.where(jump, jump_eh, ordinary_eh)
+    if parameters.extensions.jump_extension_height_floor:
+        from transformer_rl.formal.tasks.jump import ReferenceStage
+
+        if jump_progress is None or jump_progress.flight_closed is None:
+            if jump.any():
+                raise ValueError('Jump extension height floor requires explicit first-flight closure and request progress')
+        else:
+            jump_progress.validate(reference.mode)
+            extension = (jump & (jump_progress.reference_stage == int(ReferenceStage.EXTENSION))
+                         & ~jump_progress.flight_closed)
+            invalid |= extension & ~torch.isfinite(jump_eh)
+            # Preserve the signed physical error in telemetry; only the height
+            # objective stops pulling down an already above-reference extension.
+            eh = torch.where(extension, eh.clamp_max(0), eh)
     evz = sample.velocity_origin_world_m_s[:, 2] - reference.jump_velocity_world_z_m_s
     pose = sample.roll_pitch_rad - reference.target_roll_pitch_rad
     upright = (-sample.gravity_body[:, 2]).clamp(-1, 1)
