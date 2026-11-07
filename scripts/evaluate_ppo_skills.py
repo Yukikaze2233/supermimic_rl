@@ -2,7 +2,7 @@
 """Per-skill native evaluation of a PPO actor on the fixed course task suite.
 
 The factory config must contain an ``evaluation`` section (fixed scenarios,
-e.g. ``{"evaluation_stage": "combined_dr", "seed": 7}`` for all 27). The PPO
+e.g. ``{"evaluation_stage": "combined_dr", "seed": 7}`` for the full bank). The PPO
 actor reads the native ``obs_buf`` history exactly as in PPO training, not the
 collector's handoff-refilled history; actions default to its deterministic mean.
 Optional PPO Gaussian sampling uses the checkpoint std and an independent RNG
@@ -100,7 +100,6 @@ def main():
     from supermimic_rl.adapters.packed import PackedEnvironment
     from supermimic_rl.cli import _native_schema_source, native_logs
     from supermimic_rl.ppo.trainer import load_actor
-    from supermimic_rl.world_model_v2.evaluation import evaluate_native
     from supermimic_rl.world_model_v2.teacher import file_sha256
 
     with native_logs(output / "native"):
@@ -121,10 +120,20 @@ def main():
             policy = NativeHistoryActor(actor, environment, action_sampling=args.action_sampling,
                                         sampling_seed=args.sampling_seed)
             with torch.no_grad():
-                report = evaluate_native(environment, policy, args.steps, on_progress=progress,
-                    record_dataset=output / "replay.pt" if args.record_dataset else None,
-                    recording_source={"kind": "own_ppo_native_evaluation", "checkpoint": str(args.checkpoint.resolve()),
-                        "checkpoint_sha256": digest, "action_sampling": policy.sampling_report()})
+                if args.record_dataset:
+                    # Recording is still subject to the world-model contract.
+                    # PPO-only physics extensions are not silently encoded as
+                    # a compatible V2 replay by the non-recording evaluator.
+                    from supermimic_rl.world_model_v2.evaluation import evaluate_native
+
+                    report = evaluate_native(environment, policy, args.steps, on_progress=progress,
+                        record_dataset=output / "replay.pt",
+                        recording_source={"kind": "own_ppo_native_evaluation", "checkpoint": str(args.checkpoint.resolve()),
+                            "checkpoint_sha256": digest, "action_sampling": policy.sampling_report()})
+                else:
+                    from supermimic_rl.ppo.native_skill_evaluation import evaluate_native_policy
+
+                    report = evaluate_native_policy(environment, policy, args.steps, on_progress=progress)
             if file_sha256(args.checkpoint) != digest:
                 raise ValueError("Checkpoint changed during evaluation")
             report.update(checkpoint=str(args.checkpoint.resolve()), checkpoint_sha256=digest,

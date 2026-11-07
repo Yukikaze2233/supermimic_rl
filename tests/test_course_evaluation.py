@@ -72,13 +72,37 @@ def test_fixed_suite_preserves_ids_and_maps_real_request_and_recovery_modes(adap
     resolved = plan.description()["resolved_curriculum"]
     assert resolved["stage"] == 7 and resolved["stage_name"] == "combined_dr"
     assert resolved["source_schedule_coordinate"] == 34999
-    assert len(plan.names) == 27 and not plan.description()["unassigned_scenarios"]
+    assert len(plan.names) == 31 and not plan.description()["unassigned_scenarios"]
     assert plan.curriculum.terrain_step_up_cap_m() == pytest.approx(.2)
     for motion in ("standing", "moving"):
         assert [plan.scenarios[f"jump_{motion}_{level}"]["jump_height_m"]
                 for level in ("low", "intermediate", "high")] == pytest.approx([.03, .10, .40])
     for row, name in enumerate(plan.row_names):
         assert sample.draw.jump_height_m[row] == pytest.approx(plan.scenarios[name]["jump_height_m"])
+
+
+def test_reviewed_low_speed_authored_and_100mm_cases_are_explicit(adapter):
+    from transformer_rl.formal.tasks.geometry import TerrainKind
+
+    router = adapter.env._terrain_course.router
+    router.manifest = {'tiles': [
+        {'name': 'flat', 'kind': int(TerrainKind.FLAT), 'parameters': {}},
+        {'name': 'step_up', 'kind': int(TerrainKind.STEP_UP), 'parameters': {'step_height_m': .02}},
+        {'name': 'road_step', 'kind': int(TerrainKind.STEP_UP), 'parameters': {'step_height_m': .2}},
+        {'name': 'central_steps', 'kind': int(TerrainKind.TWO_PLATFORMS), 'parameters': {'step_height_m': .2}},
+    ]}
+    plan = FixedCourseScenarios(adapter, CourseEvaluationConfig(scenarios=(
+        'authored_single_step', 'authored_single_step_low', 'authored_two_platforms', 'authored_two_platforms_low',
+        'jump_standing_100mm', 'jump_moving_100mm', 'jump_standing_low')))
+    for canonical in ('authored_single_step', 'authored_two_platforms'):
+        alias = canonical + '_low'
+        assert plan.fixed_tiles[canonical] == plan.fixed_tiles[alias]
+        assert plan.scenarios[alias]['step_up_m'] == .2
+        assert plan.scenarios[alias]['commands'][0][0] == plan.pool.config.approach_forward_m_s[0]
+        assert plan.scenarios[canonical]['commands'][0][0] == plan.pool.config.high_approach_forward_m_s[1]
+    for motion in ('standing', 'moving'):
+        assert plan.scenarios[f'jump_{motion}_100mm']['jump_height_m'] == .1
+    assert plan.scenarios['jump_standing_low']['jump_height_m'] == .03
 
 
 def test_source_task_reset_uses_fixed_braking_segments_and_gimbal_contract(adapter):

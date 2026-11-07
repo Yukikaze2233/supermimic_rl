@@ -122,7 +122,8 @@ class FixedCourseScenarios:
         tiles = manifest['tiles']
         result = {}
         for name, case in self.scenarios.items():
-            authored = {'authored_single_step': 'road_step', 'authored_two_platforms': 'central_steps'}.get(name)
+            authored = {'authored_single_step': 'road_step', 'authored_single_step_low': 'road_step',
+                        'authored_two_platforms': 'central_steps', 'authored_two_platforms_low': 'central_steps'}.get(name)
             candidates = [index for index, tile in enumerate(tiles)
                 if tile['name'] == authored] if authored else [index for index, tile in enumerate(tiles)
                 if tile['kind'] == int(self.terrain_type[case['terrain']])
@@ -199,6 +200,14 @@ class FixedCourseScenarios:
         if positive.numel():
             add("low_obstacle", "TERRAIN", [command(p.approach_forward_m_s[0])],
                 terrain="STEP_UP", step=float(positive.min()))
+        # Preserve the reviewed PPO22600 fixed cases and the earlier bank's
+        # order. These speed aliases retain authored 200 mm collision geometry.
+        add("authored_single_step_low", "TERRAIN", [command(p.approach_forward_m_s[0])],
+            terrain="STEP_UP", step=d.step_up_m[1])
+        add("authored_two_platforms_low", "TERRAIN", [command(p.approach_forward_m_s[0])],
+            terrain="TWO_PLATFORMS", step=d.step_up_m[1])
+        for motion, forward in (("standing", 0.), ("moving", p.approach_forward_m_s[0])):
+            add(f"jump_{motion}_100mm", "REQUEST", [command(forward)], jump=.1)
         return bank
 
     def _selected(self, ids):
