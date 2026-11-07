@@ -26,6 +26,9 @@ def create_course(configuration):
     wheel_delay_randomization = configuration.get('wheel_delay_randomization', False)
     if type(wheel_delay_randomization) is not bool:
         raise ValueError('Wheel delay randomization must be a boolean')
+    physx_contact_randomization = configuration.get('physx_contact_randomization', False)
+    if type(physx_contact_randomization) is not bool:
+        raise ValueError('PhysX contact randomization must be a boolean')
     motion_trajectory_owner = configuration.get('motion_trajectory_owner', False)
     if type(motion_trajectory_owner) is not bool:
         raise ValueError('Motion trajectory owner must be a boolean')
@@ -89,6 +92,13 @@ def create_course(configuration):
     asset = load_asset_description(str(asset_directory),
                                   expected_manifest_sha256=configuration["asset_manifest_sha256"])
     atlas = verify_pin(runtime["terrain_atlas_pin"])
+    from .physx_contact import contact_provenance, atlas_contact_profile, install_physx_contact_mapping
+
+    contact_profile = None
+    if physx_contact_randomization:
+        if strategy.name != 'physx' or runtime.get('wheel_material') is not None:
+            raise ValueError('Atlas-relative contact randomization requires PhysX and no legacy material writer')
+        contact_profile = atlas_contact_profile(atlas, runtime['terrain_atlas_pin']['sha256'])
     sections = optional_sections(runtime)
     if sections["communication"] is not None and sections["communication"].enabled:
         raise ValueError("Identified wheel aggregate delay must not also receive legacy USB delay")
@@ -142,6 +152,10 @@ def create_course(configuration):
         randomized_type = strategy.environment_type(WheeledLabEnv, randomization, execution)
         environment_type = make_environment(make_root_twist_corrected_environment(randomized_type), execution)
         native = environment_type(cfg)
+        if contact_profile is not None:
+            install_physx_contact_mapping(native, randomization, contact_profile)
+        contact_receipt = contact_provenance(native._wheel_materials, backend=strategy.name)
+        native.requested_randomization_receipt['contact_material'] = contact_receipt
         friction_readback = (read_identified_native_friction(native.robot, execution, backend=strategy.name)
                              if execution.friction_mode == "native_floor" else None)
         from .action_contract import install_action_bounds
@@ -243,7 +257,8 @@ def create_course(configuration):
             "reward_config": asdict(native._formal_reward.config),
             "terrain_support_config": asdict(native._terrain_course.support_reference.config),
             "randomization": {**randomization.config.provenance(),
-                              "applied": strategy.applies_requested_randomization},
+                              "applied": strategy.applies_requested_randomization,
+                              "contact_material": contact_receipt},
             "continuous_coordinates": getattr(native, "continuous_coordinate_receipt", None),
             "numerical_isolation": native.numerical_isolation_receipt,
             "root_twist": ROOT_TWIST_RECEIPT if strategy.name == "kamino" else None,
