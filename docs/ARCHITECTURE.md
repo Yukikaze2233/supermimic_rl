@@ -74,7 +74,7 @@ tests/               无 Isaac 的单元/合同测试；共享构造器在 tests
 | `trainer` | `PPOTrainer`：4096×24 每更新，KL 自适应学习率；`initial_actor`（SHA 绑定）、模仿退火、`course_rewind_stage`、`course_gate_resume` |
 | `evaluation` | 原生评价 |
 
-能力判定以 27 场景固定评价（`scripts/evaluate_ppo_skills.py`）为准，不以训练奖励为准。
+能力判定以命名固定场景评价（`scripts/evaluate_ppo_skills.py`）为准，不以训练奖励为准。报告记录实际场景、每场景行数和物理配置；普通起身、困难恢复，以及起飞、净空、落地稳定分别判断。默认 PPO 评价不依赖世界模型的布局或 replay，录制世界模型数据时另行检查其合同。
 
 ## SuperMimic 世界模型 V2 `supermimic_rl.world_model_v2`
 
