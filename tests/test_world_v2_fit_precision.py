@@ -131,6 +131,7 @@ def test_cpu_precision_change_restores_full_learner_and_adam_before_identical_co
     previous.optimizers = {'model': torch.optim.Adam(model.parameters(), lr=2e-4)}
     previous.updates, previous.skipped = {'model': 0}, {'model': 0}
     previous.anchor = None
+    previous.platform_contact = None
     previous.imagination = SimpleNamespace(contact_floor=None)
     windows = replay.sample_windows(2, 2, env_ids=[0], generator=torch.Generator().manual_seed(4))
     assert previous.fit_model(windows)['model/updated']

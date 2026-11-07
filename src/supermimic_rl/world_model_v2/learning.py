@@ -98,12 +98,21 @@ class Learner:
                                        disturbance_config=disturbance_config,
                                        platform_task=platform_task, platform_contact=platform_contact,
                                        platform_geometry=platform_geometry)
+        self.platform_contact = platform_contact
+        if platform_contact is not None:
+            from .platform_contacts import PlatformContactModel
+
+            if not isinstance(platform_contact, PlatformContactModel):
+                raise ValueError('Platform learning requires a persistable contact model')
         self.optimizers = {
             "model": torch.optim.Adam(model.parameters(), lr=config.model_learning_rate),
             "actor": torch.optim.Adam(actor.decoder.parameters(), lr=config.actor_learning_rate),
             "critic": torch.optim.Adam(critic.parameters(), lr=config.critic_learning_rate),
             "estimator": torch.optim.Adam(actor.estimator.parameters(), lr=config.estimator_learning_rate),
         }
+        if platform_contact is not None:
+            self.optimizers['platform_contact'] = torch.optim.Adam(
+                platform_contact.parameters(), lr=config.model_learning_rate)
         self.updates = {name: 0 for name in self.optimizers}
         self.skipped = {name: 0 for name in self.optimizers}
         self.anchor = None   # (frozen teacher actor, teacher action std [6])
@@ -160,6 +169,43 @@ class Learner:
         loss = self.actor.estimator_loss(frames[valid], target[..., :3], target[..., 3:5])
         return {"estimator/updated": self._step("estimator", loss), "estimator/labels": int(valid.sum()),
                 "estimator/loss": float(loss.detach()), "estimator/skipped": self.skipped["estimator"]}
+
+    def fit_platform_contact(self, record: dict[str, Tensor], *, command_height: Tensor) -> dict:
+        """Fit attribution from actual four-tick evidence without updating motion.
+
+        The caller provides the admitted height for this recorded interval.
+        Unknown historical evidence supplies no labels, including no negatives.
+        Normalizers see only real, labeled training examples. Actor imagination
+        never invokes this method or supplies its own predictions as truth.
+        """
+        from .jump_task import JumpTaskState
+        from .model import Ticks
+        from .platform_records import PlatformRecordState
+
+        model = self.platform_contact
+        if model is None:
+            raise ValueError('Platform contact fitting requires an installed model')
+        ticks = Ticks.decode(record['ticks'], decode_physical(record['physical']))
+        arguments = dict(intent=PlatformRecordState.decode(record).intent,
+                         jump_state=JumpTaskState.decode(record),
+                         terrain_tile=record['terrain_tile'][:, 0].long(), command_height=command_height)
+        targets = model.targets(record, command_height=command_height)
+        with torch.no_grad():
+            prediction = model.predict(ticks, **arguments)
+            valid = prediction.available & targets.valid
+            labels = int(valid.sum())
+            if not labels:
+                return {'platform_contact/updated': False, 'platform_contact/labels': 0,
+                        'platform_contact/skipped': self.skipped['platform_contact']}
+            model.observe(prediction, targets)
+        # Observe changes both feature and height scales; evaluate the loss
+        # with the newly observed scales, just as the motion fitter does.
+        terms = model.losses_from_features(prediction.features, targets, available=prediction.available)
+        updated = self._step('platform_contact', sum(terms.values()))
+        return {'platform_contact/updated': updated, 'platform_contact/labels': labels,
+                'platform_contact/height_labels': int((valid & targets.height_valid).sum()),
+                'platform_contact/skipped': self.skipped['platform_contact'],
+                **{'platform_contact/' + name: float(value.detach()) for name, value in terms.items()}}
 
     def _usable_rollout(self, start, frames):
         """Retain the healthy graph on an atlas miss; replay other invalid graphs.
@@ -239,7 +285,8 @@ class Learner:
         accepted = replayed = 0
         causes = dict.fromkeys(('nonfinite_prediction', 'terrain_query', 'reward_reference', 'nonfinite_return'), 0)
         gradient = torch.enable_grad() if train_actor else torch.no_grad()
-        with frozen_parameters(self.model, self.critic), gradient:
+        contact = () if self.platform_contact is None else (self.platform_contact,)
+        with frozen_parameters(self.model, self.critic, *contact), gradient:
             for first in range(0, batch_size, microbatch_size):
                 part = slice(first, first + microbatch_size)
                 rollout, rejected, retried, rejected_causes = self._usable_rollout(
@@ -334,14 +381,20 @@ class Learner:
         return {"model": self.model.state_dict(), "actor": self.actor.state_dict(),
                 "critic": self.critic.state_dict(), "updates": self.updates.copy(), "skipped": self.skipped.copy(),
                 "optimizers": {name: optimizer.state_dict() for name, optimizer in self.optimizers.items()},
+                **({} if self.platform_contact is None else
+                   {'platform_contact': self.platform_contact.state_dict()}),
                 **({} if floor is None else {"contact_floor": {"body": floor[0], "base": floor[1]}}),
                 **({} if self.anchor is None else
                    {"anchor": {"actor": self.anchor[0].state_dict(), "std": self.anchor[1],
                                "actor_features": self.anchor[0].features.configuration}})}
 
     def load_state_dict(self, state: dict) -> None:
+        if (self.platform_contact is None) != ('platform_contact' not in state):
+            raise ValueError('Checkpoint and learner platform contact contracts differ')
         for name in ("model", "actor", "critic"):
             getattr(self, name).load_state_dict(state[name])
+        if self.platform_contact is not None:
+            self.platform_contact.load_state_dict(state['platform_contact'])
         for name, optimizer in self.optimizers.items():
             optimizer.load_state_dict(state["optimizers"][name])
         self.updates, self.skipped = dict(state["updates"]), dict(state["skipped"])

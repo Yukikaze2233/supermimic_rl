@@ -152,10 +152,9 @@ class PlatformContactModel(nn.Module):
                     & (intent.bound_request_id == jump_state.physical_id))
         features, available, gap, gap_valid = self._features(ticks, intent, terrain_tile, selected)
         ids = selected.nonzero().flatten()
-        predicted = self.net(self.input_norm(features[ids]).to(self.net[0].weight.dtype)).to(features.dtype)
-        raw = features.new_zeros(n, 4, PLATFORM_CONTACT_OUTPUT_DIM).index_copy(0, ids, predicted)
-        logits = raw[..., :3]
-        height = (raw[..., 3:4] * self.height_norm.std() + self.height_norm.mean)[..., 0]
+        values, relative_height = self.predict_from_features(features[ids])
+        logits = features.new_zeros(n, 4, 3).index_copy(0, ids, values)
+        height = self.height_norm.mean[0].to(features).expand(n, 4).index_copy(0, ids, relative_height)
         c = self.config
         wheel_touch = ticks.body_normal_load[..., self.wheel_indices] > c.airborne_load_max_n
         nonwheel = (ticks.body_normal_load[..., self.nonwheel_indices] > c.airborne_load_max_n).any(-1)
@@ -216,12 +215,34 @@ class PlatformContactModel(nn.Module):
 
     def losses(self, prediction: PlatformContactPrediction, targets: PlatformContactTargets):
         """Independent supervised terms, with no policy reward or implied recall."""
-        valid = prediction.available & targets.valid
+        return self._losses(prediction.logits, prediction.support_height_relative_root,
+                            targets, prediction.available)
+
+    def losses_from_features(self, features: Tensor, targets: PlatformContactTargets, *, available: Tensor):
+        """Refit cached real features without repeating terrain/FK/cylinder queries.
+
+        Call after observing training statistics. Only the small head is
+        evaluated again; held-out evaluation must not update either normalizer.
+        """
+        logits, height = self.predict_from_features(features)
+        return self._losses(logits, height, targets, available)
+
+    def predict_from_features(self, features: Tensor):
+        """Return logits and relative support height over cached real features.
+
+        This evaluates only the head, without geometry, task evidence or
+        normalization updates, for supervised training and held-out evaluation.
+        """
+        raw = self.net(self.input_norm(features).to(self.net[0].weight.dtype)).to(features.dtype)
+        height = (raw[..., 3:4] * self.height_norm.std() + self.height_norm.mean)[..., 0]
+        return raw[..., :3], height
+
+    def _losses(self, logits, height, targets, available):
+        valid = available & targets.valid
         height_valid = valid & targets.height_valid
-        contact = F.binary_cross_entropy_with_logits(prediction.logits, targets.contact, reduction='none')
+        contact = F.binary_cross_entropy_with_logits(logits, targets.contact, reduction='none')
         average = lambda values, mask: values[mask].sum() / mask.sum().clamp_min(1)
-        height_error = ((prediction.support_height_relative_root - targets.support_height_relative_root)
-                        / self.height_norm.std()[0]).square()
+        height_error = ((height - targets.support_height_relative_root) / self.height_norm.std()[0]).square()
         return {'target_contact': average(contact[..., :2].mean(-1), valid),
                 'support_contact': average(contact[..., 2], valid),
                 'support_height': average(height_error, height_valid)}
