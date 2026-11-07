@@ -7,6 +7,7 @@ advance the native physical evidence and reference before every tick's reward.
 from __future__ import annotations
 
 from dataclasses import dataclass, replace
+from typing import TYPE_CHECKING
 
 import torch
 
@@ -22,6 +23,9 @@ from .reward_assembly import RewardAssembly, RewardTick
 from . import so3
 from .motion_task import MotionTask
 from .terrain import AtlasTerrain
+
+if TYPE_CHECKING:
+    from ..course.jump_physics import PlatformLandingEvidence, PlatformLandingState
 
 
 @dataclass(frozen=True)
@@ -46,7 +50,20 @@ class LocomotionRewardContext:
         return replace(self, body_contact_allowed=conditions[:, 1] > .5)
 
     def integrate(self, start, prediction, action, reward_memory, controller_memory, goal, step, *,
-                  jump_state=None, base_mode=None):
+                  jump_state=None, base_mode=None,
+                  platform_state: PlatformLandingState | None = None,
+                  platform_evidence: PlatformLandingEvidence | None = None):
+        """Integrate explicit task evidence alongside this interval's motion.
+
+        Platform evidence comes from the rollout's prediction producer, or
+        recorded truth only in a parity audit. Its ``landing_world_height``
+        must share ``prediction.ticks.state.position`` coordinates (tile-local
+        in the world model). No implicit translation or replay lookup occurs.
+        """
+        if (platform_state is None) != (platform_evidence is None):
+            raise ValueError('Platform reward requires both landing history and interval evidence')
+        if platform_state is not None and self.jump_task is None:
+            raise ValueError('Platform reward requires the configured jump task')
         ticks = prediction.ticks
         n, device = len(action), action.device
         ids = torch.zeros(n, dtype=torch.long, device=device)
@@ -87,7 +104,9 @@ class LocomotionRewardContext:
                 wheel_support_load=ticks.wheel_load.clamp_min(0),
                 base_com_offset=self.base_com_offset, base_mode=mode if base_mode is None else base_mode,
                 command_height=goal[:, 3] / 5., ground_z=ground[:, :, 0],
-                retain_peak_gradient=self.assembly.parameters.extensions.jump_peak_completion)
+                retain_peak_gradient=self.assembly.parameters.extensions.jump_peak_completion,
+                **({} if platform_state is None else {
+                    'platform_state': platform_state, 'platform_evidence': platform_evidence}))
         for tick in range(count):
             state = ticks.state.tick(tick)
             wheel = geometry.tick(tick)
@@ -127,7 +146,8 @@ class LocomotionRewardContext:
             controller_memory.wheel_torque_history, self.legs, self.encoder_bias, self.motor_strength)
         return replace(result, termination_height=torch.stack(heights, -1)[..., None],
             jump_state=None if jump_interval is None else jump_interval.state,
-            success_credited=None if jump_interval is None else jump_interval.success_credited)
+            success_credited=None if jump_interval is None else jump_interval.success_credited,
+            platform_state=None if jump_interval is None else jump_interval.platform_state)
 
 
 class OrdinaryFlatReward:

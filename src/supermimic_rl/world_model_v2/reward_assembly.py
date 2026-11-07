@@ -7,6 +7,7 @@ geometry as measured simulator geometry. The caller must provide that geometry.
 from __future__ import annotations
 
 from dataclasses import dataclass, fields, is_dataclass, replace
+from typing import TYPE_CHECKING
 
 import torch
 from torch import Tensor
@@ -19,6 +20,9 @@ from .execution import LegExecution, WheelExecution
 from .geometry import WheelGeometry
 from .physical import PhysicalState
 from .support import SupportInputs, SupportState, advance_support
+
+if TYPE_CHECKING:
+    from ..course.jump_physics import PlatformLandingState
 
 
 @dataclass(frozen=True)
@@ -68,6 +72,7 @@ class RewardInterval:
     termination_height: Tensor | None = None  # Task/terrain producer's [N, K, 1] height, not a learned label.
     jump_state: object | None = None
     success_credited: Tensor | None = None
+    platform_state: PlatformLandingState | None = None
 
     def finish(self, terminated: Tensor, success_credited: Tensor, parameters: RewardParameters) -> Tensor:
         """One-shot events; the task producer owns success identity/ownership checks."""
