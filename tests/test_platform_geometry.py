@@ -230,10 +230,21 @@ def test_actual_pinned_sparse_probes_when_catalog_is_supplied(tmp_path):
                              torch.arange(len(targets)))
     assert control.atlas_valid.all() and not control.inside.any()
     assert (control.edge_distance < 0).all() and torch.isnan(control.height).all()
+    nearest_control = geometry.nearest(torch.tensor(padding), torch.tensor([t['tile_id'] for t in targets]),
+                                       torch.arange(len(targets)))
+    assert nearest_control.source_valid.all() and torch.isfinite(nearest_control.point_local).all()
+    torch.testing.assert_close(nearest_control.distance_xy, -control.edge_distance)
+    nearest_inside = geometry.nearest(torch.tensor(points), torch.tensor(routes), torch.tensor(target_routes))
+    assert nearest_inside.source_valid.all() and nearest_inside.visible.all()
+    torch.testing.assert_close(nearest_inside.point_local[..., :2], torch.tensor(points)[..., :2])
+    torch.testing.assert_close(nearest_inside.point_local[..., 2], sample.height, atol=1e-7, rtol=0)
     report = {'catalog_sha256': pin, 'probe_count': 36, 'inside': int(sample.inside.sum()),
               'padding_controls': 4, 'padding_rejected': int((~control.inside).sum()),
               'max_height_error_m': float(error.max()),
               'boundary_segments_per_target': geometry.edge_mask.sum(-1).tolist(),
+              'nearest_runout_points': nearest_control.point_local.tolist(),
+              'nearest_runout_visible': nearest_control.visible.tolist(),
+              'nearest_inside_source_valid': int(nearest_inside.source_valid.sum()),
               'backend': 'CPU pinned native NumPy surface_height through AtlasTerrain; not Warp/GPU',
               'target_ids': geometry.target_ids, 'source': catalog['source']}
     if os.environ.get('SUPERMIMIC_PLATFORM_REPORT'):
@@ -256,3 +267,151 @@ def test_crossing_triangle_edges_keep_only_exposed_subsegments(tmp_path):
     assert sample.inside.tolist() == [True, False, True]
     torch.testing.assert_close(sample.edge_distance,
                                torch.tensor([.5, -.5 * 2**-.5, .25 * 2**-.5]))
+
+
+def nearest(geometry, xy, *, tile=0, target=0, requires_grad=False):
+    points = torch.tensor([[*p, 100.] for p in xy], requires_grad=requires_grad)
+    sample = geometry.nearest(points, torch.full((len(xy),), tile), torch.full((len(xy),), target))
+    return points, sample
+
+
+def test_nearest_is_xy_projection_with_true_tilted_height_not_3d_projection(tmp_path):
+    triangles = rectangle(0, 0, 2, 2)
+    for triangle in triangles:
+        for vertex in triangle:
+            vertex[2] = .2 + .1 * vertex[0] - .05 * vertex[1]
+    geometry = fixture(tmp_path, triangles, terrain=Terrain(lambda p: .2 + .1*p[..., 0] - .05*p[..., 1]))
+    points, sample = nearest(geometry, [[-1., .7], [.5, .7], [-1., -2.]], requires_grad=True)
+    torch.testing.assert_close(sample.point_local, torch.tensor([[0., .7, .165], [.5, .7, .215], [0., 0., .2]]))
+    torch.testing.assert_close(sample.distance_xy, torch.tensor([1., 0., 5**.5]))
+    assert sample.source_valid.all() and sample.visible.all()
+    sample.point_local.sum().backward()
+    torch.testing.assert_close(points.grad, torch.tensor([[0., .95, 0.], [1.1, .95, 0.], [0., 0., 0.]]))
+    below = points.detach().clone()
+    below[:, 2] = -100.
+    torch.testing.assert_close(geometry.nearest(below, torch.zeros(3), torch.zeros(3)).point_local,
+                               sample.point_local)
+
+
+def test_nearest_gradient_agrees_with_finite_difference_away_from_switches(tmp_path):
+    geometry = fixture(tmp_path, rectangle(0, 0, 2, 2))
+    points, sample = nearest(geometry, [[-1., .7]], requires_grad=True)
+    loss = sample.distance_xy.sum() + (sample.point_local * torch.tensor([1., 3., 2.])).sum()
+    loss.backward()
+    numeric = []
+    for column in range(3):
+        delta = torch.zeros_like(points)
+        delta[:, column] = .001
+        values = []
+        for position in (points.detach() - delta, points.detach() + delta):
+            result = geometry.nearest(position, torch.tensor([0]), torch.tensor([0]))
+            values.append(result.distance_xy.sum() + (result.point_local * torch.tensor([1., 3., 2.])).sum())
+        numeric.append((values[1] - values[0]) / .002)
+    torch.testing.assert_close(points.grad.flatten(), torch.stack(numeric), atol=2e-4, rtol=0)
+
+
+def test_nearest_does_not_fill_holes_or_replace_disconnected_union_with_bbox(tmp_path):
+    triangles = (rectangle(0, 0, 3, 1) + rectangle(0, 2, 3, 3)
+                 + rectangle(0, 1, 1, 2) + rectangle(2, 1, 3, 2) + rectangle(5, 0, 6, 1))
+    geometry = fixture(tmp_path, triangles, roi=((-1, -1), (7, 4)))
+    _, sample = nearest(geometry, [[1.4, 1.5], [4.8, .5]])
+    torch.testing.assert_close(sample.point_local, torch.tensor([[1., 1.5, .2], [5., .5, .2]]))
+    torch.testing.assert_close(sample.distance_xy, torch.tensor([.4, .2]))
+    assert sample.source_valid.all()
+
+
+def test_nearest_roi_edge_is_cut_from_the_real_sloped_triangle(tmp_path):
+    geometry = fixture(tmp_path, [[[0, 0, .1], [2, 0, .3], [0, 2, .5]]],
+                       roi=((.5, .5), (1.5, 1.5)),
+                       terrain=Terrain(lambda p: .1 + .1*p[..., 0] + .2*p[..., 1]))
+    _, sample = nearest(geometry, [[.1, .8], [1.8, 1.8]])
+    torch.testing.assert_close(sample.point_local, torch.tensor([[.5, .8, .31], [1., 1., .4]]))
+    assert sample.source_valid.all() and sample.visible.all()
+
+
+def test_nearest_upper_envelope_is_not_interpolated_between_segment_endpoint_heights(tmp_path):
+    triangles = rectangle(0, 0, 2, 2) + rectangle(0, 0, 2, 2)
+    for index, triangle in enumerate(triangles):
+        for vertex in triangle:
+            vertex[2] = .2 + .1*vertex[0] if index < 2 else .4 - .1*vertex[0]
+    geometry = fixture(tmp_path, triangles, terrain=Terrain(
+        lambda p: torch.maximum(.2 + .1*p[..., 0], .4 - .1*p[..., 0])))
+    points, sample = nearest(geometry, [[.5, -.4], [1., -.4], [1.5, -.4]], requires_grad=True)
+    torch.testing.assert_close(sample.point_local[:, 2], torch.tensor([.35, .3, .35]))
+    assert sample.visible.all()
+    sample.point_local[[0, 2], 2].sum().backward()
+    torch.testing.assert_close(points.grad[[0, 2], 0], torch.tensor([-.1, .1]))
+
+
+def test_nearest_endpoint_only_upper_face_does_not_raise_entire_edge(tmp_path):
+    # The upper triangle meets the clipped target only at (1,1).
+    geometry = fixture(tmp_path, rectangle(0, 0, 1, 1)
+        + [[[1, 1, .5], [2, 1, .5], [1, 2, .5]]], roi=((0, 0), (1, 1)),
+        terrain=Terrain(lambda p: torch.where((p[..., 0] == 1) & (p[..., 1] == 1), .5, .2)))
+    _, sample = nearest(geometry, [[.9, 1.2], [1.2, 1.2]])
+    torch.testing.assert_close(sample.point_local, torch.tensor([[.9, 1., .2], [1., 1., .5]]))
+    assert sample.source_valid.all() and sample.visible.all()
+
+
+def test_nearest_verifies_atlas_at_target_point_not_original_outside_column(tmp_path):
+    terrain = Terrain(lambda p: torch.where((p[..., 0] >= 0) & (p[..., 0] <= 2)
+                                            & (p[..., 1] >= 0) & (p[..., 1] <= 2), .2, 0.))
+    geometry = fixture(tmp_path, rectangle(0, 0, 2, 2), terrain=terrain)
+    _, sample = nearest(geometry, [[-1., .7]])
+    assert sample.source_valid.item() and sample.visible.item()
+    geometry.terrain.height = .4
+    _, hidden = nearest(geometry, [[-1., .7]])
+    assert hidden.source_valid.item() and not hidden.visible.item()
+    assert hidden.atlas_valid.item()
+    torch.testing.assert_close(hidden.point_local, sample.point_local)
+    geometry.terrain.valid = False
+    _, missing = nearest(geometry, [[-1., .7]])
+    assert missing.source_valid.item() and not missing.atlas_valid.item() and not missing.visible.item()
+
+
+def test_nearest_fp32_rotated_edge_uses_real_load_time_witness(tmp_path):
+    geometry = fixture(tmp_path, [[[.1, .2, .21], [1.4, .333, .34], [.7, 2.2, .27]]],
+                       terrain=Terrain(lambda p: .2 + .1*p[..., 0]),
+                       roi=((.15, .1), (1.3, 1.9)))
+    points, sample = nearest(geometry, [[.6, -.4], [-.3, .8], [1.7, 2.1]], requires_grad=True)
+    assert sample.source_valid.all() and torch.isfinite(sample.point_local).all()
+    torch.testing.assert_close(sample.point_local[:, 2], .2 + .1*sample.point_local[:, 0])
+    assert sample.visible.all()
+    (sample.distance_xy.sum() + sample.point_local.sum()).backward()
+    assert torch.isfinite(points.grad).all()
+    # Adding the world origin may quantize a nearby outside point to an edge,
+    # but the source projection still moves to the actual edge (no dilation).
+    geometry.terrain.origins[:] = torch.tensor([48., 144., 0.])
+    _, shifted = nearest(geometry, [[.6, -.4]])
+    torch.testing.assert_close(shifted.point_local[0], sample.point_local[0])
+    assert shifted.source_valid.item()
+
+
+def test_nearest_preserves_extra_axes_and_inactive_wrong_tile_nonfinite_rows(tmp_path):
+    geometry = fixture(tmp_path, rectangle(0, 0, 2, 2))
+    points = torch.tensor([[[[-.3, .8, 0.], [.2, .8, 0.]]],
+                           [[[-.3, .8, 0.], [.2, .8, 0.]]],
+                           [[[-.3, .8, 0.], [float('nan'), .8, 0.]]]])
+    sample = geometry.nearest(points, torch.tensor([0, 1, 0]), torch.tensor([0, 0, -1]))
+    assert sample.source_valid.tolist() == [[[True, True]], [[False, False]], [[False, False]]]
+    torch.testing.assert_close(sample.point_local[0], torch.tensor([[[0., .8, .2], [.2, .8, .2]]]))
+    assert torch.isnan(sample.point_local[1:]).all()
+    assert torch.isnan(sample.distance_xy[1:]).all()
+
+
+def test_nearest_distance_is_continuous_across_edge_without_smoothing_geometry(tmp_path):
+    geometry = fixture(tmp_path, rectangle(0, 0, 2, 2))
+    _, sample = nearest(geometry, [[-.0001, .7], [0., .7], [.0001, .7]])
+    torch.testing.assert_close(sample.distance_xy, torch.tensor([.0001, 0., 0.]))
+    torch.testing.assert_close(sample.point_local[:, 0], torch.tensor([0., 0., .0001]))
+    assert sample.source_valid.all()
+
+
+def test_nearest_retains_source_faces_clipped_to_an_isolated_line_or_point(tmp_path):
+    triangles = (rectangle(.1, .1, .4, .4)
+        + [[[.8, 1., .5], [1.2, 1., .5], [1.2, 2., .5]]]
+        + [[[0., 0., .7], [-1., 0., .7], [0., -1., .7]]])
+    geometry = fixture(tmp_path, triangles, roi=((0, 0), (1, 1)))
+    _, sample = nearest(geometry, [[.9, 1.2], [-.1, -.1]])
+    torch.testing.assert_close(sample.point_local, torch.tensor([[.9, 1., .5], [0., 0., .7]]))
+    assert sample.source_valid.all()

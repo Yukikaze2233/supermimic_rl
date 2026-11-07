@@ -30,6 +30,15 @@ class PlatformSurfaceSample:
     atlas_valid: Tensor
 
 
+@dataclass(frozen=True)
+class PlatformTargetPoint:
+    point_local: Tensor
+    distance_xy: Tensor
+    source_valid: Tensor
+    visible: Tensor
+    atlas_valid: Tensor
+
+
 class PlatformGeometry:
     """Immutable target geometry on the same device as the physical atlas.
 
@@ -91,6 +100,14 @@ class PlatformGeometry:
         # Padding is masked, never a source triangle or a fill for a source hole.
         self.triangles, self.face_mask = cls._padded(triangles, (3, 3), self.device)
         self.boundaries, self.edge_mask = cls._padded(boundaries, (2, 2), self.device)
+        # The exposed segments were already split at every projected face edge.
+        # Cache which real faces cover each open segment and its two endpoints.
+        # This is an exact source witness, not a relaxed runtime edge tolerance.
+        witness = np.zeros((len(selected), self.boundaries.shape[1], 3,
+                            self.triangles.shape[1]), dtype=bool)
+        for row, (triangle, boundary) in enumerate(zip(triangles, boundaries)):
+            witness[row, :len(boundary), :, :len(triangle)] = cls._boundary_witness(triangle, boundary)
+        self.boundary_witness = torch.as_tensor(witness, device=self.device)
         self.tiles = torch.tensor(tiles, dtype=torch.long, device=self.device)
         self.rois = torch.as_tensor(np.asarray(rois), device=self.device, dtype=torch.float32)
         self.height_tolerance = torch.tensor(tolerances, device=self.device, dtype=torch.float32)
@@ -135,13 +152,19 @@ class PlatformGeometry:
         This once-per-load CPU construction retains holes, overlaps and T joints.
         The infinitesimal-side test needs no physical offset or welding radius.
         """
-        polygons = [cls._clip_triangle(triangle, roi) for triangle in triangles]
-        polygons = [p for p in polygons if len(p) >= 3]
-        if not polygons:
+        clipped = [cls._clip_triangle(triangle, roi) for triangle in triangles]
+        clipped = [p for p in clipped if len(p)]
+        if not clipped:
             raise ValueError('No platform source face intersects its ROI')
-        edges = np.concatenate([np.stack((p, np.roll(p, -1, axis=0)), axis=1) for p in polygons])
-        edges = edges[np.linalg.norm(edges[:, 1] - edges[:, 0], axis=-1) > 0]
+        # A face clipped to a line/point has no halfspace interior, but remains
+        # part of the closed source union. Do not let its zero edges cover all
+        # space, or discard an isolated source point from a nearest query.
+        polygons = [p for p in clipped if len(p) >= 3
+                    and np.sum(_cross2(p, np.roll(p, -1, axis=0))) != 0]
+        edges = np.concatenate([np.stack((p, np.roll(p, -1, axis=0)), axis=1) for p in clipped])
+        isolated = [p[0] for p in clipped if np.all(p == p[0])]
         scale = max(1., float(np.abs(edges).max()))
+        edges = edges[np.linalg.norm(edges[:, 1] - edges[:, 0], axis=-1) > 0]
         epsilon = 64 * np.finfo(np.float64).eps * scale * scale
         a, direction = edges[:, 0], edges[:, 1] - edges[:, 0]
         pieces = []
@@ -173,8 +196,12 @@ class PlatformGeometry:
                     sides[1] |= bool((derivative[on] <= epsilon).all())
                     if all(sides):
                         break
-                if sides[0] != sides[1]:
+                if sides[0] != sides[1] or not any(sides):
                     pieces.append([start + lo * delta, start + hi * delta])
+        for point in isolated:
+            if not any((_cross2(np.roll(p, -1, axis=0) - p, point - p) >= -epsilon).all()
+                       for p in polygons):
+                pieces.append([point, point])
         if not pieces:
             raise ValueError('Platform footprint has no exposed boundary')
         # Duplicate collinear pieces do not alter distance; exact dedup reduces work.
@@ -184,6 +211,21 @@ class PlatformGeometry:
         segments[order] = segments[order, ::-1]
         return np.unique(segments.reshape(-1, 4), axis=0).reshape(-1, 2, 2)
 
+    @staticmethod
+    def _boundary_witness(triangles, boundary):
+        """FP64 load-time membership at segment interior and exact endpoints."""
+        xy = triangles[..., :2]
+        edge = np.roll(xy, -1, axis=1) - xy
+        orientation = np.sign(_cross2(edge[:, 0], -edge[:, 2]))
+        samples = np.stack((boundary.mean(axis=1), boundary[:, 0], boundary[:, 1]), axis=1)
+        side = _cross2(edge[None, None], samples[:, :, None, None] - xy[None, None])
+        scale = max(1., float(np.abs(xy).max()), float(np.abs(boundary).max()))
+        epsilon = 64 * np.finfo(np.float64).eps * scale * scale
+        covered = (side * orientation[None, None, :, None] >= -epsilon).all(-1)
+        if not covered.any(-1).all():
+            raise ValueError('A target boundary has no covering source triangle')
+        return covered
+
     def query(self, points: Tensor, tile: Tensor, target_index: Tensor) -> PlatformSurfaceSample:
         """Batch tile-local ``[B, ..., 3]`` points, with one tile/target per row.
 
@@ -192,6 +234,24 @@ class PlatformGeometry:
         Numerical comparisons use the catalog's original float32 geometry scale;
         this is not a landing-height, contact-force or stability tolerance.
         """
+        return self._query(points, tile, target_index, nearest=False)
+
+    def nearest(self, points: Tensor, tile: Tensor, target_index: Tensor) -> PlatformTargetPoint:
+        """XY-nearest point on the source footprint, with its true upper Z.
+
+        Inside the footprint, XY stays at the input. Outside (including holes),
+        XY is the nearest exposed boundary point. This is neither a 3D closest
+        point nor the closest point on the visible subset. Source-valid points
+        remain explicit when occluded; ``visible`` must be checked separately.
+
+        Projection is piecewise differentiable, with discrete choices at ties,
+        corners and facet changes. It does not imply reachability, cylinder gap,
+        support or successful landing. The caller may transform the displacement
+        into yaw coordinates for a privileged critic; actor inputs are untouched.
+        """
+        return self._query(points, tile, target_index, nearest=True)
+
+    def _query(self, points, tile, target_index, *, nearest):
         if (points.ndim < 2 or points.shape[-1] != 3 or tile.shape != points.shape[:1]
                 or target_index.shape != tile.shape or not points.is_floating_point()):
             raise ValueError('Platform query requires XYZ points and one tile/target per row')
@@ -200,7 +260,9 @@ class PlatformGeometry:
         if not ((target_index == target_index.round()) & (target_index >= -1)
                 & (target_index < len(self.target_ids))).all():
             raise ValueError('Platform target indices must be integer catalog routes or -1')
-        sampled = self.terrain.height_at(points, tile)
+        if not ((tile == tile.round()) & (tile >= 0) & (tile < len(self.terrain.origins))).all():
+            raise ValueError('Terrain tile IDs must be recorded integer routes inside the pinned atlas')
+        sampled = None if nearest else self.terrain.height_at(points, tile)
         target = target_index.long().clamp_min(0)
         shape = (len(points), *([1] * (points.ndim - 2)))
         active = ((target_index >= 0) & (tile == self.tiles[target])).reshape(shape)
@@ -233,7 +295,6 @@ class PlatformGeometry:
         rounding = snapped - xy.detach()
         comparison = heights.detach() + slope_x * rounding[..., 0, None] + slope_y * rounding[..., 1, None]
         comparison = torch.where(covered, comparison, -torch.inf).amax(-1)
-        visible = footprint & sampled.valid & ((comparison - sampled.height).abs() <= tolerance)
         # Distance uses unsnapped local points: its continuous geometric gradient
         # is not the renderer/atlas's world-coordinate float32 quantization.
         edges = self.boundaries[target].reshape(*shape, -1, 2, 2)
@@ -244,8 +305,40 @@ class PlatformGeometry:
         ratio = (projection / torch.where(edge_mask & (squared_length > 0), squared_length, 1.)).clamp(0, 1)
         closest = start + ratio[..., None] * delta
         distance = torch.linalg.vector_norm(xy.to(points.dtype)[..., None, :] - closest, dim=-1)
-        distance = torch.where(edge_mask, distance, torch.inf).amin(-1)
-        distance = torch.where(footprint, distance, -distance)
-        distance = torch.where(active & finite, distance, torch.nan).to(points.dtype)
-        height = torch.where(footprint, height, torch.nan).to(points.dtype)
-        return PlatformSurfaceSample(height, visible, distance, footprint, visible, sampled.valid)
+        edge_distances = torch.where(edge_mask, distance, torch.inf)
+        if not nearest:
+            distance = edge_distances.amin(-1)
+            distance = torch.where(footprint, distance, -distance)
+            distance = torch.where(active & finite, distance, torch.nan).to(points.dtype)
+            height = torch.where(footprint, height, torch.nan).to(points.dtype)
+            visible = footprint & sampled.valid & ((comparison - sampled.height).abs() <= tolerance)
+            return PlatformSurfaceSample(height, visible, distance, footprint, visible, sampled.valid)
+
+        distance, edge_index = edge_distances.min(-1)
+        selected = edge_index[..., None]
+        closest_xy = closest.gather(-2, selected[..., None].expand(*selected.shape, 2)).squeeze(-2)
+        fraction = ratio.gather(-1, selected).squeeze(-1)
+        length = squared_length.expand_as(edge_distances).gather(-1, selected).squeeze(-1)
+        faces_at_edge = self.boundary_witness[target.reshape(shape), edge_index]
+        supported = torch.where((fraction == 0)[..., None], faces_at_edge[..., 1, :],
+                    torch.where((fraction == 1)[..., None], faces_at_edge[..., 2, :], faces_at_edge[..., 0, :]))
+        # A FP64 segment can collapse to a single represented FP32 point. Its
+        # upper envelope then includes both endpoint witnesses, without a 0/0.
+        supported = torch.where((length == 0)[..., None], faces_at_edge.any(-2), supported)
+        near_xy = torch.where(footprint[..., None], xy, closest_xy)
+        supported = torch.where(footprint[..., None], covered, supported)
+        offset = near_xy[..., None, :] - base[..., :2]
+        near_heights = base[..., 2] + slope_x * offset[..., 0] + slope_y * offset[..., 1]
+        near_height = torch.where(supported, near_heights, -torch.inf).amax(-1)
+        source_valid = active & finite & supported.any(-1) & torch.isfinite(near_height)
+        point = torch.cat((near_xy, near_height[..., None]), -1).to(points.dtype)
+        point = torch.where(source_valid[..., None], point, torch.nan)
+        sampled = self.terrain.height_at(point, tile)
+        near_snapped = ((near_xy.detach().float() + origin[..., :2]) - origin[..., :2]).to(points.dtype)
+        rounding = near_snapped - near_xy.detach()
+        comparison = near_heights.detach() + slope_x * rounding[..., 0, None] + slope_y * rounding[..., 1, None]
+        comparison = torch.where(supported, comparison, -torch.inf).amax(-1)
+        visible = source_valid & sampled.valid & ((comparison - sampled.height).abs() <= tolerance)
+        distance = torch.where(footprint, 0., distance)
+        distance = torch.where(source_valid, distance, torch.nan).to(points.dtype)
+        return PlatformTargetPoint(point, distance, source_valid, visible, sampled.valid)
