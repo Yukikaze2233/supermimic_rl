@@ -16,12 +16,14 @@ from transformer_rl.formal.tasks.reward import RewardPhase, RewardReference, Rew
 from transformer_rl.formal.tasks.gimbal_course import GimbalRewardReference
 from ..contracts import action_bounds_from_source
 from ..reward_kernel import JumpProgress, RewardExtensions, RewardParameters
+from ..course.platform_target_reward import platform_target_progress
 from .execution import WHEEL_ACTION_BOUND, LegExecution
 from .geometry import RewardGeometry
 from .records import CONTACT_BODIES, WHEEL_BODIES, decode_transforms
 from .reward_assembly import RewardAssembly, RewardTick
 from . import so3
 from .motion_task import MotionTask
+from .jump_task import JUMP_VALUE_NAMES
 from .terrain import AtlasTerrain
 
 if TYPE_CHECKING:
@@ -52,7 +54,8 @@ class LocomotionRewardContext:
     def integrate(self, start, prediction, action, reward_memory, controller_memory, goal, step, *,
                   jump_state=None, base_mode=None,
                   platform_state: PlatformLandingState | None = None,
-                  platform_evidence: PlatformLandingEvidence | None = None):
+                  platform_evidence: PlatformLandingEvidence | None = None,
+                  platform_intent=None, platform_geometry=None):
         """Integrate explicit task evidence alongside this interval's motion.
 
         Platform evidence comes from the rollout's prediction producer, or
@@ -64,6 +67,10 @@ class LocomotionRewardContext:
             raise ValueError('Platform reward requires both landing history and interval evidence')
         if platform_state is not None and self.jump_task is None:
             raise ValueError('Platform reward requires the configured jump task')
+        if (platform_intent is None) != (platform_geometry is None):
+            raise ValueError('Platform target reward requires both causal intent and bound geometry')
+        if platform_intent is not None and (platform_state is None or self.terrain_tile is None):
+            raise ValueError('Platform target reward requires landing state and the actual terrain route')
         ticks = prediction.ticks
         n, device = len(action), action.device
         ids = torch.zeros(n, dtype=torch.long, device=device)
@@ -107,6 +114,19 @@ class LocomotionRewardContext:
                 retain_peak_gradient=self.assembly.parameters.extensions.jump_peak_completion,
                 **({} if platform_state is None else {
                     'platform_state': platform_state, 'platform_evidence': platform_evidence}))
+        platform_target = None
+        if platform_intent is not None and self.assembly.parameters.extensions.jump_missed:
+            # This uses the already assembled predicted tree, with its explicit
+            # passive knees. The separate whole-cylinder gap is not differentiated.
+            expand = lambda value: value[:, None].expand(-1, count).reshape(-1)
+            platform_target = platform_target_progress(platform_geometry,
+                centres_local_m=geometry.centre_world.reshape(-1, 2, 3),
+                bottoms_local_z_m=geometry.bottom_world_z.reshape(-1, 2),
+                radii_m=action.new_tensor([side.radius for side in self.geometry.sides]),
+                terrain_tile=expand(self.terrain_tile).long(), target_index=expand(platform_intent.target_index),
+                requested_rise_m=expand(jump_state.values[:, JUMP_VALUE_NAMES.index('active_rise')]),
+                bound=jump_interval.platform_bound.reshape(-1), landing_phase=jump_interval.platform_phase.reshape(-1)
+                ).intervals(n)
         for tick in range(count):
             state = ticks.state.tick(tick)
             wheel = geometry.tick(tick)
@@ -142,7 +162,8 @@ class LocomotionRewardContext:
                     None if jump_interval.peak_rise is None else jump_interval.peak_rise[:, tick],
                     None if jump_interval.requested_rise is None else jump_interval.requested_rise[:, tick],
                     None if jump_interval.physical_active is None else jump_interval.physical_active[:, tick],
-                    None if jump_interval.platform_bound is None else jump_interval.platform_bound[:, tick])))
+                    None if jump_interval.platform_bound is None else jump_interval.platform_bound[:, tick],
+                    None if platform_target is None else platform_target.tick(tick))))
         result = self.assembly.integrate(start, tuple(samples), action, reward_memory,
             controller_memory.wheel_torque_history, self.legs, self.encoder_bias, self.motor_strength)
         return replace(result, termination_height=torch.stack(heights, -1)[..., None],

@@ -139,7 +139,8 @@ class NativePlatformCourse:
             raise ValueError('Native platform course is already installed')
         self.task_adapter = NativeJumpTaskAdapter(self.native._terrain_course.tasks)
         self.landing = NativePlatformLanding(self.native, self.geometry, intent_capture=self._intent,
-                                             clearance_capture=self.clearance.capture).install()
+                                             clearance_capture=self.clearance.capture,
+                                             wheel_pose_capture=self.clearance.capture_pose).install()
         self.native.supermimic_platform_course = self
         return self
 
@@ -159,6 +160,7 @@ class NativePlatformCourse:
 
     def receipt(self):
         from ..world_model_v2.platform_records import PLATFORM_RECORD_VERSION
+        from . import platform_target_reward
 
         return {
             'format': PLATFORM_COURSE_FORMAT, 'intent_format': PLATFORM_INTENT_FORMAT,
@@ -172,7 +174,12 @@ class NativePlatformCourse:
             'physical_evidence': 'actual native contact patches and source-bound whole-cylinder atlas clearance',
             'clearance_reference': 'whole_cylinder_minimum_world_z_gap_over_own_terrain_footprint',
             'recording': 'policy-start caller and landing owner; four actual physics-tick evidence records',
-            'geometry_role': 'privileged task verification; no additional actor inputs',
+            'geometry_role': 'privileged task verification and flight target shaping; no additional actor inputs',
+            'target_reward': {'format': platform_target_reward.PLATFORM_TARGET_REWARD_FORMAT,
+                'implementation_sha256': hashlib.sha256(Path(platform_target_reward.__file__).read_bytes()).hexdigest(),
+                'coefficient': 'existing jump_missed; additive to unchanged peak cost',
+                'scale': 'max(admitted request rise, source wheel radius)',
+                'scope': 'same live request after-observe FLIGHT or TARGET_SINGLE_WHEEL only'},
             'trigger_role': 'native supported-stance readiness uses simulation truth, not a deployment sensor contract',
             'joint_imagination_enabled': False,
             'native_collision_equivalence_verified': False,

@@ -281,6 +281,7 @@ class JumpInterval:
     physical_active: Tensor | None = None  # derived per tick from the existing physical request ID
     platform_state: PlatformLandingState | None = None
     platform_bound: Tensor | None = None  # same-request platform selection after each physical tick [N, 4]
+    platform_phase: Tensor | None = None  # after-observe landing phase at each tick, never a final-state broadcast
 
 
 class JumpTask:
@@ -442,7 +443,7 @@ class JumpTask:
             tilt = torch.atan2(gravity[..., :2].norm(dim=-1), -gravity[..., 2])
             speed = physical.angular_velocity_body.norm(dim=-1)
             phases, ascents, closed_ticks, stable_ticks, lifted_ticks = [], [], [], [], []
-            active_ticks, platform_ticks = [], []
+            active_ticks, platform_ticks, platform_phases = [], [], []
             peak_active = []
             latch = None if state.flight_latch is None else state._flight_latch_state()
             for tick in range(4):
@@ -457,6 +458,7 @@ class JumpTask:
                 stable_ticks.append(owner.landed_s.clone())
                 active_ticks.append((owner.physical_id >= 0).clone())
                 if platform_state is not None:
+                    platform_phases.append(platform_state.phase.clone())
                     platform_ticks.append(platform_evidence.selected[:, tick] & (owner.physical_id >= 0)
                                           & (platform_state.request_id == owner.physical_id))
                 if latch is not None:
@@ -499,4 +501,5 @@ class JumpTask:
                             torch.stack(closed_ticks, -1) if closed_ticks else None, torch.stack(stable_ticks, -1),
                             torch.stack(lifted_ticks, -1) if lifted_ticks else None, peaks, requested,
                             torch.stack(active_ticks, -1), platform_state,
-                            torch.stack(platform_ticks, -1) if platform_ticks else None)
+                            torch.stack(platform_ticks, -1) if platform_ticks else None,
+                            torch.stack(platform_phases, -1) if platform_phases else None)

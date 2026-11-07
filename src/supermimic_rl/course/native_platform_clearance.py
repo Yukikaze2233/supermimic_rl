@@ -1,7 +1,17 @@
 """Bind whole-wheel clearance to actual native collider poses and asset bytes."""
 from __future__ import annotations
 
+from dataclasses import dataclass
+
 import torch
+
+
+@dataclass(frozen=True)
+class NativeWheelPose:
+    centres_local_m: torch.Tensor
+    bottoms_local_z_m: torch.Tensor
+    radii_m: torch.Tensor
+    terrain_tile: torch.Tensor
 
 
 class NativePlatformClearance:
@@ -39,6 +49,8 @@ class NativePlatformClearance:
             from .atlas_cylinder_gap import AtlasCylinderTerrainGap
             query_factory = AtlasCylinderTerrainGap
         self.query = query_factory(terrain, self.wheels.radius_m, self.wheels.length_m, tile_ids=tile_ids)
+        self._radii = torch.tensor(self.wheels.radius_m, device=device, dtype=torch.float64)
+        self._half_lengths = torch.tensor(self.wheels.length_m, device=device, dtype=torch.float64) / 2
         self._cache = None
 
     @torch.no_grad()
@@ -91,11 +103,29 @@ class NativePlatformClearance:
         rotate = TerrainSupportReference._rotate
         centre = pose[..., :3].double() + rotate(quaternion, self._offsets)
         axis = rotate(quaternion, self._axes)
-        gap = self.query.at(centre - origins[:, None].double(), axis, tile, selected)
+        local = centre - origins[:, None].double()
+        bottom = local[..., 2] - (self._radii * axis[..., :2].norm(dim=-1)
+                                  + self._half_lengths * axis[..., 2].abs())
+        cylinder = NativeWheelPose(local, bottom, self._radii, tile.clone())
+        gap = self.query.at(local, axis, tile, selected)
         sample = WheelClearanceSample(
             gap, origins.clone(), native._clock().clone(), tick, 0,
             self.wheels.body_names, self.wheels.urdf_sha256,
             source_geometry_bound=True, native_collision_equivalence_verified=False)
         self._cache = {'sample': sample, 'tile': tile.clone(), 'episode': episode.clone(),
-                       'selected': selected.clone(), 'pose': pose.clone(), 'origins': origins.clone()}
+                       'selected': selected.clone(), 'pose': pose.clone(), 'origins': origins.clone(), 'cylinder': cylinder}
         return sample
+
+    def capture_pose(self):
+        """Reuse the actual cylinder pose captured by this tick's landing observer.
+
+        No second SDK pose read or clearance query. A same-tick reset or route
+        change must be followed by the observer's normal capture first.
+        """
+        cache = self._cache
+        if (cache is None or cache['sample'].physical_tick != self.native._physical_tick
+                or not torch.equal(cache['episode'], self.native._episode_id)
+                or not torch.equal(cache['tile'], self._router.tile)
+                or not torch.equal(cache['origins'], self._router.origins)):
+            raise RuntimeError('Platform target reward needs the current observed cylinder pose')
+        return cache['cylinder']

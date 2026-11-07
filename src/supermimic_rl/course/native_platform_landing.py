@@ -193,7 +193,7 @@ class NativePlatformLanding:
     the same atlas. No simulation, request or reward is created by this object.
     """
 
-    def __init__(self, native, geometry, *, intent_capture, clearance_capture=None):
+    def __init__(self, native, geometry, *, intent_capture, clearance_capture=None, wheel_pose_capture=None):
         self.native, self.geometry = native, geometry
         self.tasks = native._terrain_course.tasks
         self.loads = native._contact_loads
@@ -206,7 +206,10 @@ class NativePlatformLanding:
             raise ValueError('Platform landing needs explicit intent and optional clearance capture')
         if not all(hasattr(self.loads, name) for name in ('view', 'sensor_to_native', 'normal', '_tick')):
             raise ValueError('Native platform patch observation requires the PhysX LabContactLoads interface')
+        if wheel_pose_capture is not None and not callable(wheel_pose_capture):
+            raise ValueError('Platform reward wheel pose capture must be callable')
         self.intent_capture, self.clearance_capture = intent_capture, clearance_capture
+        self.wheel_pose_capture = wheel_pose_capture
         self.builder = PlatformLandingEvidenceBuilder(geometry, native._wheel_body_indices)
         self.wheel_body_names = tuple(native._binding.native_body_names[index]
                                       for index in native._binding.wheel_body_indices)
@@ -220,6 +223,21 @@ class NativePlatformLanding:
     def capture(self):
         return PlatformLandingState(**{field.name: getattr(self.state, field.name).clone()
                                       for field in fields(self.state)})
+
+    def target_progress(self, bound):
+        """Shape only the same request's current qualified flight/first target touch."""
+        from .platform_target_reward import platform_target_progress
+
+        if self.wheel_pose_capture is None:
+            return None
+        pose = self.wheel_pose_capture()
+        intent = self.intent_capture()
+        if not isinstance(intent, PlatformIntentState):
+            intent = PlatformIntentState.decode(intent)
+        return platform_target_progress(self.geometry, centres_local_m=pose.centres_local_m,
+            bottoms_local_z_m=pose.bottoms_local_z_m, radii_m=pose.radii_m,
+            terrain_tile=pose.terrain_tile, target_index=intent.target_index,
+            requested_rise_m=self.tasks.active_rise, bound=bound, landing_phase=self.state.phase)
 
     def reset(self, mask):
         # Auto-reset happens before the outer collector receives the completed

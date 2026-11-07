@@ -20,6 +20,8 @@ from transformer_rl.formal.tasks.reward import (
 )
 from transformer_rl.formal.tasks.gimbal_course import GimbalCourse
 
+from .course.platform_target_reward import PlatformTargetProgress
+
 JUMP_PUSH_MIN_REFERENCE_M_S = .1
 JUMP_SETTLE_STREAK_S = 2.     # the native physical success needs this uninterrupted stable landing
 JUMP_LANDING_RATE_FREE_RAD_S = .4   # inside the native quiet limit of 0.5 rad/s
@@ -166,6 +168,7 @@ class JumpProgress:
     requested_rise: Tensor | None = None
     physical_active: Tensor | None = None  # current physical request >= 0, observed after this physics tick
     platform_bound: Tensor | None = None  # selected platform evidence belongs to that same live request
+    platform_target: PlatformTargetProgress | None = None  # continuous cost only before both-wheel landing
 
     def validate(self, mode: Tensor) -> None:
         flags = tuple(flag for flag in (self.ascent_seen, self.flight_closed, self.flight_started,
@@ -178,6 +181,8 @@ class JumpProgress:
                 or self.landed_s is not None and (self.landed_s.shape != mode.shape or self.landed_s.device != mode.device
                                                   or not self.landed_s.is_floating_point())):
             raise ValueError('Jump progress needs matching int64 reference stages, boolean latches and float times')
+        if self.platform_target is not None:
+            self.platform_target.validate(mode)
         peaks = (self.peak_rise, self.requested_rise)
         if ((peaks[0] is None) != (peaks[1] is None)
                 or any(value is not None and (value.shape != mode.shape or value.device != mode.device
@@ -195,7 +200,8 @@ class JumpProgress:
                 or len({item.peak_rise is None for item in items}) != 1
                 or len({item.requested_rise is None for item in items}) != 1
                 or len({item.physical_active is None for item in items}) != 1
-                or len({item.platform_bound is None for item in items}) != 1):
+                or len({item.platform_bound is None for item in items}) != 1
+                or len({item.platform_target is None for item in items}) != 1):
             raise ValueError('Jump progress coverage changes within a physical interval')
         optional = lambda name: (None if getattr(items[0], name) is None
                                  else torch.cat([getattr(item, name) for item in items]))
@@ -203,7 +209,9 @@ class JumpProgress:
                             torch.cat([item.ascent_seen for item in items]),
                             optional('flight_closed'), optional('landed_s'), optional('flight_started'),
                             optional('peak_rise'), optional('requested_rise'), optional('physical_active'),
-                            optional('platform_bound'))
+                            optional('platform_bound'),
+                            None if items[0].platform_target is None else
+                            PlatformTargetProgress.cat(item.platform_target for item in items))
 
 
 def advance_flight_latch(request: Tensor, lifted: Tensor, closed: Tensor, *, current: Tensor,
@@ -626,6 +634,16 @@ def physical_reward_densities(sample: RewardPhysics, reference: RewardReference,
             for name in ('forward', 'yaw', 'height', 'jump_vertical'):
                 positive[name] = torch.where(missed_jump, 0., positive[name])
             cost['jump_missed'] = extensions.jump_missed * missed_jump.to(v_up.dtype)
+    if extensions.jump_missed and jump_progress is not None and jump_progress.platform_target is not None:
+        # Keep the peak objective and geometric approach gradients independent.
+        # Together their costs can reach 2 * jump_missed; no new multiplier.
+        target = jump_progress.platform_target
+        target.validate(reference.mode)
+        if jump_progress.platform_bound is None or jump_progress.physical_active is None:
+            raise ValueError('Platform target cost requires the current physical request binding')
+        target_scope = (target.eligible & jump_progress.platform_bound
+                        & jump_progress.physical_active)
+        cost['jump_target'] = extensions.jump_missed * torch.where(target_scope, target.cost, 0.)
     if extensions.jump_flight or extensions.jump_lift:
         # As SCUT's takeoff state machine, the flight window opens at the
         # physical takeoff event (not the reference clock), so late real
@@ -725,5 +743,13 @@ def physical_reward_densities(sample: RewardPhysics, reference: RewardReference,
               'jump_world_height_m': jump_eh, 'jump_world_vertical_m_s': evz,
               'roll_rad': pose[:, 0], 'pitch_rad': pose[:, 1],
               'stationary_world_xy_speed_m_s': horizontal.norm(dim=-1), 'leg_fork_m': fork}
+    if extensions.jump_missed and jump_progress is not None and jump_progress.platform_target is not None:
+        target = jump_progress.platform_target
+        gates['jump_target_eligible'] = target.eligible
+        gates['jump_target_available'] = target.available & target.eligible
+        errors['jump_target_horizontal_m'] = torch.where(target.available,
+            target.horizontal_distance_m.mean(-1), 0.)
+        errors['jump_target_vertical_shortfall_m'] = torch.where(target.available,
+            target.vertical_shortfall_m.mean(-1), 0.)
     errors.update(gimbal_errors)
     return RewardDensities(positive, cost, components, gates, errors, failure_scale, invalid)

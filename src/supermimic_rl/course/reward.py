@@ -39,17 +39,20 @@ class SharedRewardComposer(PhysicalRewardComposer):
                 window['jump_reference_stage'] = (tasks.jump_reference() if curve is None else curve).clock_stage
             latch = tasks.supermimic_flight_latch
             platform = self.supermimic_platform_landing
-            platform_bound = None
+            platform_bound = platform_target = None
             if platform is not None:
                 if platform.last_evidence is None:
                     raise ValueError('Platform reward needs the current observed physics evidence')
                 platform_bound = (platform.last_evidence.selected & (tasks.physical_id >= 0)
                                   & (platform.state.request_id == tasks.physical_id))
+                capture_target = getattr(platform, 'target_progress', None)
+                if capture_target is not None and self.supermimic_reward_extensions.jump_missed:
+                    platform_target = capture_target(platform_bound)
             progress = JumpProgress(window['jump_reference_stage'], tasks.ascent_seen.clone(), latch.closed.clone(),
                                     tasks.landed_s.clone(), latch.lifted.clone(),
                                     tasks.peak_rise.clone() if self.supermimic_reward_extensions.jump_peak_completion else None,
                                     tasks.active_rise.clone() if self.supermimic_reward_extensions.jump_peak_completion else None,
-                                    (tasks.physical_id >= 0).clone(), platform_bound)
+                                    (tasks.physical_id >= 0).clone(), platform_bound, platform_target)
         densities = physical_reward_densities(
             sample, reference,
             RewardHistory(window['dq'], window['action_cost'], window['action2_cost'], self._action_count),

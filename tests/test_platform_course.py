@@ -151,6 +151,9 @@ def assembly(tmp_path, monkeypatch):
             return WheelClearanceSample(gap[0], course.router.origins, native.time,
                 native._physical_tick, 0, ('left', 'right'), 'test-source', True, False)
 
+        def capture_pose(self):
+            raise AssertionError('This installation fixture does not supply reward wheel geometry')
+
     monkeypatch.setattr('supermimic_rl.course.native_platform_clearance.NativePlatformClearance', Clearance)
     plan = read(configuration(tmp_path))
     owner = NativePlatformCourse(native, plan)
