@@ -35,6 +35,9 @@ class RequestedRandomizationConfig:
     base_com_offset_m: tuple[float, float, float] = (.012, .0064, .008)
     motor_strength_fraction: float = .16
     encoder_bias_rad: float = .004
+    # RMCS uses one calibrated encoder coordinate for the policy and host PD.
+    # Keep the historical independent-bias stress profile unless opted in.
+    shared_encoder_bias: bool = False
     gyro_bias_rad_s: float = .00525
     imu_fixed_degrees: tuple[float, float, float] = (.8, .8, .8 / 3)
     encoder_noise_rad: float = .00035
@@ -56,7 +59,10 @@ class RequestedRandomizationConfig:
 
     def __post_init__(self):
         for name, value in asdict(self).items():
-            if name in ("push_interval_s", "wrench_interval_s"):
+            if name == "shared_encoder_bias":
+                if type(value) is not bool:
+                    raise ValueError("shared_encoder_bias requires a boolean")
+            elif name in ("push_interval_s", "wrench_interval_s"):
                 if (not isinstance(value, (tuple, list)) or len(value) != 2
                         or any(type(v) not in (int, float) or not math.isfinite(v) for v in value)
                         or not 0 < value[0] <= value[1]):
@@ -83,16 +89,22 @@ class RequestedRandomizationConfig:
         return bool(self.external_force_n or self.external_torque_nm)
 
     def provenance(self):
+        configuration = asdict(self)
+        if not self.shared_encoder_bias:
+            configuration.pop("shared_encoder_bias")
         return {
             "source_root": "/home/kaiser/workspace/isaac_sim-6-task-200hz",
             "source_contract": "contracts/wheel_leg_randomization_study_v2.json",
             "source_code_directory": "src/wheeled_tasks/chassis",
-            "source_sha256": dict(SOURCE_PINS), "configuration": asdict(self),
+            "source_sha256": dict(SOURCE_PINS), "configuration": configuration,
             "classification": "requested simulation stress ranges; not hardware measurements",
             "distribution": "independent uniform bounded parameters; Gaussian policy white noise",
             "nominal_mask": "fixed startup Bernoulli lanes shared across body/motor/sensor groups",
             "inertia_rule": "mass scale times independent scalar inertia scale per named body",
-            "encoder_bias": "independent policy and PD draws on four leg positions; wheels zero",
+            "encoder_bias": ("shared calibrated encoder bias for policy and PD on four leg positions; "
+                             "wheels zero; independent policy noise and causal delay remain"
+                             if self.shared_encoder_bias else
+                             "independent policy and PD draws on four leg positions; wheels zero"),
             "imu": "R_BS=Rz(yaw)Ry(pitch)Rx(roll), uniform per-reset fixed bounds; no wobble",
             "gyro_units": "SI rad/s; source gyro feature was multiplied by .5 before bias/noise",
             "sensor_noise_order": "fixed transforms in physical ring; causal delay then Gaussian policy noise",
@@ -159,6 +171,10 @@ class CourseRandomization:
         self.motor_strength[rows] = 1 + scale * self._uniform(count, 6) * c.motor_strength_fraction
         self.encoder_bias_rad[rows, :4] = scale * self._uniform(count, 4) * c.encoder_bias_rad
         self.policy_encoder_bias_rad[rows, :4] = scale * self._uniform(count, 4) * c.encoder_bias_rad
+        if c.shared_encoder_bias:
+            # Consume the legacy policy draw so other DR samples and later
+            # resets keep the same random stream when comparing the profiles.
+            self.policy_encoder_bias_rad[rows] = self.encoder_bias_rad[rows]
         self.gyro_bias_rad_s[rows] = scale * self._uniform(count, 3) * c.gyro_bias_rad_s
         self.imu_rpy_rad[rows] = (scale * self._uniform(count, 3)
                                  * self.imu_rpy_rad.new_tensor(c.imu_fixed_degrees) * math.pi / 180)
@@ -198,12 +214,15 @@ class CourseRandomization:
         return rows, delta
 
     def transform_measurement(self, state):
-        # 41e's _encoder_state has already added the PD bias. Replace, do not
-        # stack it with the independent policy encoder bias.
+        # 41e's _encoder_state has already added the PD bias. The shared
+        # coordinate goes into the physical ring unchanged; only the legacy
+        # independent profile replaces its bias. White noise is added on read.
         inverse = sensor_to_body_rotation(self.imu_rpy_rad).transpose(-1, -2)
+        position = state.policy_position_rad
+        if not self.config.shared_encoder_bias:
+            position = position - self.encoder_bias_rad + self.policy_encoder_bias_rad
         return replace(state,
-            policy_position_rad=(state.policy_position_rad - self.encoder_bias_rad
-                                 + self.policy_encoder_bias_rad),
+            policy_position_rad=position,
             angular_velocity_body_rad_s=(inverse @ state.angular_velocity_body_rad_s[..., None]).squeeze(-1)
                                        + self.gyro_bias_rad_s,
             gravity_body=(inverse @ state.gravity_body[..., None]).squeeze(-1))
@@ -231,6 +250,7 @@ class CourseRandomization:
             defaults = RequestedRandomizationConfig()
             state = {**state, "configuration": {
                 "push_interval_s": defaults.push_interval_s, "wrench_interval_s": defaults.wrench_interval_s,
+                "shared_encoder_bias": defaults.shared_encoder_bias,
                 **state["configuration"]}}
         if (not isinstance(state, dict) or state.keys() != expected.keys()
                 or any(state[key] != expected[key] for key in ("format", "configuration", "seed", "num_envs"))
