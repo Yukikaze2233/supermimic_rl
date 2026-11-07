@@ -20,7 +20,8 @@ def make_learner(schema, runtime, config, *, linkage_path, asset_directory, iden
                  estimator_hidden=(128, 64), critic_hidden=(256, 128), record_tasks=False,
                  terrain=None, stair_task=None, stair_source=None, jump_task=None, recovery_task=None, actor_frame_dim=45,
                  chassis_command_contract=LEGACY_COMMANDS, actor_features=None,
-                 platform_task=None, platform_contact=None, platform_geometry=None):
+                 platform_task=None, platform_contact=None, platform_geometry=None,
+                 platform_contact_hidden=None):
     # Native task dependencies become available after the pinned course factory
     # has installed its upstream path; importing the package alone needs no Isaac.
     from .imagined_reward import OrdinaryFlatReward, TerrainLocomotionReward
@@ -50,7 +51,20 @@ def make_learner(schema, runtime, config, *, linkage_path, asset_directory, iden
     critic = Critic(Critic.feature_size(schema.goal_dim, SIM_CONTEXT_DIM, task_dim=task_dim, **routes),
                     tuple(critic_hidden), task_dim=task_dim, input_clip=config.critic_input_clip, **routes).to(device)
     reward_type = OrdinaryFlatReward if terrain is None else TerrainLocomotionReward
-    reward = reward_type(source, RewardGeometry(linkage, asset_directory), model.wheels, schema.policy_dt_s,
+    geometry = RewardGeometry(linkage, asset_directory)
+    if platform_contact_hidden is not None:
+        from ..course.atlas_cylinder_gap import AtlasCylinderTerrainGap
+        from .platform_contacts import PlatformContactModel
+
+        if (platform_contact is not None or platform_task is None or platform_geometry is None
+                or platform_geometry.terrain is not terrain):
+            raise ValueError('Contact head construction requires one shared platform task and atlas')
+        clearance = AtlasCylinderTerrainGap(terrain, tuple(float(s.radius) for s in geometry.sides),
+            tuple(2 * float(s.half_length) for s in geometry.sides),
+            tile_ids=tuple(int(tile) for tile in platform_geometry.tiles))
+        platform_contact = PlatformContactModel(geometry, platform_geometry, clearance,
+                                               hidden=tuple(platform_contact_hidden)).to(device)
+    reward = reward_type(source, geometry, model.wheels, schema.policy_dt_s,
                          jump_task=jump_task, recovery_task=recovery_task, **({} if terrain is None else {'terrain': terrain}))
     termination = PoseContactTermination(PoseContactLimits.from_runtime(runtime), dt)
     return Learner(model, actor, critic, termination, config, reward=reward,
