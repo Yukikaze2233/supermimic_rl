@@ -1,8 +1,8 @@
-"""Opt-in native assembly for explicit per-row platform-jump plans.
+"""Opt-in native assembly for fixed or actual-route platform-jump plans.
 
 The existing course still owns terrain placement and command sampling. This
 owner binds the shared caller, actual patch evidence and whole-wheel clearance
-for a recorded native experiment; it is not an automatic mixed-skill sampler.
+without changing the course's terrain, birth pose or command sampling.
 """
 from __future__ import annotations
 
@@ -15,6 +15,7 @@ from pathlib import Path
 import torch
 
 from .platform_intent import PLATFORM_INTENT_FORMAT, PLATFORM_TARGET_IDS, PlatformIntentState
+from .platform_sampler import PLATFORM_SAMPLER_FORMAT, PlatformSamplerConfig
 
 
 PLATFORM_COURSE_FORMAT = 'native-explicit-platform-course-v1'
@@ -27,18 +28,22 @@ class PlatformCoursePlan:
     atlas_sha256: str
     geometry_sha256: str
     rows: tuple
+    sampler: PlatformSamplerConfig | None = None
 
     @classmethod
     def read(cls, configuration, *, num_envs, atlas_sha256, record_substeps, jump_takeoff):
         """Validate required experiment inputs before starting the simulator."""
         if configuration is None:
             return None
+        common = {'catalog_path', 'catalog_sha256'}
         if (not isinstance(configuration, dict)
-                or set(configuration) != {'catalog_path', 'catalog_sha256', 'rows'}):
-            raise ValueError('Platform task requires only catalog_path, catalog_sha256 and explicit rows')
+                or set(configuration) not in (common | {'rows'}, common | {'sampler'})):
+            raise ValueError('Platform task requires catalog pins and either explicit rows or sampler')
         if record_substeps is not True or not isinstance(jump_takeoff, dict):
             raise ValueError('Platform task requires record_substeps and explicit jump_takeoff configuration')
-        rows = configuration['rows']
+        sampler = (None if 'sampler' not in configuration else
+                   PlatformSamplerConfig.read(configuration['sampler']))
+        rows = configuration.get('rows', [None] * num_envs)
         if not isinstance(rows, list) or len(rows) != num_envs:
             raise ValueError('Platform task needs one explicit plan or null per environment')
         names = {'target_id', 'earliest_episode_s', 'rise_m', 'support_height_m'}
@@ -65,7 +70,10 @@ class PlatformCoursePlan:
                 or catalog['source']['atlas_manifest']['sha256'] != atlas_sha256
                 or not set(PLATFORM_TARGET_IDS).issubset(t['target_id'] for t in catalog['targets'])):
             raise ValueError('Platform catalog must identify both supported targets on the pinned native atlas')
-        return cls(path, pin, atlas_sha256, catalog['source']['atlas_geometry']['sha256'], tuple(copied))
+        if sampler is not None:
+            sampler.validate_catalog(catalog)
+        return cls(path, pin, atlas_sha256, catalog['source']['atlas_geometry']['sha256'],
+                   tuple(copied), sampler)
 
     def state(self, device):
         targets = [-1 if row is None else PLATFORM_TARGET_IDS.index(row['target_id']) for row in self.rows]
@@ -106,6 +114,9 @@ class NativePlatformCourse:
         self.geometry = PlatformGeometry.load(plan.catalog_path, expected_sha256=plan.catalog_sha256,
                                               terrain=self.terrain, target_ids=PLATFORM_TARGET_IDS)
         self._initial = plan.state(self.terrain.origins.device)
+        self._reset_counts = torch.zeros(native.num_envs, dtype=torch.long, device=self.terrain.origins.device)
+        self._birth_routes = torch.full((native.num_envs, 2), -1, dtype=torch.long,
+                                        device=self.terrain.origins.device)
         self.caller = self.task_adapter = self.landing = None
         # Reuse the native query and final router. A later router replacement is
         # a real scene identity change, so routing must be installed first.
@@ -114,8 +125,22 @@ class NativePlatformCourse:
 
     @property
     def platform_rows(self):
-        """Fixed plan rows, including waiting/finished requests, for report scope."""
-        return (self._initial.target_index >= 0).clone()
+        """Current episode plan rows, including waiting/finished requests."""
+        state = (self._initial if self.caller is None or self.plan.sampler is None
+                 else self.caller.state)
+        return (state.target_index >= 0).clone()
+
+    def _plan_after_reset(self, ids, task):
+        """The native router and task reset have already completed for ids."""
+        course = self.native._terrain_course
+        tile = course.router.tile[ids]
+        family = task.draw.family
+        if not torch.equal(family, course.tasks.family[ids]):
+            raise ValueError('Platform birth family differs from the completed native reset')
+        state = self.plan.sampler.select(tile, family, course.tasks.base_mode[ids])
+        self._reset_counts[ids] += 1
+        self._birth_routes[ids] = torch.stack((tile, family), -1)
+        return state
 
     def _intent(self):
         state = self._initial if self.caller is None else self.caller.state
@@ -150,7 +175,8 @@ class NativePlatformCourse:
         if self.task_adapter is None or self.caller is not None:
             raise ValueError('Install platform physics once before installing its caller')
         self.caller = NativePlatformIntent(self.native, task_adapter=self.task_adapter,
-                                           state=self._initial).install()
+            state=self._initial, reset_plan=(None if self.plan.sampler is None
+                                             else self._plan_after_reset)).install()
         return self
 
     def recording_options(self):
@@ -162,7 +188,7 @@ class NativePlatformCourse:
         from ..world_model_v2.platform_records import PLATFORM_RECORD_VERSION
         from . import platform_target_reward
 
-        return {
+        result = {
             'format': PLATFORM_COURSE_FORMAT, 'intent_format': PLATFORM_INTENT_FORMAT,
             'record_version': PLATFORM_RECORD_VERSION,
             'catalog_sha256': self.plan.catalog_sha256, 'atlas_sha256': self.plan.atlas_sha256,
@@ -184,6 +210,54 @@ class NativePlatformCourse:
             'joint_imagination_enabled': False,
             'native_collision_equivalence_verified': False,
         }
+        if self.plan.sampler is not None:
+            from . import platform_sampler
+
+            del result['rows']
+            result['format'] = 'native-route-platform-course-v1'
+            result['sampler'] = {'format': PLATFORM_SAMPLER_FORMAT,
+                'configuration': self.plan.sampler.to_dict(),
+                'implementation_sha256': hashlib.sha256(Path(platform_sampler.__file__).read_bytes()).hexdigest(),
+                'selection': 'actual router tile and explicit birth task family after native reset',
+                'random_draws': 0,
+                'reset_order': 'native route/task reset, select only reset rows, publish caller plan',
+                'cold_resume': 'preserve counters; discard active caller history and reselect after real reset'}
+            result['plan_scope'] = 'deterministic per-episode plans on existing matching course routes; no terrain or pose override'
+            result['joint_imagination_supported'] = True
+            result['joint_imagination_scope'] = (
+                'caller plan is fully recorded; ordinary command known-horizon rules still apply; '
+                'does not enable a learner or override contact-supervision-only dataset restrictions')
+        return result
+
+    def state_dict(self):
+        """Caller history is auditable; a cold restart must not resume its flight."""
+        if self.caller is None:
+            raise ValueError('Install the platform caller before saving its state')
+        return {'format': 'native-platform-course-state-v1', 'task': self.receipt(),
+                'caller': self.caller.state_dict(), 'reset_counts': self._reset_counts.clone(),
+                'birth_routes': self._birth_routes.clone()}
+
+    def restore_after_physical_reset(self, saved):
+        """Restore only accounting before the adapter performs its real reset."""
+        if (not isinstance(saved, dict)
+                or set(saved) != {'format', 'task', 'caller', 'reset_counts', 'birth_routes'}
+                or saved['format'] != 'native-platform-course-state-v1'
+                or saved['task'] != self.receipt()):
+            raise ValueError('Platform course saved source differs')
+        history = PlatformIntentState.from_state_dict(saved['caller'])
+        if history.phase.shape != self._initial.phase.shape:
+            raise ValueError('Platform course saved caller row count differs')
+        for name, current in (('reset_counts', self._reset_counts), ('birth_routes', self._birth_routes)):
+            value = saved[name]
+            if (not isinstance(value, torch.Tensor) or value.dtype != torch.long or value.shape != current.shape
+                    or (value < (0 if name == 'reset_counts' else -1)).any()):
+                raise ValueError('Platform course saved birth accounting differs')
+        # Native task restore owns watermarks and aborted requests. Its cold
+        # reset supplies a fresh pose/route; old active caller state is evidence
+        # only, never an instruction to continue an in-flight physical request.
+        self._reset_counts.copy_(saved['reset_counts'])
+        self._birth_routes.copy_(saved['birth_routes'])
+        self.caller.set_plan(self._initial)
 
     def summary(self):
         """Actual final snapshots only; never aggregate flat-anchor failure tests."""
@@ -205,8 +279,13 @@ class NativePlatformCourse:
                 'landing_phase': PlatformLandingPhase(int(landing.phase[row])).name.lower(),
                 'consecutive_whole_body_clear_ticks': int(landing.free_ticks[row]),
                 'actual_tile': int(self.native._terrain_course.router.tile[row])})
-        return {'format': 'native-platform-final-snapshot-v1', 'task': self.receipt(), 'rows': rows,
+        result = {'format': 'native-platform-final-snapshot-v1', 'task': self.receipt(), 'rows': rows,
                 'scope': 'final native caller/landing snapshots; not all requests or a skill success rate',
                 'flat_jump_failure_conditions_applicable': False,
                 'outcome_semantics': 'native shared platform observer owns success; snapshots do not independently qualify it',
                 'joint_imagination_enabled': False}
+        if self.plan.sampler is not None:
+            result['sampler_births'] = {'reset_counts': self._reset_counts.cpu().tolist(),
+                'latest_tile_and_family': self._birth_routes.cpu().tolist(),
+                'scope': 'current and explicitly restored accounting only; not task success counts'}
+        return result

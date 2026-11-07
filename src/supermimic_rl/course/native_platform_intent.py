@@ -27,7 +27,7 @@ class NativePlatformIntent:
     """
 
     def __init__(self, native, *, task_adapter: NativeJumpTaskAdapter,
-                 state: PlatformIntentState):
+                 state: PlatformIntentState, reset_plan=None):
         self.native = native
         self.course = native._terrain_course
         self.tasks = self.course.tasks
@@ -42,6 +42,9 @@ class NativePlatformIntent:
         if self.gate is None or self.gate.tasks is not self.tasks:
             raise ValueError('Install the native take-off gate before platform intent')
         self._check_state(state)
+        if reset_plan is not None and not callable(reset_plan):
+            raise ValueError('Platform reset plan producer must be callable')
+        self.reset_plan = reset_plan
         self.state = PlatformIntentState.decode(state.record())
         self._patches = []
         self._pending_cancel = None
@@ -240,10 +243,13 @@ class NativePlatformIntent:
         finally:
             self._pending_cancel = None
 
-    def _reset_commands(self, ids, *args, **kwargs):
-        result = self._native_reset(ids, *args, **kwargs)
-        mask = torch.zeros_like(self.state.phase, dtype=torch.bool)
-        mask[ids] = True
-        self.state = self.state.reset(mask)
+    def _reset_commands(self, ids, task, *args, **kwargs):
+        result = self._native_reset(ids, task, *args, **kwargs)
+        if self.reset_plan is None:
+            mask = torch.zeros_like(self.state.phase, dtype=torch.bool)
+            mask[ids] = True
+            self.state = self.state.reset(mask)
+        else:
+            self.set_plan(self.reset_plan(ids, task), rows=ids)
         self._pending_cancel = None
         return result
