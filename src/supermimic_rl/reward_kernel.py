@@ -9,6 +9,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 import math
+from typing import TYPE_CHECKING
 
 import torch
 from torch import Tensor
@@ -20,7 +21,8 @@ from transformer_rl.formal.tasks.reward import (
 )
 from transformer_rl.formal.tasks.gimbal_course import GimbalCourse
 
-from .course.platform_target_reward import PlatformTargetProgress
+if TYPE_CHECKING:
+    from .course.platform_target_reward import PlatformTargetProgress
 
 JUMP_PUSH_MIN_REFERENCE_M_S = .1
 JUMP_SETTLE_STREAK_S = 2.     # the native physical success needs this uninterrupted stable landing
@@ -265,13 +267,19 @@ class JumpProgress:
             raise ValueError('Jump progress coverage changes within a physical interval')
         optional = lambda name: (None if getattr(items[0], name) is None
                                  else torch.cat([getattr(item, name) for item in items]))
+        platform = None
+        if items[0].platform_target is not None:
+            # Ordinary/jump deployments do not install the optional selected-
+            # platform producer. Import its implementation only when supplied.
+            from .course.platform_target_reward import PlatformTargetProgress
+
+            platform = PlatformTargetProgress.cat(item.platform_target for item in items)
         return JumpProgress(torch.cat([item.reference_stage for item in items]),
                             torch.cat([item.ascent_seen for item in items]),
                             optional('flight_closed'), optional('landed_s'), optional('flight_started'),
                             optional('peak_rise'), optional('requested_rise'), optional('physical_active'),
                             optional('platform_bound'),
-                            None if items[0].platform_target is None else
-                            PlatformTargetProgress.cat(item.platform_target for item in items),
+                            platform,
                             None if items[0].flight_geometry is None else
                             JumpFlightGeometry.cat(item.flight_geometry for item in items))
 

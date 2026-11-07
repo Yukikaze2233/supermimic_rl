@@ -15,6 +15,7 @@ _PROOF_KEYS = {
     'recovery-roll-bridge-sampling-v1': 'recovery_roll_bridge_sampling',
     'settling-reward-continuity-v1': 'settling_reward_continuity',
     'jump-extension-height-floor-v1': 'jump_extension_height_floor',
+    'jump-flight-geometry-and-rest-v1': 'jump_flight_geometry_reward',
 }
 
 
@@ -49,6 +50,10 @@ def verify_source_proof(proof):
             checked = verify_saved_proof(proof)
         elif kind == 'jump-extension-height-floor-v1':
             from .extension_height import verify_saved_proof
+
+            checked = verify_saved_proof(proof)
+        elif kind == 'jump-flight-geometry-and-rest-v1':
+            from .flight_reward import verify_saved_proof
 
             checked = verify_saved_proof(proof)
         else:

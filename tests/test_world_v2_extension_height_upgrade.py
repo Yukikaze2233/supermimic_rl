@@ -25,6 +25,12 @@ from test_world_v2_recovery_bridge_upgrade import equal_nested
 from test_world_v2_settling_upgrade import candidate as settling_fixture
 
 
+@pytest.fixture(autouse=True)
+def historical_running_kernel(monkeypatch):
+    # This suite verifies the retained historical boundary, not a later reward.
+    monkeypatch.setattr(reward_continuity, '_kernel_sha256', lambda: extension_height.TARGET_KERNEL_SHA256)
+
+
 def target_source(source):
     target = deepcopy(source)
     target['reward_kernel']['kernel_sha256'] = extension_height.TARGET_KERNEL_SHA256
@@ -215,7 +221,8 @@ def test_older_auxiliary_source_split_and_next_draw_survive_both_reward_proofs(c
     assert file_sha256(path) == config.sha256
 
 
-def test_new_target_kernel_is_the_reviewed_production_file():
-    assert hashlib.sha256(Path(inspect.getfile(physical_reward_densities)).read_bytes()).hexdigest() == (
-        extension_height.TARGET_KERNEL_SHA256)
+def test_historical_target_is_the_next_reviewed_source():
+    from supermimic_rl.world_model_v2.migrations.flight_reward import SOURCE_KERNEL_SHA256
+
+    assert extension_height.TARGET_KERNEL_SHA256 == SOURCE_KERNEL_SHA256
     assert extension_height.SOURCE_KERNEL_SHA256 == settling.TARGET_KERNEL_SHA256
