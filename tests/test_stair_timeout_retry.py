@@ -291,6 +291,14 @@ def test_evaluation_links_raw_timeout_retries_without_changing_native_states_or_
         assert len(records) == 1 and records[0]['end_reason'] == reason
         assert records[0]['retry_of_timed_out_request_id'] is None
     assert result == evidence.summary()
+    observed.time += .5
+    condition = course.stair_requests.step(now_s=observed.time,
+        request_id=torch.full((observed.num_envs,), -1),
+        height_m=torch.full((observed.num_envs,), .1),
+        cancel_id=torch.full((observed.num_envs,), -1),
+        jump_active=torch.zeros(observed.num_envs, dtype=torch.bool))
+    course._record_stair_end(condition.finished_id >= 0, condition.end_reason)
+    assert evidence.active[0] is None and evidence.previous[0]['end_reason'] == 'timeout'
     # Native reset accounting precedes the episode counter increment. Even
     # identical geometry in the next episode must not inherit a retry link.
     ended = torch.ones(observed.num_envs, dtype=torch.bool)
@@ -298,7 +306,6 @@ def test_evaluation_links_raw_timeout_retries_without_changing_native_states_or_
     course.stair_requests.reset(torch.arange(observed.num_envs), observed.time)
     observed._episode_id.add_(1)
     observed.time += .02
-    course._completed_estimate = estimate_at(observed.time - .02, observed.num_envs)
     evidence.fired.fill_(True)
     course.stair_requests.step(now_s=observed.time,
         request_id=course.stair_requests.max_seen_id + 1,
