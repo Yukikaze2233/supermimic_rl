@@ -19,7 +19,8 @@ def make_learner(schema, runtime, config, *, linkage_path, asset_directory, iden
                  model_hidden=(2048, 2048, 2048), actor_hidden=(512, 256, 128),
                  estimator_hidden=(128, 64), critic_hidden=(256, 128), record_tasks=False,
                  terrain=None, stair_task=None, stair_source=None, jump_task=None, recovery_task=None, actor_frame_dim=45,
-                 chassis_command_contract=LEGACY_COMMANDS, actor_features=None):
+                 chassis_command_contract=LEGACY_COMMANDS, actor_features=None,
+                 platform_task=None, platform_contact=None, platform_geometry=None):
     # Native task dependencies become available after the pinned course factory
     # has installed its upstream path; importing the package alone needs no Isaac.
     from .imagined_reward import OrdinaryFlatReward, TerrainLocomotionReward
@@ -44,6 +45,7 @@ def make_learner(schema, runtime, config, *, linkage_path, asset_directory, iden
     routes = {'terrain': terrain is not None, 'stairs': stair_source is not None, 'jumps': jump_task is not None,
               'recovery': recovery_task is not None,
               'disturbances': disturbances,
+              'platforms': platform_task is not None,
               'jump_trigger': jump_task is not None and jump_task.config.trigger is not None}
     critic = Critic(Critic.feature_size(schema.goal_dim, SIM_CONTEXT_DIM, task_dim=task_dim, **routes),
                     tuple(critic_hidden), task_dim=task_dim, input_clip=config.critic_input_clip, **routes).to(device)
@@ -53,4 +55,5 @@ def make_learner(schema, runtime, config, *, linkage_path, asset_directory, iden
     termination = PoseContactTermination(PoseContactLimits.from_runtime(runtime), dt)
     return Learner(model, actor, critic, termination, config, reward=reward,
                     stair_task=stair_task, stair_source=stair_source, jump_task=jump_task, recovery_task=recovery_task,
-                    disturbance_config=disturbance_config)
+                    disturbance_config=disturbance_config, platform_task=platform_task,
+                    platform_contact=platform_contact, platform_geometry=platform_geometry)

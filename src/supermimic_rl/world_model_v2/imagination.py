@@ -27,6 +27,8 @@ from .stair_source import StairSourceState, TOF_FEATURE_DIM
 from .jump_task import JumpTaskState, JUMP_FEATURE_DIM, JUMP_TRIGGER_FEATURE_DIM
 from .recovery_task import RecoveryTaskState, RECOVERY_FEATURE_DIM
 from .disturbance import DisturbanceState, DISTURBANCE_NOISE_DIM
+from .platform_records import PlatformRecordState
+from .platform_features import PLATFORM_FEATURE_DIM, platform_critic_features
 
 POLICY_DT_S = .02
 
@@ -68,14 +70,16 @@ class Critic(nn.Module):
     @staticmethod
     def feature_size(goal_dim: int, sim_context_dim: int, *, task_dim: int = 0,
                      terrain: bool = False, stairs: bool = False, jumps: bool = False, recovery: bool = False,
-                     jump_trigger: bool = False, disturbances: bool = False) -> int:
+                     jump_trigger: bool = False, disturbances: bool = False, platforms: bool = False) -> int:
         return (30 + 12 + 19 + goal_dim + sim_context_dim + 77 + 3 + 2 + 23 + task_dim
                 + 14 * terrain + (STAIR_FEATURE_DIM + TOF_FEATURE_DIM) * stairs + JUMP_FEATURE_DIM * jumps
-                + RECOVERY_FEATURE_DIM * recovery + JUMP_TRIGGER_FEATURE_DIM * jump_trigger + 9 * disturbances)
+                + RECOVERY_FEATURE_DIM * recovery + JUMP_TRIGGER_FEATURE_DIM * jump_trigger + 9 * disturbances
+                + PLATFORM_FEATURE_DIM * platforms)
 
     def __init__(self, input_dim: int, hidden: tuple[int, ...] = (256, 128), *, task_dim: int = 0,
                  terrain: bool = False, stairs: bool = False, jumps: bool = False, recovery: bool = False,
-                 input_clip: float | None = None, jump_trigger: bool = False, disturbances: bool = False):
+                 input_clip: float | None = None, jump_trigger: bool = False, disturbances: bool = False,
+                 platforms: bool = False):
         super().__init__()
         if input_clip is not None and not input_clip > 0:
             raise ValueError('Critic input clip must be positive or None')
@@ -93,6 +97,9 @@ class Critic(nn.Module):
             raise ValueError('Recovery critic requires complete jump and stair arbitration state')
         self.recovery = recovery
         self.disturbances = disturbances
+        if platforms and not jump_trigger:
+            raise ValueError('Platform critic needs the complete gated jump task')
+        self.platforms = platforms
         self.norm = RunningNorm(input_dim)
         self.net = elu_mlp(input_dim, hidden, 1)
 
@@ -141,7 +148,8 @@ class Imagination:
     def __init__(self, model: WorldModelV2, actor: EstimatorActor, critic: Critic,
                  termination: PoseContactTermination, *, reward, gamma: float = .99,
                  stair_task=None, stair_source=None, jump_task=None, recovery_task=None,
-                 bootstrap_gradient: bool = True, disturbance_config=None):
+                 bootstrap_gradient: bool = True, disturbance_config=None,
+                 platform_task=None, platform_contact=None, platform_geometry=None):
         self.model, self.actor, self.critic, self.gamma = model, actor, critic, gamma
         self.bootstrap_gradient = bootstrap_gradient
         self.termination, self.reward = termination, reward
@@ -162,6 +170,19 @@ class Imagination:
         if (getattr(model, 'disturbances', False) != (disturbance_config is not None)
                 or critic.disturbances != (disturbance_config is not None)):
             raise ValueError('Disturbance motion, critic and analytic schedule must be configured together')
+        if (critic.platforms != (platform_task is not None)
+                or (platform_task is None) != (platform_contact is None)
+                or (platform_task is None) != (platform_geometry is None)):
+            raise ValueError('Platform imagination needs its caller, predictive contact producer, geometry and critic')
+        if platform_task is not None:
+            if (platform_task.jump_task is not jump_task or platform_task.stair_task is not stair_task
+                    or platform_task.stair_source is not stair_source
+                    or platform_geometry.terrain is not model.terrain):
+                raise ValueError('Platform imagination must share the existing tasks and physical atlas')
+            if not callable(platform_contact):
+                raise ValueError('Platform contact producer must consume predicted intervals')
+        self.platform_task, self.platform_contact, self.platform_geometry = (
+            platform_task, platform_contact, platform_geometry)
         # (body_floor [bodies], base_floor []) from held-out calibration; None leaves loads raw.
         self.contact_floor = None
 
@@ -208,7 +229,8 @@ class Imagination:
     def critic_features(self, state, height, scan, memory, goal, sim_context, failure_memory,
                         conditions, reward_memory, motion_task=None, *, terrain_route=None,
                         stair_state=None, stair_source=None, jump_state=None, recovery_state=None,
-                        disturbance_state=None) -> Tensor:
+                        disturbance_state=None, platform_intent=None, platform_landing=None,
+                        platform_tile=None) -> Tensor:
         linkage, _ = linkage_features(self.model.inputs.linkage, state)
         features = (physical_features(state, height), linkage, memory_features(memory, state), goal,
                     sim_context, scan, failure_memory, conditions, reward_memory)
@@ -240,6 +262,14 @@ class Imagination:
             if disturbance_state is None:
                 raise ValueError('Disturbance critic needs current held wrench and scheduler state')
             features += (disturbance_state.encode(),)
+        if self.critic.platforms:
+            if platform_intent is None or platform_landing is None or platform_tile is None:
+                raise ValueError('Platform critic requires recorded caller, landing and tile context')
+            features += (platform_critic_features(platform_intent, platform_landing, state,
+                MotionTask.decode(motion_task), jump_state, self.platform_geometry,
+                platform_tile[:, 0], self.jump_task.config),)
+        elif platform_intent is not None or platform_landing is not None or platform_tile is not None:
+            raise ValueError('Platform task histories cannot be silently ignored by a legacy critic')
         return torch.cat(features, -1)
 
     @staticmethod
@@ -257,6 +287,12 @@ class Imagination:
             result['recovery_state'] = RecoveryTaskState.decode(start)
         if 'disturbance' in start:
             result['disturbance_state'] = DisturbanceState.decode(start['disturbance'])
+        if 'platform_intent_ids' in start:
+            platform = PlatformRecordState.decode(start)
+            if not platform.valid.all():
+                raise ValueError('Platform imagination requires known caller and landing histories')
+            result.update(platform_intent=platform.intent, platform_landing=platform.landing,
+                          platform_tile=start['terrain_tile'])
         return result
 
     @torch.no_grad()
@@ -291,6 +327,10 @@ class Imagination:
         jump = task_features.get('jump_state')
         recovery = task_features.get('recovery_state')
         disturbance = task_features.get('disturbance_state')
+        platform_intent = task_features.get('platform_intent')
+        platform_landing = task_features.get('platform_landing')
+        if (platform_intent is None) != (self.platform_task is None):
+            raise ValueError('Imagined platform state and configured task differ')
         if (disturbance is None) != (self.disturbance_config is None):
             raise ValueError('Imagined disturbance state and configured schedule differ')
         if disturbance is not None and not (start['disturbance_record_valid'] > .5).all():
@@ -412,10 +452,10 @@ class Imagination:
                         value[keep] for value in (history, height, scan, goal, sim_context, strength,
                             failure_memory, conditions, lengths, survival, objective, invalid, active, action))
                     (state, memory, reward_memory, queues, transforms, task, stair, source, jump, recovery,
-                     disturbance, next_disturbance,
+                     disturbance, next_disturbance, platform_intent, platform_landing,
                      prediction) = (_take_rows(value, keep) for value in (
                         state, memory, reward_memory, queues, transforms, task, stair, source, jump, recovery,
-                        disturbance, next_disturbance,
+                        disturbance, next_disturbance, platform_intent, platform_landing,
                         prediction))
                     readout = decode_readout(start['readout'])
                     task_features = {name: _take_rows(value, keep) for name, value in task_features.items()}
@@ -465,10 +505,21 @@ class Imagination:
                 # noisy actor observation, not its newly predicted physical state.
                 with torch.no_grad():
                     estimate = self.stair_task.completed_estimate(history, actor.estimate(history), stair.clock[:, 0])
+            platform_inputs = {}
+            if platform_intent is not None:
+                # Only this interval's prediction and causal task state reach the
+                # producer. Recorded future contact labels are never passed in.
+                evidence = self.platform_contact(ticks, intent=platform_intent, jump_state=jump,
+                    command_height=goal[:, 3] / 5., terrain_tile=start['terrain_tile'][:, 0])
+                platform_inputs = {'platform_state': platform_landing, 'platform_evidence': evidence}
             physical = reward_context.integrate(state, prediction, action, reward_memory, memory, goal, step,
-                **({} if jump is None else {'jump_state': jump, 'base_mode': task.route[:, 3].long()}))
+                **({} if jump is None else {'jump_state': jump, 'base_mode': task.route[:, 3].long()}),
+                **platform_inputs)
             reject(active & physical.invalid, step, 'reward_reference')
             active = active & ~invalid
+            if platform_landing is not None:
+                platform_landing = _select(active, physical.platform_state, platform_landing)
+                task_features['platform_landing'] = platform_landing
             termination_height = (prediction.tick_height_above_ground if physical.termination_height is None
                                   else physical.termination_height)
             observed_recovery = None
@@ -525,7 +576,25 @@ class Imagination:
                 radius = goal.new_tensor([side.radius for side in reward_context.geometry.sides])
                 rows = active.nonzero().flatten()
                 jump_inputs = {}
-                if jump is not None:
+                if platform_intent is not None:
+                    ground = end.position[rows, 2] - prediction.height_above_ground[rows, 0]
+                    platform_boundary = self.platform_task.advance(
+                        _take_rows(platform_intent, rows), _take_rows(physical.jump_state, rows),
+                        motion=_take_rows(task, rows), stair=_take_rows(stair, rows),
+                        source=_take_rows(source, rows), physical=_take_rows(end, rows),
+                        wheel_centres=wheel.centre_world[rows], wheel_radius=radius,
+                        terrain_tile=start['terrain_tile'][rows, 0], queues=_take_rows(queues, rows),
+                        readout=decode_readout(start['readout'][rows]), goal=goal[rows],
+                        estimate=_take_rows(estimate, rows), task_family=start['task_family'][rows, 0].long(),
+                        ground_z=ground, interval_uniform=start['jump_uniform'][rows, step],
+                        latency=start['tof_latency'][rows, step], draws=start['tof_uniform'][rows, step],
+                        retain_peak_gradient=getattr(getattr(self.reward, 'extensions', None),
+                                                     'jump_peak_completion', False))
+                    advanced = platform_boundary.source
+                    jump = _scatter_prediction(rows, platform_boundary.jump.state, jump)
+                    platform_intent = _scatter_prediction(rows, platform_boundary.intent, platform_intent)
+                    task_features['platform_intent'] = platform_intent
+                elif jump is not None:
                     following, admitted = _take_rows(task, rows).advance_admission(
                         _take_rows(queues, rows), decode_readout(start['readout'][rows]), POLICY_DT_S)
                     physical_jump = _take_rows(physical.jump_state, rows)
@@ -545,13 +614,14 @@ class Imagination:
                         'jump_active': jumped.state.active_id >= 0, 'request_height': jumped.request_height,
                         'request_clock': jumped.request_clock}
                     jump = _scatter_prediction(rows, jumped.state, jump)
-                advanced = self.stair_source.advance(_take_rows(source, rows), _take_rows(stair, rows),
-                    task=self.stair_task, motion=_take_rows(task, rows), physical=_take_rows(end, rows),
-                    wheel_centres=wheel.centre_world[rows], wheel_radius=radius,
-                    terrain_tile=start['terrain_tile'][rows, 0], queues=_take_rows(queues, rows),
-                    readout=decode_readout(start['readout'][rows]), goal=goal[rows], estimate=_take_rows(estimate, rows),
-                    physics_dt_s=model.physics_dt_s, latency=start['tof_latency'][rows, step],
-                    draws=start['tof_uniform'][rows, step], **jump_inputs)
+                if platform_intent is None:
+                    advanced = self.stair_source.advance(_take_rows(source, rows), _take_rows(stair, rows),
+                        task=self.stair_task, motion=_take_rows(task, rows), physical=_take_rows(end, rows),
+                        wheel_centres=wheel.centre_world[rows], wheel_radius=radius,
+                        terrain_tile=start['terrain_tile'][rows, 0], queues=_take_rows(queues, rows),
+                        readout=decode_readout(start['readout'][rows]), goal=goal[rows], estimate=_take_rows(estimate, rows),
+                        physics_dt_s=model.physics_dt_s, latency=start['tof_latency'][rows, step],
+                        draws=start['tof_uniform'][rows, step], **jump_inputs)
                 boundary = advanced.boundary
                 task = _scatter_prediction(rows, boundary.motion, task)
                 stair = _scatter_prediction(rows, boundary.stair.state, stair)
