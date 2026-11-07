@@ -79,6 +79,11 @@ class RewardExtensions:
     supplies a settling signal without damping the whole flip or changing the
     recovery handoff. It is not physical success or contact certification.
 
+    ``stationary_quiet`` uses the same soft objective after an explicit NORMAL
+    zero command, with both wheels supported and no harmful body contact.
+    Terrain/flight windows, special gimbal commands and still-live physical
+    jump requests are excluded. It adds no mode lock or motion restriction.
+
     ``ordinary_leg_acceleration`` overrides the physical acceleration cost
     only for normal, slope and stair locomotion. None retains the native
     5e-7 coefficient; jump and recovery always retain their native cost.
@@ -95,12 +100,13 @@ class RewardExtensions:
     recovery_quiet: float = 0.    # per second at quiet, upright target height; default retains native parity
     ordinary_leg_acceleration: float | None = None  # per second and (rad/s^2)^2, summed over four legs
     jump_peak_completion: bool = False  # reuse missed-jump weight with continuous requested-peak completion
+    stationary_quiet: float = 0.  # per second at upright target height and quiet supported NORMAL standstill
 
     def __post_init__(self):
         if type(self.jump_peak_completion) is not bool or self.jump_peak_completion and self.jump_missed <= 0:
             raise ValueError('Jump peak completion requires a boolean flag and positive jump_missed weight')
         values = (self.jump_flight, self.jump_lift, self.jump_lift_cap_m_s, self.jump_push, self.jump_missed,
-                  self.jump_settle, self.jump_landing_rate, self.recovery_quiet,
+                  self.jump_settle, self.jump_landing_rate, self.recovery_quiet, self.stationary_quiet,
                   0. if self.ordinary_leg_acceleration is None else self.ordinary_leg_acceleration,
                   1. if self.success_event is None else self.success_event)
         if any(type(value) not in (int, float) or not math.isfinite(value) or value < 0 for value in values):
@@ -110,12 +116,12 @@ class RewardExtensions:
     def active(self) -> bool:
         return bool(self.jump_flight or self.jump_lift or self.jump_push or self.jump_missed or self.jump_settle
                     or self.jump_landing_rate or self.recovery_quiet or self.success_event is not None
-                    or self.ordinary_leg_acceleration is not None)
+                    or self.ordinary_leg_acceleration is not None or self.stationary_quiet)
 
     @property
     def needs_jump_progress(self) -> bool:
         return bool(self.jump_flight or self.jump_lift or self.jump_push or self.jump_missed or self.jump_settle
-                    or self.jump_landing_rate)
+                    or self.jump_landing_rate or self.stationary_quiet)
 
 
 @dataclass(frozen=True)
@@ -140,9 +146,10 @@ class JumpProgress:
     flight_started: Tensor | None = None # first-real-flight latch, retained after touchdown
     peak_rise: Tensor | None = None      # running native root-height rise; differentiable in imagination
     requested_rise: Tensor | None = None
+    physical_active: Tensor | None = None  # current physical request >= 0, observed after this physics tick
 
     def validate(self, mode: Tensor) -> None:
-        flags = tuple(flag for flag in (self.ascent_seen, self.flight_closed, self.flight_started)
+        flags = tuple(flag for flag in (self.ascent_seen, self.flight_closed, self.flight_started, self.physical_active)
                       if flag is not None)
         if (self.reference_stage.shape != mode.shape or self.reference_stage.device != mode.device
                 or self.reference_stage.dtype != torch.long
@@ -166,14 +173,15 @@ class JumpProgress:
                 or len({item.landed_s is None for item in items}) != 1
                 or len({item.flight_started is None for item in items}) != 1
                 or len({item.peak_rise is None for item in items}) != 1
-                or len({item.requested_rise is None for item in items}) != 1):
+                or len({item.requested_rise is None for item in items}) != 1
+                or len({item.physical_active is None for item in items}) != 1):
             raise ValueError('Jump progress coverage changes within a physical interval')
         optional = lambda name: (None if getattr(items[0], name) is None
                                  else torch.cat([getattr(item, name) for item in items]))
         return JumpProgress(torch.cat([item.reference_stage for item in items]),
                             torch.cat([item.ascent_seen for item in items]),
                             optional('flight_closed'), optional('landed_s'), optional('flight_started'),
-                            optional('peak_rise'), optional('requested_rise'))
+                            optional('peak_rise'), optional('requested_rise'), optional('physical_active'))
 
 
 def advance_flight_latch(request: Tensor, lifted: Tensor, closed: Tensor, *, current: Tensor,
@@ -410,6 +418,7 @@ def physical_reward_densities(sample: RewardPhysics, reference: RewardReference,
     # is the pitch component of projected gravity; gy is the roll component.
     ordinary_attitude = 32 * relief.square() * (
         torch.where(terrain_airborne, 0., gx.square()) + gy.square())
+    harmful_contact = (sample.body_normal_load_n[:, parameters.harmful_indices] > 3).any(-1)
     cost = {'forward': (~recovery) * velocity_gate * forward_square_weight * (.25 * ev).square(),
             'yaw': (~recovery) * velocity_gate * VELOCITY_SQUARE_WEIGHT * (.5 * ew).square(),
             'height': height_gate * (10 * eh).square() * (~terrain_airborne),
@@ -437,7 +446,7 @@ def physical_reward_densities(sample: RewardPhysics, reference: RewardReference,
             'leg_acceleration': 5e-7 * ddq[:, :4].square().sum(-1),
             'issued_first_difference': history.action_cost, 'issued_second_difference': history.action2_cost,
             # SCUT undesired_contact: any non-wheel body above 3 N.
-            'harmful_contact': 2 * (sample.body_normal_load_n[:, parameters.harmful_indices] > 3).any(-1).float(),
+            'harmful_contact': 2 * harmful_contact.float(),
             'contact_slip': .5 * (slip * (sample.wheel_contact_tangent_speed_m_s / .2).square()).sum(-1),
             'joint_boundary': 2 * (sample.joint_boundary_shortfall_rad / .05).square().sum(-1),
             'flight_wheel_effort': .2 * flight * (effort[:, 4:] / 4.5).square().sum(-1),
@@ -621,12 +630,27 @@ def physical_reward_densities(sample: RewardPhysics, reference: RewardReference,
         angular_square = sample.angular_velocity_body_rad_s.square().sum(-1)
         positive['recovery_quiet'] = (extensions.recovery_quiet * recovery * positive['height']
                                      * torch.exp(-angular_square / .25))
+    if extensions.stationary_quiet:
+        if jump_progress is None or jump_progress.physical_active is None:
+            raise ValueError('Stationary quiet requires explicit per-tick physical jump activity')
+        jump_progress.validate(reference.mode)
+        # Use the native 5 N stable-wheel support and existing >3 N harmful
+        # contact predicates; absent contact coverage is never evidence of rest.
+        contact_available = sample.available_terms is None or 'harmful_contact' in sample.available_terms
+        supported = (wheel_load >= 5).all(-1) & ~harmful_contact & contact_available
+        stationary = ((reference.mode == int(CommandMode.NORMAL)) & exact_still & supported
+                      & ~terrain_active & ~terrain_airborne & ~rough_active
+                      & ~jump_progress.physical_active)
+        angular_square = sample.angular_velocity_body_rad_s.square().sum(-1)
+        positive['stationary_quiet'] = (extensions.stationary_quiet * stationary * positive['height']
+                                       * upright.clamp_min(0) * torch.exp(-angular_square / .25))
     p, c = torch.stack(tuple(positive.values())).sum(0), torch.stack(tuple(cost.values())).sum(0)
     components = {**{'positive.' + key: value for key, value in positive.items()},
                   **{'cost.' + key: -value for key, value in cost.items()}}
     positive_bound = torch.where(gimbal_active, 11., 8.)
     positive_bound = (positive_bound + extensions.jump_flight + extensions.jump_lift * extensions.jump_lift_cap_m_s
-                      + extensions.jump_push + extensions.jump_settle + extensions.recovery_quiet)
+                      + extensions.jump_push + extensions.jump_settle + extensions.recovery_quiet
+                      + extensions.stationary_quiet)
     if rough_dash:
         # 10 centering + 20 zero torque + 10 directional wheel speed.
         positive_bound = positive_bound + 40 * rough_active

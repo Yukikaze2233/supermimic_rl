@@ -121,7 +121,8 @@ class LocomotionRewardContext:
                     None if jump_interval.landed_s is None else jump_interval.landed_s[:, tick],
                     None if jump_interval.flight_started is None else jump_interval.flight_started[:, tick],
                     None if jump_interval.peak_rise is None else jump_interval.peak_rise[:, tick],
-                    None if jump_interval.requested_rise is None else jump_interval.requested_rise[:, tick])))
+                    None if jump_interval.requested_rise is None else jump_interval.requested_rise[:, tick],
+                    None if jump_interval.physical_active is None else jump_interval.physical_active[:, tick])))
         result = self.assembly.integrate(start, tuple(samples), action, reward_memory,
             controller_memory.wheel_torque_history, self.legs, self.encoder_bias, self.motor_strength)
         return replace(result, termination_height=torch.stack(heights, -1)[..., None],

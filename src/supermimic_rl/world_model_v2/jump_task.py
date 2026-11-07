@@ -277,6 +277,7 @@ class JumpInterval:
     flight_started: Tensor | None = None  # per tick: first-real-flight latch, including after landing
     peak_rise: Tensor | None = None       # continuous running root rise, outside the detached FSM
     requested_rise: Tensor | None = None
+    physical_active: Tensor | None = None  # derived per tick from the existing physical request ID
 
 
 class JumpTask:
@@ -441,6 +442,7 @@ class JumpTask:
             tilt = torch.atan2(gravity[..., :2].norm(dim=-1), -gravity[..., 2])
             speed = physical.angular_velocity_body.norm(dim=-1)
             phases, ascents, closed_ticks, stable_ticks, lifted_ticks = [], [], [], [], []
+            active_ticks = []
             peak_active = []
             latch = None if state.flight_latch is None else state._flight_latch_state()
             for tick in range(4):
@@ -452,6 +454,7 @@ class JumpTask:
                 phases.append(owner.phase.clone())
                 ascents.append(owner.ascent_seen.clone())
                 stable_ticks.append(owner.landed_s.clone())
+                active_ticks.append((owner.physical_id >= 0).clone())
                 if latch is not None:
                     # The native FirstFlightLatch update after observe_physics.
                     latch = advance_flight_latch(*latch, current=owner.physical_id,
@@ -490,4 +493,5 @@ class JumpTask:
         return JumpInterval(following, phase, height, velocity, owner.success_id.clone(), success,
                             curve.clock_stage[:, None].expand(-1, 4), torch.stack(ascents, -1),
                             torch.stack(closed_ticks, -1) if closed_ticks else None, torch.stack(stable_ticks, -1),
-                            torch.stack(lifted_ticks, -1) if lifted_ticks else None, peaks, requested)
+                            torch.stack(lifted_ticks, -1) if lifted_ticks else None, peaks, requested,
+                            torch.stack(active_ticks, -1))

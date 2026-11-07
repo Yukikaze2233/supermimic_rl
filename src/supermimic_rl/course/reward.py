@@ -41,7 +41,8 @@ class SharedRewardComposer(PhysicalRewardComposer):
             progress = JumpProgress(window['jump_reference_stage'], tasks.ascent_seen.clone(), latch.closed.clone(),
                                     tasks.landed_s.clone(), latch.lifted.clone(),
                                     tasks.peak_rise.clone() if self.supermimic_reward_extensions.jump_peak_completion else None,
-                                    tasks.active_rise.clone() if self.supermimic_reward_extensions.jump_peak_completion else None)
+                                    tasks.active_rise.clone() if self.supermimic_reward_extensions.jump_peak_completion else None,
+                                    (tasks.physical_id >= 0).clone())
         densities = physical_reward_densities(
             sample, reference,
             RewardHistory(window['dq'], window['action_cost'], window['action2_cost'], self._action_count),
@@ -171,7 +172,7 @@ def install_shared_reward(composer, *, verify_native=False, extensions: RewardEx
     if verify_native and extensions.active:
         raise ValueError("The native reward audit compares the unextended reward")
     if extensions.needs_jump_progress and jump_tasks is None:
-        raise ValueError('Jump flight/missed rewards require the native jump task owner')
+        raise ValueError('Request-aware rewards require the native jump task owner')
     composer.supermimic_reward_extensions = extensions
     composer.supermimic_jump_tasks = jump_tasks
     if extensions.needs_jump_progress:
@@ -193,6 +194,8 @@ def install_shared_reward(composer, *, verify_native=False, extensions: RewardEx
         if not extensions.jump_peak_completion:
             # An absent opt-in keeps old source receipts and replay contracts.
             receipt['extensions'].pop('jump_peak_completion')
+        if not extensions.stationary_quiet:
+            receipt['extensions'].pop('stationary_quiet')
     return receipt
 
 
