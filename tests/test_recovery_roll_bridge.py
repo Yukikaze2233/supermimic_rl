@@ -203,6 +203,30 @@ def test_fixed_evaluation_keeps_all_sixteen_original_poses(native_reset, tmp_pat
     assert [record['variant'] for record in value.pending.values()] == list(RECOVERY_NAMES)
 
 
+def test_explicit_fixed_bridges_use_real_placement_and_repeat_across_resets(native_reset, tmp_path):
+    value, _ = bridge(native_reset, tmp_path, evaluation=True)
+    value.fixed_variants = torch.arange(32) % len(RECOVERY_VARIANTS)
+    ids = torch.tensor([21, 16, 19, 4, 5, 15])
+    labels = value.fixed_variants[ids]
+    posture = torch.where(labels >= 16, 4 + (labels - 16) % 2, labels)
+    rng = value.curriculum.sampler.generator.get_state().clone()
+    first = value.pose(ids, posture, torch.zeros(len(ids)), torch.zeros(len(ids), 3))
+    second = value.pose(ids.flip(0), posture.flip(0), torch.zeros(len(ids)), torch.zeros(len(ids), 3))
+    for field in fields(first):
+        assert torch.equal(getattr(first, field.name), getattr(second, field.name).flip(0))
+    torch.testing.assert_close(value.roll(first.root_pose_xyzw[:3, 3:]),
+                               torch.tensor([BRIDGE_ROLL_RAD[i - 16] for i in labels[:3]]),
+                               atol=2e-7, rtol=0)
+    original = value.original_pose(ids[3:], posture[3:], torch.zeros(3), torch.zeros(3, 3))
+    for field in fields(first):
+        assert torch.equal(getattr(first, field.name)[3:], getattr(original, field.name))
+    assert first.geometry_ready.all()
+    assert torch.equal(value.curriculum.sampler.generator.get_state(), rng)
+    assert [value.pending[int(i)]['variant_id'] for i in ids] == labels.tolist()
+    with pytest.raises(ValueError, match='variant and native posture'):
+        value.pose(ids[:1], torch.tensor([4]), torch.zeros(1), torch.zeros(1, 3))
+
+
 def test_trace_distinguishes_variant_request_placement_and_actual_episode(native_reset, tmp_path):
     value, draw = bridge(native_reset, tmp_path)
     pose = value.pose(torch.arange(32), draw.recovery_posture, torch.zeros(32), torch.zeros(32, 3))

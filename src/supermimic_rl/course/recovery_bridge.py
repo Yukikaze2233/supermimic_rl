@@ -62,6 +62,9 @@ class RecoveryRollBridge:
         self.reset = native._recovery_reset
         self.original_pose = self.reset.pose
         self.evaluation = evaluation
+        # A fixed evaluation may explicitly name bridge poses. The native
+        # reset still receives its original left/right 90-degree base IDs.
+        self.fixed_variants = None
         self.trace_path = Path(log_directory) / 'recovery-births.jsonl'
         self.pending = {}
         self.cache = None
@@ -124,8 +127,13 @@ class RecoveryRollBridge:
                 or ids.unique().numel() != n or (ids < 0).any() or (ids >= self.reset.num_envs).any()
                 or not torch.isfinite(yaw).all() or not torch.isfinite(origins).all()):
             raise ValueError('Recovery birth IDs, postures, yaw and origins must match native layout')
-        variant = (posture.clone() if self.evaluation else
-                   self.curriculum.recovery_birth_variants(ids.to(self.curriculum.device)).cpu())
+        if self.evaluation and self.fixed_variants is not None:
+            variant = self.fixed_variants[ids].clone()
+        else:
+            variant = (posture.clone() if self.evaluation else
+                       self.curriculum.recovery_birth_variants(ids.to(self.curriculum.device)).cpu())
+        if ((variant < 0) | (variant >= len(RECOVERY_VARIANTS))).any():
+            raise ValueError('Unknown fixed recovery birth variant')
         bridge = variant >= len(RECOVERY_NAMES)
         selected = bridge.nonzero().flatten()
         ordinary = (~bridge).nonzero().flatten()
@@ -137,7 +145,8 @@ class RecoveryRollBridge:
             index = variant[selected] - len(RECOVERY_NAMES)
             if not torch.equal(posture[selected], 4 + index % 2):
                 raise ValueError('Side-roll birth variant and native posture differ')
-            if yaw[selected].eq(0).all() and origins[selected, 2].eq(0).all():
+            if (self.cache is not None and yaw[selected].eq(0).all()
+                    and origins[selected, 2].eq(0).all()):
                 index = index.to(self.reset.device)
                 value = type(self.cache)(*(getattr(self.cache, f.name).index_select(0, index)
                                           for f in fields(self.cache)))

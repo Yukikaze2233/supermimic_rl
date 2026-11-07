@@ -130,6 +130,50 @@ def test_family_selection_and_unassigned_coverage_are_explicit(adapter):
         FixedCourseScenarios(adapter, CourseEvaluationConfig(scenarios=("imagined_success",)))
 
 
+def test_fixed_bridge_cases_keep_native_ids_and_distinct_endpoint_labels(adapter):
+    from supermimic_rl.course.recovery_bridge import BRIDGE_VARIANTS, RECOVERY_VARIANTS
+    from transformer_rl.formal.tasks.recovery import RECOVERY_NAMES
+
+    with pytest.raises(ValueError, match='enabled birth geometry'):
+        FixedCourseScenarios(adapter, CourseEvaluationConfig(recovery_bridges=True))
+    adapter.curriculum = type(adapter.curriculum)(adapter.num_envs, config=replace(
+        adapter.curriculum.config, recovery_roll_bridge=True, recovery_postures=RECOVERY_NAMES))
+    bridge = SimpleNamespace(evaluation=False, fixed_variants=None)
+    adapter.env.supermimic_recovery_bridge = bridge
+    original = adapter.curriculum
+    rng = original.sampler.generator.get_state().clone()
+    plan = FixedCourseScenarios(adapter, CourseEvaluationConfig(family='RECOVERY', recovery_bridges=True))
+    assert plan.names == tuple('recovery_' + name for name in RECOVERY_VARIANTS)
+    plan.install()
+    try:
+        rows = torch.arange(adapter.num_envs)
+        sample = adapter.env._task_sampler(rows)
+        assert sample.draw.recovery_posture[:16].tolist() == list(range(16))
+        assert sample.draw.recovery_posture[16:22].tolist() == [4, 5, 4, 5, 4, 5]
+        assert bridge.fixed_variants.tolist() == (rows % 22).tolist()
+        report = plan.description()
+        assert report['recovery_birth_variants']['row_variant'][16:22] == list(BRIDGE_VARIANTS)
+        assert report['selection']['recovery_bridges'] is True
+        assert torch.equal(original.sampler.generator.get_state(), rng)
+        sample = adapter.env._task_sampler(torch.tensor([21, 4, 16]))
+        assert sample.draw.recovery_posture.tolist() == [5, 4, 4]
+    finally:
+        plan.close()
+    assert bridge.evaluation is False and bridge.fixed_variants is None
+    assert adapter.curriculum is original
+
+
+def test_fixed_bridge_selection_requires_installed_geometry_and_boolean_config(adapter):
+    with pytest.raises(ValueError, match='Invalid fixed'):
+        CourseEvaluationConfig(recovery_bridges=1)
+    adapter.curriculum = type(adapter.curriculum)(adapter.num_envs, config=replace(
+        adapter.curriculum.config, recovery_roll_bridge=True))
+    plan = FixedCourseScenarios(adapter, CourseEvaluationConfig(recovery_bridges=True, family='RECOVERY'))
+    with pytest.raises(ValueError, match='has not been installed'):
+        plan.install()
+    assert plan._restore == []
+
+
 def test_fixed_jump_evaluation_uses_the_selected_schedule_order_and_domain(adapter):
     from supermimic_rl.course.jump_first import JumpFirstCurriculum
 
