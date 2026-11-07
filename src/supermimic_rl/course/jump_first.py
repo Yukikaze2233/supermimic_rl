@@ -20,19 +20,26 @@ JUMP_FIRST_STAGE_NAMES = tuple(STAGE_NAMES[index] for index in STAGE_ORDER)
 
 
 class JumpFirstCommandPool(CommandPool):
-    """Jump requests keep their forward speed but never a yaw rate or a random heading.
+    """Preserve request motion and sample genuinely in-place spin segments.
 
     The native jump success needs 2 s of stable landing with a body angular
     speed of at most 0.5 rad/s, which no turning command can meet: in R8 the
     yaw part of the stable-landing test started failing when moving jumps
     (with the segment's yaw rate) entered the course. The evaluated moving
     jumps also command no yaw.
+
+    SCUT's spin pool samples small forward commands but its reward deadzone
+    treats them as zero. Our admitted-command contract has no such deadzone:
+    sample zero explicitly for SPIN_LOW/MID so the existing centering reward
+    is exercised. NORMAL micro-motion and gimbal translation remain distinct.
     """
 
     def sample(self, family, *args, **kwargs):
         draw = super().sample(family, *args, **kwargs)
         request = family == int(TaskFamily.REQUEST)
+        spin = (draw.kind == int(SegmentKind.SPIN_LOW)) | (draw.kind == int(SegmentKind.SPIN_MID))
         command = draw.command.clone()
+        command[:, 0] = torch.where(spin, 0., command[:, 0])
         command[:, 2] = torch.where(request, 0., command[:, 2])
         return replace(draw, command=command, heading_enabled=draw.heading_enabled & ~request)
 
@@ -80,6 +87,7 @@ def install_jump_first_command_pool(tasks, curriculum):
             'native_handoff_preserved': True, 'request_yaw_rate': 0.,
             'request_motion': 'birth_forward_held_v1',
             'request_motion_resume': 'cold_physics_reset_repopulates_cache',
+            'spin_motion': 'zero_forward_spin_segments_v1',
             'early_jump_domain': list(curriculum.initial_domain.jump_m)}
 
 
