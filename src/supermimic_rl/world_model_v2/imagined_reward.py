@@ -199,7 +199,7 @@ class OrdinaryFlatReward:
             if source['request_gimbal_exclusion'] != arbitration_receipt():
                 raise ValueError('Imagined chassis request ownership differs from its native source')
         self.jump_geometry = None
-        if self.extensions.jump_flight_clearance or self.extensions.jump_tuck:
+        if self.extensions.needs_flight_geometry:
             self.jump_geometry = JumpRewardGeometry(geometry)
             if source.get('reward_kernel', {}).get('jump_flight_geometry') != self.jump_geometry.receipt:
                 raise ValueError('Imagined jump reward geometry differs from its native source receipt')

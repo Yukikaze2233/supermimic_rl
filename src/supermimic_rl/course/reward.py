@@ -1,7 +1,7 @@
 """Use the shared reward kernel in one native composer without changing upstream files."""
 from __future__ import annotations
 
-from dataclasses import asdict, replace
+from dataclasses import replace
 import hashlib
 import inspect
 from pathlib import Path
@@ -224,8 +224,7 @@ def install_shared_reward(composer, *, verify_native=False, extensions: RewardEx
         raise ValueError('Request-aware rewards require the native jump task owner')
     if platform_landing is not None and (jump_tasks is None or platform_landing.tasks is not jump_tasks):
         raise ValueError('Platform reward evidence must share the native jump task owner')
-    needs_geometry = extensions.jump_flight_clearance or extensions.jump_tuck > 0
-    if needs_geometry != (flight_geometry is not None):
+    if extensions.needs_flight_geometry != (flight_geometry is not None):
         raise ValueError('Jump geometry producer must match the enabled geometry reward extensions')
     composer.supermimic_jump_geometry = flight_geometry
     composer.supermimic_reward_extensions = extensions
@@ -248,22 +247,7 @@ def install_shared_reward(composer, *, verify_native=False, extensions: RewardEx
     if flight_geometry is not None:
         receipt['jump_flight_geometry'] = flight_geometry.receipt
     if extensions.active:
-        receipt["extensions"] = asdict(extensions)
-        if not extensions.jump_flight_clearance:
-            receipt['extensions'].pop('jump_flight_clearance')
-        if not extensions.jump_tuck:
-            receipt['extensions'].pop('jump_tuck')
-        if not extensions.jump_peak_completion:
-            # An absent opt-in keeps old source receipts and replay contracts.
-            receipt['extensions'].pop('jump_peak_completion')
-        if not extensions.stationary_quiet:
-            receipt['extensions'].pop('stationary_quiet')
-        if not extensions.jump_physical_tail:
-            receipt['extensions'].pop('jump_physical_tail')
-        if not extensions.jump_extension_height_floor:
-            receipt['extensions'].pop('jump_extension_height_floor')
-        if not extensions.stair_support_transfer:
-            receipt['extensions'].pop('stair_support_transfer')
+        receipt["extensions"] = extensions.receipt()
     return receipt
 
 

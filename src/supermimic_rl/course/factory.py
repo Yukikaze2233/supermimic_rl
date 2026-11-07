@@ -156,7 +156,7 @@ def create_course(configuration):
         # jump task owner; the environment constructor leaves it unset.
         extensions = RewardExtensions(**configuration.get("reward_extensions", {}))
         jump_geometry = None
-        if extensions.jump_flight_clearance or extensions.jump_tuck:
+        if extensions.needs_flight_geometry:
             from .jump_reward_geometry import JumpRewardGeometry, NativeJumpRewardGeometry
 
             linkage_pin = configuration.get('jump_reward_linkage', {})

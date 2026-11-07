@@ -189,7 +189,8 @@ def test_native_installation_requests_latch_and_records_only_enabled_opt_in():
         receipt = install_shared_reward(setup('ordinary')[0], extensions=extension)
         expected = asdict(extension)
         for key in ('jump_peak_completion', 'stationary_quiet', 'jump_physical_tail',
-                    'jump_extension_height_floor', 'jump_flight_clearance', 'jump_tuck'):
+                    'jump_extension_height_floor', 'jump_flight_clearance', 'jump_tuck',
+                    'stair_support_transfer', 'jump_takeoff_extension'):
             expected.pop(key)
         assert receipt['extensions'] == expected
 

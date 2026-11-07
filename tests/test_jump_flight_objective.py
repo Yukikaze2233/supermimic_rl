@@ -27,12 +27,16 @@ def geometry(clearance=None, length=None, valid=None):
 
 
 def evaluate(value, *, case='jump_flight', extensions=None, ascent=True, closed=False,
-             stage=ReferenceStage.BALLISTIC, root_z=None):
+             stage=ReferenceStage.BALLISTIC, root_z=None, vertical_speed=None):
     composer, reference = setup(case)
     begin(composer, reference, torch.zeros(2, 6))
     physics = sample(composer, 1)
     if root_z is not None:
         physics = replace(physics, root_world_z_m=root_z)
+    if vertical_speed is not None:
+        velocity = physics.velocity_origin_world_m_s.clone()
+        velocity[:, 2] = torch.as_tensor(vertical_speed, dtype=velocity.dtype)
+        physics = replace(physics, velocity_origin_world_m_s=velocity)
     parameters = replace(RewardParameters.from_composer(composer), extensions=(extensions or
                          RewardExtensions(jump_flight=4., jump_flight_clearance=True, jump_tuck=1.7)))
     history = RewardHistory(composer._window['dq'], torch.zeros(2), torch.zeros(2), torch.zeros(2))
@@ -171,7 +175,80 @@ def test_geometry_cat_and_substeps_preserve_gradients_and_progress_coverage():
 
 
 @pytest.mark.parametrize('kwargs', [dict(jump_tuck=-1.), dict(jump_tuck=float('nan')),
+                                    dict(jump_takeoff_extension=-1.),
+                                    dict(jump_takeoff_extension=float('inf')),
                                   dict(jump_flight_clearance=1), dict(jump_flight_clearance=True)])
 def test_invalid_extension_configuration_is_rejected(kwargs):
     with pytest.raises(ValueError):
         RewardExtensions(**kwargs)
+
+
+TAKEOFF = RewardExtensions(jump_takeoff_extension=1.5)
+
+
+def takeoff(value, **kwargs):
+    # Row 0 has a 0.2 m/s upward reference (push window); row 1 a downward one.
+    kwargs = {'case': 'jump_takeoff', 'ascent': False, 'stage': ReferenceStage.EXTENSION,
+              'vertical_speed': (1., 1.), 'extensions': TAKEOFF, **kwargs}
+    return evaluate(value, **kwargs)
+
+
+def test_takeoff_extension_pays_source_normalized_extension_inside_the_push_window():
+    base = geometry()
+    partial = takeoff(base)
+    torch.testing.assert_close(partial.positive['jump_takeoff_extension'],
+                               torch.tensor([1.5 * .7, 0.], dtype=torch.float64))
+    full = takeoff(replace(base, leg_length_m=base.minimum_leg_length_m + base.leg_length_range_m))
+    torch.testing.assert_close(full.positive['jump_takeoff_extension'], torch.tensor([1.5, 0.], dtype=torch.float64))
+    beyond = takeoff(replace(base, leg_length_m=base.minimum_leg_length_m + 1.2 * base.leg_length_range_m))
+    torch.testing.assert_close(beyond.positive['jump_takeoff_extension'], full.positive['jump_takeoff_extension'])
+    # One short leg is not hidden by its fully extended partner.
+    uneven = takeoff(replace(base, leg_length_m=base.minimum_leg_length_m
+                             + base.leg_length_range_m * torch.tensor([[1., .4]], dtype=torch.float64)))
+    torch.testing.assert_close(uneven.positive['jump_takeoff_extension'][0],
+                               torch.tensor(1.5 * .7, dtype=torch.float64))
+    assert not partial.invalid.any()
+    torch.testing.assert_close(partial.errors['jump_takeoff_extension_fraction'],
+                               torch.tensor([.7, 0.], dtype=torch.float64))
+
+
+@pytest.mark.parametrize('kwargs', [
+    dict(vertical_speed=(.1, .1)),                                   # supported but not rising
+    dict(case='jump_flight', stage=ReferenceStage.BALLISTIC),       # already airborne
+    dict(closed=True),                                               # first real flight already landed
+    dict(case='ordinary'), dict(case='recovery'),
+])
+def test_takeoff_extension_never_pays_outside_a_rising_supported_push(kwargs):
+    base = geometry()
+    length = base.leg_length_m.clone().requires_grad_()
+    result = takeoff(replace(base, leg_length_m=length), **kwargs)
+    score = result.positive['jump_takeoff_extension'].sum()
+    assert score == 0
+    torch.testing.assert_close(torch.autograd.grad(score, length)[0], torch.zeros_like(length))
+
+
+def test_takeoff_extension_gradient_lengthens_only_pushing_rows():
+    base = geometry()
+    length = base.leg_length_m.clone().requires_grad_()
+    score = takeoff(replace(base, leg_length_m=length)).positive['jump_takeoff_extension'].sum()
+    gradient, = torch.autograd.grad(score, length)
+    torch.testing.assert_close(gradient[0], 1.5 / 2 / base.leg_length_range_m[0])
+    assert not gradient[1].any()
+
+
+def test_takeoff_extension_requires_its_producer_and_reports_bad_geometry():
+    with pytest.raises(ValueError, match='leg geometry producer'):
+        takeoff(None)
+    base = geometry()
+    bad = takeoff(replace(base, leg_length_m=torch.tensor([[float('nan'), .3], [.3, .3]], dtype=torch.float64)))
+    assert bad.invalid.tolist() == [True, False]
+    assert bad.positive['jump_takeoff_extension'][0] == 0
+
+
+def test_takeoff_extension_is_an_opt_in_receipt_and_geometry_requirement():
+    assert not RewardExtensions().needs_flight_geometry
+    assert 'jump_takeoff_extension' not in RewardExtensions(jump_push=2.).receipt()
+    assert TAKEOFF.needs_flight_geometry and TAKEOFF.needs_jump_progress and TAKEOFF.active
+    assert TAKEOFF.receipt()['jump_takeoff_extension'] == 1.5
+    assert RewardExtensions(jump_tuck=1.7).needs_flight_geometry
+    assert RewardExtensions(jump_flight=4., jump_flight_clearance=True).needs_flight_geometry
