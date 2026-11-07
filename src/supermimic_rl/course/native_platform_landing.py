@@ -20,6 +20,22 @@ CLEARANCE_REFERENCE = 'whole_cylinder_minimum_world_z_gap_over_own_terrain_footp
 
 
 @dataclass(frozen=True)
+class PlatformLandingInterval:
+    """Four actual physics ticks and their post-update landing histories.
+
+    Heights retain native world Z, including unknown NaN values when support
+    cannot be certified. The evidence is not inferred from compact load labels.
+    """
+
+    evidence: PlatformLandingEvidence
+    state: PlatformLandingState
+
+    def validate(self, count, device):
+        self.evidence.validate((count, 4), device)
+        self.state.validate((count, 4), device)
+
+
+@dataclass(frozen=True)
 class PlatformContactPatches:
     """Active native patches, retaining exact environment/body ownership."""
 
@@ -198,13 +214,43 @@ class NativePlatformLanding:
         self.last_evidence = None
         self._packet, self._packet_tick = None, None
         self._patches = []
+        # No interval buffers or per-tick copies unless a collector opts in.
+        self._interval = None
 
     def capture(self):
         return PlatformLandingState(**{field.name: getattr(self.state, field.name).clone()
                                       for field in fields(self.state)})
 
     def reset(self, mask):
+        # Auto-reset happens before the outer collector receives the completed
+        # transition. Its four pre-reset tick records must survive this reset.
         self.state = self.state.reset(mask)
+
+    def begin_interval(self):
+        """Start recording one four-tick policy step before native stepping."""
+        if self._interval is not None:
+            raise RuntimeError('Capture or abort the existing platform interval before beginning another')
+        self._interval = []
+        self._interval_start_tick = self.native._physical_tick
+
+    def abort_interval(self):
+        """Discard only an interrupted recording, without changing task state."""
+        self._interval = None
+
+    def capture_interval(self):
+        """Consume the completed recording, including after native auto-reset."""
+        if self._interval is None or len(self._interval) != 4:
+            raise RuntimeError('Platform interval capture requires exactly four observed physics ticks')
+        evidence = PlatformLandingEvidence(**{
+            field.name: torch.stack([getattr(tick[0], field.name) for tick in self._interval], 1)
+            for field in fields(PlatformLandingEvidence)})
+        state = PlatformLandingState(**{
+            field.name: torch.stack([getattr(tick[1], field.name) for tick in self._interval], 1)
+            for field in fields(PlatformLandingState)})
+        result = PlatformLandingInterval(evidence, state)
+        result.validate(len(self.state.request_id), self.state.request_id.device)
+        self._interval = None
+        return result
 
     def _patch(self, owner, name, callback):
         self._patches.append((owner, name, name in vars(owner), vars(owner).get(name), callback))
@@ -240,6 +286,9 @@ class NativePlatformLanding:
     @torch.no_grad()
     def observe(self, *args, **kwargs):
         native, tick = self.native, self.native._physical_tick
+        if self._interval is not None and (
+                len(self._interval) >= 4 or tick != self._interval_start_tick + len(self._interval) + 1):
+            raise RuntimeError('Platform recording requires one observation per consecutive physics tick')
         sample, measured_state = native._last_sample, native._last_state
         if sample is None or measured_state is None:
             raise RuntimeError('Platform physics must follow the current native substep sample')
@@ -264,4 +313,8 @@ class NativePlatformLanding:
         # Call the unique success/payment owner once, then preserve its history.
         self.state = self._observe(*args, **kwargs, platform_state=self.state,
                                    platform_evidence=self.last_evidence)
+        if self._interval is not None:
+            evidence = PlatformLandingEvidence(**{field.name: getattr(self.last_evidence, field.name).clone()
+                                                  for field in fields(PlatformLandingEvidence)})
+            self._interval.append((evidence, self.capture()))
         return self.state

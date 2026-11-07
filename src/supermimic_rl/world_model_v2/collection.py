@@ -16,7 +16,7 @@ from .stair_source import TOF_RECORD_FIELDS, StairSourceState
 from .jump_task import (JUMP_FLIGHT_LATCH_RECORD_FIELDS, JUMP_RECORD_FIELDS, JUMP_TRIGGER_RECORD_FIELDS,
                         JumpTaskState)
 from .recovery_task import RECOVERY_RECORD_FIELDS, RecoveryTaskState
-from .platform_records import PLATFORM_RECORD_FIELDS, PlatformRecordState
+from .platform_records import PLATFORM_RECORD_FIELDS, PlatformRecordState, encode_platform_interval
 
 
 def _schema_action_bounds(schema) -> tuple[float, ...]:
@@ -31,7 +31,7 @@ class Collector:
                  record_terrain: bool = False, record_tasks: bool = False, record_stairs: bool = False,
                  record_stair_source: bool = False, record_jumps: bool = False, record_recovery: bool = False,
                  course_coordinate: int | None = None, course_coordinate_at=None,
-                 record_platform: bool = False, platform_landing_capture=None):
+                 record_platform: bool = False, platform_landing=None):
         if environment.current is None:
             raise ValueError('Reset the native environment before constructing its collector')
         if action_noise_std < 0 or history_length < 1 or capacity_steps < 1:
@@ -43,13 +43,18 @@ class Collector:
         self.environment, self.decision = environment, decision
         if type(record_platform) is not bool or (record_platform and not record_jumps):
             raise ValueError('Platform collection requires an explicit opt-in and complete jump task records')
-        if not record_platform and platform_landing_capture is not None:
-            raise ValueError('A platform landing capture requires opt-in platform collection')
+        if not record_platform and platform_landing is not None:
+            raise ValueError('A platform landing owner requires opt-in platform collection')
         if record_platform:
-            caller = getattr(environment.adapter.env, 'supermimic_platform_intent', None)
-            if not callable(getattr(caller, 'capture', None)) or not callable(platform_landing_capture):
+            native = environment.adapter.env
+            caller = getattr(native, 'supermimic_platform_intent', None)
+            if (not callable(getattr(caller, 'capture', None))
+                    or getattr(platform_landing, 'native', None) is not native
+                    or getattr(native, 'supermimic_platform_landing', None) is not platform_landing
+                    or not all(callable(getattr(platform_landing, name, None)) for name in
+                               ('capture', 'begin_interval', 'capture_interval', 'abort_interval'))):
                 raise ValueError('Platform collection requires the native caller and actual landing owner capture')
-        self.record_platform, self.platform_landing_capture = record_platform, platform_landing_capture
+        self.record_platform, self.platform_landing = record_platform, platform_landing
         layout_options = {'record_platform': True} if record_platform else {}
         if record_terrain:
             layout_options['record_terrain'] = True
@@ -148,7 +153,7 @@ class Collector:
             source = StairSourceState.capture(env.adapter.env) if self.record_stair_source else None
             jump = JumpTaskState.capture(env.adapter.env) if self.record_jumps else None
             recovery = RecoveryTaskState.capture(env.adapter.env) if self.record_recovery else None
-            platform = (PlatformRecordState.capture(env.adapter.env, self.platform_landing_capture,
+            platform = (PlatformRecordState.capture(env.adapter.env, self.platform_landing.capture,
                         count=env.num_envs, device=env.device) if self.record_platform else None)
             action, estimate = self.decision(self.history)
             teacher_rows = getattr(self.decision, 'teacher_rows', None)
@@ -163,7 +168,17 @@ class Collector:
                 # Keeping it outside replay avoids duplicating it per environment.
                 generator = env.adapter.env._terrain_course.tof_trigger.generator
                 on_source_rng(self.steps, generator.get_state().clone())
-            transition = env.step((action + noise).clamp(-self.action_bounds, self.action_bounds))
+            if self.record_platform:
+                self.platform_landing.begin_interval()
+                try:
+                    transition = env.step((action + noise).clamp(-self.action_bounds, self.action_bounds))
+                    platform_ticks = encode_platform_interval(self.platform_landing.capture_interval(),
+                                                               count=env.num_envs, device=env.device)
+                except BaseException:
+                    self.platform_landing.abort_interval()
+                    raise
+            else:
+                transition = env.step((action + noise).clamp(-self.action_bounds, self.action_bounds))
             record = self.layout.encode(transition)
             if task is not None:
                 record['motion_task'] = task
@@ -182,6 +197,7 @@ class Collector:
                 record['recovery_record_valid'] = task_estimate.new_ones(env.num_envs, 1)
             if platform is not None:
                 record.update(platform.record())
+                record.update(platform_ticks)
             if self.replay is None:
                 self.replay = CompactReplay({name: tuple(value.shape[1:]) for name, value in record.items()},
                                              env.num_envs, self.capacity, env.device)

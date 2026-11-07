@@ -7,13 +7,15 @@ import torch
 
 from supermimic_rl.adapters.substeps import substep_fields
 from supermimic_rl.contracts import Field, StateSchema
-from supermimic_rl.course.jump_physics import PlatformLandingPhase, PlatformLandingState
+from supermimic_rl.course.jump_physics import PlatformLandingEvidence, PlatformLandingPhase, PlatformLandingState
+from supermimic_rl.course.native_platform_landing import PlatformLandingInterval
 from supermimic_rl.course.platform_intent import PlatformIntentPhase, PlatformIntentState
 from supermimic_rl.world_model_v2.collection import Collector
 from supermimic_rl.world_model_v2.layout import SnapshotLayout
 from supermimic_rl.world_model_v2.physical import VELOCITY_JOINTS
 from supermimic_rl.world_model_v2.platform_records import (
-    PLATFORM_RECORD_DTYPES, PLATFORM_RECORD_FIELDS, PlatformRecordState,
+    PLATFORM_RECORD_DTYPES, PLATFORM_RECORD_FIELDS, PLATFORM_RECORD_VERSION, PlatformRecordState,
+    decode_platform_interval, encode_platform_interval,
 )
 from supermimic_rl.world_model_v2.records import CONTACT_BODIES, PASSIVE_KNEE_JOINTS, RecordSpec, TICK_LABEL_DIM
 from supermimic_rl.world_model_v2.replay import CompactReplay
@@ -34,6 +36,70 @@ def platform_state():
     landing = PlatformLandingState(torch.tensor([-1, 2**54 + 17]), torch.tensor([0, 3]),
         torch.tensor([0, int(PlatformLandingPhase.TARGET_SINGLE_WHEEL)]))
     return PlatformRecordState(intent, landing, torch.ones(2, 1, dtype=torch.bool))
+
+
+def platform_interval():
+    flags = torch.tensor([[[False, True, False, True, True, False, False, False, True]] * 4,
+                          [[True, True, True, False, False, False, False, False, False],
+                           [True, False, False, False, False, False, False, False, False],
+                           [True, True, False, True, False, True, False, False, False],
+                           [True, True, False, True, True, True, True, False, True]]])
+    flags[0, :2, -1] = False
+    height = torch.tensor([[torch.nan, torch.nan, .4, .4],
+                           [torch.nan, torch.nan, torch.nan, .6]])
+    return PlatformLandingInterval(PlatformLandingEvidence(
+        flags[..., 0], flags[..., 1], flags[..., 2], flags[..., 3:5], flags[..., 5:7],
+        flags[..., 7], flags[..., 8], height), PlatformLandingState(
+            torch.tensor([[-1] * 4, [2**54 + 17] * 4]), torch.tensor([[0] * 4, [1, 1, 1, 1]]),
+            torch.tensor([[0] * 4, [0, 5, 5, 5]])))
+
+
+def test_interval_codec_preserves_actual_ticks_world_height_and_unknowns():
+    interval = platform_interval()
+    record = encode_platform_interval(interval, count=2, device='cpu')
+    decoded = decode_platform_interval(record)
+    assert PLATFORM_RECORD_VERSION == 2
+    assert record['platform_evidence_ticks'].shape == (2, 4, 9)
+    assert record['platform_evidence_ticks'][1].tolist() == [
+        [True, True, True, False, False, False, False, False, False],
+        [True, False, False, False, False, False, False, False, False],
+        [True, True, False, True, False, True, False, False, False],
+        [True, True, False, True, True, True, True, False, True]]
+    for name, expected in vars(interval.evidence).items():
+        torch.testing.assert_close(getattr(decoded.evidence, name), expected, rtol=0, atol=0, equal_nan=True)
+    for name, expected in vars(interval.state).items():
+        torch.testing.assert_close(getattr(decoded.state, name), expected, rtol=0, atol=0)
+    record['platform_landing_state_ticks'].zero_()
+    record['platform_evidence_ticks'].zero_()
+    assert decoded.state.request_id[1, 0] == 2**54 + 17
+    assert decoded.evidence.full_body_clear[1, 0]
+    with pytest.raises(ValueError, match='cannot be inferred'):
+        decode_platform_interval({'ticks': torch.zeros(2, 4, 56)})
+    with pytest.raises(ValueError, match='version'):
+        decode_platform_interval(record, version=1)
+
+
+class LandingOwner:
+    def __init__(self, native, live):
+        self.native, self.live = native, live
+        self.pending, self.begins, self.aborts = None, 0, 0
+
+    def capture(self):
+        return self.live.landing
+
+    def begin_interval(self):
+        assert self.pending is None
+        self.begins += 1
+        self.pending = platform_interval()
+
+    def capture_interval(self):
+        assert self.pending is not None
+        result, self.pending = self.pending, None
+        return result
+
+    def abort_interval(self):
+        self.aborts += 1
+        self.pending = None
 
 
 def boundary():
@@ -66,7 +132,7 @@ def test_inactive_and_unknown_are_distinct_and_snapshots_do_not_alias():
     with pytest.raises(ValueError, match='unknown, not inactive'):
         PlatformRecordState.decode({})
     with pytest.raises(ValueError, match='version'):
-        PlatformRecordState.decode(record, version=2)
+        PlatformRecordState.decode(record, version=1)
     state.landing.request_id.fill_(-1)
     state.intent.bound_request_id.fill_(-1)
     assert captured.landing.request_id[1] == 2**54 + 17
@@ -94,7 +160,8 @@ def test_replay_roundtrip_and_sampling_preserve_ids_clocks_unknown_and_false_con
     fields = {'frame': (45,), **PLATFORM_RECORD_FIELDS}
     replay = CompactReplay(fields, 2, 4, 'cpu')
     record = {'frame': torch.zeros(2, 45), **platform_state().record(),
-              'contact_valid_ticks': torch.tensor([[[True], [False], [True], [False]]]).expand(2, -1, -1)}
+              'contact_valid_ticks': torch.tensor([[[True], [False], [True], [False]]]).expand(2, -1, -1),
+              **encode_platform_interval(platform_interval(), count=2, device='cpu')}
     record['platform_record_valid'][0] = False
     for step in range(3):
         replay.add(record, boundary())
@@ -102,14 +169,16 @@ def test_replay_roundtrip_and_sampling_preserve_ids_clocks_unknown_and_false_con
     restored = CompactReplay.from_state_dict(payload)
     audited = CompactReplay.from_state_dict(payload, read_only=True)
     for name, expected in payload['storage'].items():
-        torch.testing.assert_close(restored.data[name][:3], expected, rtol=0, atol=0)
-        torch.testing.assert_close(audited.data[name], expected, rtol=0, atol=0)
+        torch.testing.assert_close(restored.data[name][:3], expected, rtol=0, atol=0, equal_nan=True)
+        torch.testing.assert_close(audited.data[name], expected, rtol=0, atol=0, equal_nan=True)
     sampled = restored.sample_windows(4, 2, generator=torch.Generator().manual_seed(9))
     for name, dtype in PLATFORM_RECORD_DTYPES.items():
         assert sampled[name].dtype == dtype
     assert (sampled['platform_intent_ids'][..., 2] == 2**54 + 17).any()
     assert (sampled['platform_intent_clock'] == 1_000_000.01).any()
     assert not sampled['contact_valid_ticks'][..., 1, :].any()
+    assert torch.isnan(sampled['platform_landing_world_height_ticks'][..., :2, :]).all()
+    assert sampled['valid'].all()  # Unknown support height does not invalidate the transition.
     with pytest.raises(ValueError, match='exact shape'):
         replay.add({key: value for key, value in record.items() if key != 'platform_record_valid'}, boundary())
     with pytest.raises(ValueError, match='native replay dtype'):
@@ -215,6 +284,7 @@ def collection_fixture(monkeypatch):
     live = platform_state()
     native.supermimic_platform_intent = SimpleNamespace(capture=live.intent.record)
     env.adapter = SimpleNamespace(env=native)
+    native.supermimic_platform_landing = LandingOwner(native, live)
     monkeypatch.setattr(MotionTask, 'capture', lambda _: torch.zeros(2, 40))
     monkeypatch.setattr(StairTaskState, 'capture', lambda _: SimpleNamespace(record=lambda: {}))
     monkeypatch.setattr(StairSourceState, 'capture', lambda _: SimpleNamespace(record=lambda: {}))
@@ -248,7 +318,7 @@ def test_collector_captures_start_before_substeps_and_auto_reset(monkeypatch):
 
     env.step = step
     collector = Collector(env, lambda history: (torch.zeros(2, 6), torch.zeros(2, 5)),
-        capacity_steps=3, **OPTIONS, record_platform=True, platform_landing_capture=lambda: live.landing)
+        capacity_steps=3, **OPTIONS, record_platform=True, platform_landing=env.adapter.env.supermimic_platform_landing)
     collector.collect(2)
     data = collector.replay.data
     assert data['platform_intent_ids'][0, 1, 2] == 2**54 + 17
@@ -257,6 +327,10 @@ def test_collector_captures_start_before_substeps_and_auto_reset(monkeypatch):
     assert data['platform_landing_ids'][1, 1, 0] == -1
     assert data['platform_record_valid'][:2].all()
     assert not data['contact_valid_ticks'][:2, :, 1::2].any()
+    assert data['platform_landing_state_ticks'][0, 1, :, 0].tolist() == [2**54 + 17] * 4
+    assert data['platform_evidence_ticks'][0, 1, 0, 2]
+    assert not data['platform_evidence_ticks'][0, 1, 1, 1]
+    assert env.adapter.env.supermimic_platform_landing.begins == 2
 
 
 def test_collector_missing_capture_and_legacy_replay_are_explicit_errors(monkeypatch):
@@ -265,8 +339,80 @@ def test_collector_missing_capture_and_legacy_replay_are_explicit_errors(monkeyp
     with pytest.raises(ValueError, match='actual landing owner'):
         Collector(env, decide, capacity_steps=3, **OPTIONS, record_platform=True)
     with pytest.raises(ValueError, match='requires opt-in'):
-        Collector(env, decide, capacity_steps=3, platform_landing_capture=lambda: live.landing)
+        Collector(env, decide, capacity_steps=3, platform_landing=env.adapter.env.supermimic_platform_landing)
     legacy = CompactReplay({'frame': (45,)}, 2, 3, 'cpu')
     with pytest.raises(ValueError, match='legacy state is not known inactive'):
         Collector(env, decide, capacity_steps=3, **OPTIONS, record_platform=True,
-                  platform_landing_capture=lambda: live.landing, replay=legacy)
+                  platform_landing=env.adapter.env.supermimic_platform_landing, replay=legacy)
+
+
+def test_collector_cannot_bind_a_different_native_owner(monkeypatch):
+    env, live = collection_fixture(monkeypatch)
+    foreign = LandingOwner(SimpleNamespace(), live)
+    with pytest.raises(ValueError, match='actual landing owner'):
+        Collector(env, lambda _: None, capacity_steps=3, **OPTIONS, record_platform=True,
+                  platform_landing=foreign)
+
+
+def test_collector_aborts_partial_record_on_step_failure_without_rolling_back_native(monkeypatch):
+    env, live = collection_fixture(monkeypatch)
+    owner = env.adapter.env.supermimic_platform_landing
+
+    def fail(action):
+        assert owner.pending is not None
+        live.landing.phase.fill_(int(PlatformLandingPhase.MISSED))
+        raise RuntimeError('physical step interrupted')
+
+    env.step = fail
+    collector = Collector(env, lambda _: (torch.zeros(2, 6), torch.zeros(2, 5)),
+        capacity_steps=3, **OPTIONS, record_platform=True, platform_landing=owner)
+    with pytest.raises(RuntimeError, match='physical step interrupted'):
+        collector.collect(1)
+    assert owner.pending is None and owner.aborts == 1
+    assert collector.steps == 0 and collector.replay is None
+    assert live.landing.phase.eq(int(PlatformLandingPhase.MISSED)).all()
+
+
+def test_diagnostic_nan_height_does_not_enter_motion_fit_or_current_critic():
+    from copy import deepcopy
+    from support.world_v2.jump_imagination import fixture
+    from supermimic_rl.world_model_v2.records import decode_memory, decode_physical
+
+    learner, start, _ = fixture()
+    start['end_physical'] = start['physical'].clone()
+    windows = {name: value[:, None] for name, value in start.items() if isinstance(value, torch.Tensor)}
+    windows['valid'] = torch.ones(2, 1, dtype=torch.bool)
+    extra = {**platform_state().record(),
+        'contact_valid_ticks': torch.ones(2, 4, 1, dtype=torch.bool),
+        **encode_platform_interval(platform_interval(), count=2, device='cpu')}
+    recorded = {**windows, **{name: value[:, None] for name, value in extra.items()}}
+    assert torch.isnan(recorded['platform_landing_world_height_ticks']).any()
+    expected_fit, actual_fit = deepcopy(learner.fit), learner.fit
+    expected_fit.observe(windows)
+    actual_fit.observe(recorded)
+    for name in ('input_norm', 'output_norm'):
+        expected = getattr(expected_fit.model.motion, name).state_dict()
+        actual = getattr(actual_fit.model.motion, name).state_dict()
+        for key in expected:
+            torch.testing.assert_close(actual[key], expected[key], rtol=0, atol=0)
+    expected_terms, actual_terms = expected_fit.terms(windows), actual_fit.terms(recorded)
+    for name in ('state', 'ticks', 'per_step_state', 'terrain_truncated_fraction'):
+        torch.testing.assert_close(getattr(actual_terms, name), getattr(expected_terms, name), rtol=0, atol=0)
+        assert torch.isfinite(getattr(actual_terms, name)).all()
+
+    def features(value):
+        return learner.imagination.critic_features(
+            decode_physical(value['physical']), value['height'], value['scan'],
+            decode_memory(value['memory']), value['goal'], value['sim_context'],
+            value['failure_memory'], value['failure_conditions'],
+            torch.cat((value['reward_memory'], value['support_memory']), -1), value.get('motion_task'),
+            **learner.imagination.task_features(value))
+
+    plain, extended = features(start), features({**start, **extra})
+    assert torch.isfinite(extended).all()
+    torch.testing.assert_close(extended, plain, rtol=0, atol=0)
+    expected_norm = deepcopy(learner.critic.norm)
+    expected_norm.update(plain)
+    learner.critic.norm.update(extended)
+    for name, value in expected_norm.state_dict().items():
+        torch.testing.assert_close(learner.critic.norm.state_dict()[name], value, rtol=0, atol=0)

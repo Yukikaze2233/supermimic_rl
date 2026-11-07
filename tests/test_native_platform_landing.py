@@ -295,3 +295,96 @@ def test_wrong_clearance_contract_cannot_certify_departure(tmp_path, kind):
     tick(native, vz=.4)
     assert not observer.last_evidence.full_body_clear.item()
     assert not observer.last_evidence.measurement_valid.item()
+
+
+def test_interval_records_each_true_tick_and_survives_native_auto_reset(tmp_path):
+    native, observer, gap = native_fixture(tmp_path)
+    backend = native._contact_loads.view._view
+    observer.begin_interval()
+    backend.loaded = False
+    gap[0] = cylinder_gap(z=.45)
+    tick(native, vz=.4)
+    tick(native, vz=.4)
+    backend.loaded = True
+    gap[0] = cylinder_gap()
+    tick(native)
+    tick(native)
+    from transformer_rl.formal.tasks.curriculum import TaskFamily
+    reset_task = SimpleNamespace(mode=torch.zeros(1, dtype=torch.long),
+        draw=SimpleNamespace(family=torch.tensor([int(TaskFamily.REQUEST)]), nominal=torch.tensor([False]),
+                             trajectory_kind=torch.zeros(1, dtype=torch.long)),
+        terrain_kind=torch.zeros(1, dtype=torch.long), request_height_m=torch.tensor([.2]),
+        command=torch.tensor([[0., 0., 0., .32]]))
+    native._terrain_course.tasks.reset(torch.tensor([0]), reset_task, native.time)
+    assert observer.state.request_id.item() == -1
+    interval = observer.capture_interval()
+    assert interval.evidence.full_body_clear.tolist() == [[True, True, False, False]]
+    assert interval.evidence.target_wheel_touch.tolist() == [[[False, False]] * 2 + [[True, True]] * 2]
+    assert interval.state.request_id.tolist() == [[7] * 4]
+    assert interval.state.phase[0, 1:].tolist() == [int(PlatformLandingPhase.FLIGHT),
+        int(PlatformLandingPhase.TARGET_BOTH_WHEELS), int(PlatformLandingPhase.TARGET_BOTH_WHEELS)]
+    assert torch.isnan(interval.evidence.landing_world_height[0, :2]).all()
+    torch.testing.assert_close(interval.evidence.landing_world_height[0, 2:], torch.full((2,), .52))
+    observer.last_evidence.target_wheel_touch.zero_()
+    observer.state.phase.fill_(99)
+    assert interval.evidence.target_wheel_touch[0, 3].all()
+    assert interval.state.phase[0, 3].item() == PlatformLandingPhase.TARGET_BOTH_WHEELS
+    assert backend.calls == 4  # Recording did not add backend reads.
+    with pytest.raises(RuntimeError, match='exactly four'):
+        observer.capture_interval()
+
+
+def test_interval_keeps_unknown_measurement_tick_without_fabricating_contact(tmp_path):
+    native, observer, _ = native_fixture(tmp_path)
+    observer.begin_interval()
+    tick(native)
+    native._physical_tick += 1
+    native._terrain_course.tasks.observe_physics(torch.full((1, 2), 20.), torch.zeros(1),
+        torch.zeros(1), torch.tensor([.52]), angular_speed_rad_s=torch.zeros(1))
+    tick(native)
+    tick(native)
+    interval = observer.capture_interval()
+    assert interval.evidence.measurement_valid.tolist() == [[True, False, True, True]]
+    assert torch.isnan(interval.evidence.landing_world_height[0, 1])
+    assert not interval.evidence.target_wheel_touch[0, 1].any()
+    assert not interval.evidence.full_body_clear[0, 1]
+
+
+@pytest.mark.parametrize('bad_tick', ['duplicate', 'skipped', 'fifth'])
+def test_interval_rejects_wrong_tick_sequence_before_double_updating(bad_tick, tmp_path):
+    native, observer, _ = native_fixture(tmp_path)
+    observer.begin_interval()
+    for _ in range(4 if bad_tick == 'fifth' else 1):
+        tick(native)
+    saved = {name: value.clone() for name, value in vars(native._terrain_course.tasks).items()
+             if isinstance(value, torch.Tensor)}
+    if bad_tick == 'skipped':
+        native._physical_tick += 2
+    elif bad_tick == 'fifth':
+        native._physical_tick += 1
+    with pytest.raises(RuntimeError, match='consecutive physics tick'):
+        observer.observe(torch.full((1, 2), 20.), torch.zeros(1), torch.zeros(1),
+                         torch.tensor([.52]), angular_speed_rad_s=torch.zeros(1))
+    for name, value in saved.items():
+        torch.testing.assert_close(getattr(native._terrain_course.tasks, name), value, rtol=0, atol=0)
+    observer.abort_interval()
+    assert observer._interval is None
+
+
+def test_partial_interval_requires_explicit_abort_and_default_path_does_not_record(tmp_path):
+    native, observer, _ = native_fixture(tmp_path)
+    tick(native)
+    assert observer._interval is None
+    observer.begin_interval()
+    tick(native)
+    with pytest.raises(RuntimeError, match='Capture or abort'):
+        observer.begin_interval()
+    with pytest.raises(RuntimeError, match='exactly four'):
+        observer.capture_interval()
+    state = observer.capture()
+    observer.abort_interval()
+    torch.testing.assert_close(observer.state.phase, state.phase, rtol=0, atol=0)
+    observer.begin_interval()
+    for _ in range(4):
+        tick(native)
+    assert observer.capture_interval().state.phase.shape == (1, 4)

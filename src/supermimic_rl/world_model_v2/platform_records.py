@@ -12,24 +12,80 @@ import torch
 from torch import Tensor
 
 from ..course.jump_physics import PlatformLandingState
+from ..course.native_platform_landing import PlatformLandingInterval
 from ..course.platform_intent import (
     PLATFORM_INTENT_RECORD_DTYPES, PLATFORM_INTENT_RECORD_FIELDS, PlatformIntentState,
 )
 
 
-PLATFORM_RECORD_VERSION = 1
+PLATFORM_RECORD_VERSION = 2
 PLATFORM_STATE_RECORD_FIELDS = {
     **PLATFORM_INTENT_RECORD_FIELDS,
     'platform_landing_ids': (3,),  # Request ID, consecutive full-clear ticks, landing phase.
     'platform_record_valid': (1,),
 }
-PLATFORM_RECORD_FIELDS = {**PLATFORM_STATE_RECORD_FIELDS, 'contact_valid_ticks': (4, 1)}
+PLATFORM_INTERVAL_RECORD_FIELDS = {
+    'platform_evidence_ticks': (4, 9),
+    'platform_landing_world_height_ticks': (4, 1),
+    'platform_landing_state_ticks': (4, 3),
+}
+PLATFORM_RECORD_FIELDS = {**PLATFORM_STATE_RECORD_FIELDS, 'contact_valid_ticks': (4, 1),
+                          **PLATFORM_INTERVAL_RECORD_FIELDS}
 PLATFORM_RECORD_DTYPES = {
     **PLATFORM_INTENT_RECORD_DTYPES,
     'platform_landing_ids': torch.int64,
     'platform_record_valid': torch.bool,
     'contact_valid_ticks': torch.bool,
+    'platform_evidence_ticks': torch.bool,
+    'platform_landing_world_height_ticks': torch.float32,
+    'platform_landing_state_ticks': torch.int64,
 }
+
+
+def encode_platform_interval(interval: PlatformLandingInterval, *, count: int, device):
+    """Record actual evidence; never substitute estimated loads or a last tick.
+
+    Boolean columns: selected, measurement-valid, full-clear, left/right wheel
+    touch, left/right target touch, non-wheel contact, legitimate support.
+    Heights remain world Z and may be NaN when legitimate support is false.
+    """
+    if not isinstance(interval, PlatformLandingInterval):
+        raise ValueError('Platform collection needs the actual four-tick landing interval')
+    interval.validate(count, torch.device(device))
+    evidence, state = interval.evidence, interval.state
+    if evidence.landing_world_height.dtype != torch.float32:
+        raise ValueError('Native platform landing height records require float32 world Z')
+    flags = torch.cat((evidence.selected[..., None], evidence.measurement_valid[..., None],
+        evidence.full_body_clear[..., None], evidence.wheel_touch, evidence.target_wheel_touch,
+        evidence.nonwheel_contact[..., None], evidence.landing_support_valid[..., None]), -1)
+    return {'platform_evidence_ticks': flags,
+            'platform_landing_world_height_ticks': evidence.landing_world_height[..., None].clone(),
+            'platform_landing_state_ticks': torch.stack((state.request_id, state.free_ticks, state.phase), -1)}
+
+
+def decode_platform_interval(record, *, version=PLATFORM_RECORD_VERSION):
+    """Decode recorded truth for task parity; no terrain/contact reconstruction."""
+    from ..course.jump_physics import PlatformLandingEvidence
+
+    if type(version) is not int or version != PLATFORM_RECORD_VERSION:
+        raise ValueError('Unknown platform interval record version')
+    if not all(name in record for name in PLATFORM_INTERVAL_RECORD_FIELDS):
+        raise ValueError('Missing platform tick evidence cannot be inferred from compact motion labels')
+    flags = record['platform_evidence_ticks']
+    n, device = len(flags), flags.device
+    for name, shape in PLATFORM_INTERVAL_RECORD_FIELDS.items():
+        value = record[name]
+        if (value.shape != (n, *shape) or value.dtype != PLATFORM_RECORD_DTYPES[name]
+                or value.device != device):
+            raise ValueError('Invalid typed platform interval record: ' + name)
+    ids = record['platform_landing_state_ticks']
+    result = PlatformLandingInterval(PlatformLandingEvidence(
+        flags[..., 0].clone(), flags[..., 1].clone(), flags[..., 2].clone(), flags[..., 3:5].clone(),
+        flags[..., 5:7].clone(), flags[..., 7].clone(), flags[..., 8].clone(),
+        record['platform_landing_world_height_ticks'][..., 0].clone()),
+        PlatformLandingState(*(ids[..., index].clone() for index in range(3))))
+    result.validate(n, device)
+    return result
 
 
 def validate_platform_fields(fields):
