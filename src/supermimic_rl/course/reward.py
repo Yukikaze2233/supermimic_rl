@@ -38,11 +38,18 @@ class SharedRewardComposer(PhysicalRewardComposer):
                 curve = window.get('jump_tracking_curve')
                 window['jump_reference_stage'] = (tasks.jump_reference() if curve is None else curve).clock_stage
             latch = tasks.supermimic_flight_latch
+            platform = self.supermimic_platform_landing
+            platform_bound = None
+            if platform is not None:
+                if platform.last_evidence is None:
+                    raise ValueError('Platform reward needs the current observed physics evidence')
+                platform_bound = (platform.last_evidence.selected & (tasks.physical_id >= 0)
+                                  & (platform.state.request_id == tasks.physical_id))
             progress = JumpProgress(window['jump_reference_stage'], tasks.ascent_seen.clone(), latch.closed.clone(),
                                     tasks.landed_s.clone(), latch.lifted.clone(),
                                     tasks.peak_rise.clone() if self.supermimic_reward_extensions.jump_peak_completion else None,
                                     tasks.active_rise.clone() if self.supermimic_reward_extensions.jump_peak_completion else None,
-                                    (tasks.physical_id >= 0).clone())
+                                    (tasks.physical_id >= 0).clone(), platform_bound)
         densities = physical_reward_densities(
             sample, reference,
             RewardHistory(window['dq'], window['action_cost'], window['action2_cost'], self._action_count),
@@ -156,12 +163,14 @@ def install_jump_tracking_reference(native) -> None:
 
 
 def install_shared_reward(composer, *, verify_native=False, extensions: RewardExtensions = RewardExtensions(),
-                          jump_tasks=None):
+                          jump_tasks=None, platform_landing=None):
     """Instance-local installation; the frozen native source stays untouched.
 
     Extensions add opt-in terms (and may replace the success event); they are
     recorded in the receipt only when active, so native-parity runs keep their
     original source identity. The native audit compares unextended rewards.
+    Optional ``platform_landing`` is the already installed physics observer;
+    its same-tick request binding extends physical tails onto selected terrain.
     """
     source = Path(inspect.getfile(PhysicalRewardComposer))
     actual = hashlib.sha256(source.read_bytes()).hexdigest()
@@ -173,8 +182,11 @@ def install_shared_reward(composer, *, verify_native=False, extensions: RewardEx
         raise ValueError("The native reward audit compares the unextended reward")
     if extensions.needs_jump_progress and jump_tasks is None:
         raise ValueError('Request-aware rewards require the native jump task owner')
+    if platform_landing is not None and (jump_tasks is None or platform_landing.tasks is not jump_tasks):
+        raise ValueError('Platform reward evidence must share the native jump task owner')
     composer.supermimic_reward_extensions = extensions
     composer.supermimic_jump_tasks = jump_tasks
+    composer.supermimic_platform_landing = platform_landing
     if extensions.needs_jump_progress:
         install_flight_latch(jump_tasks)
     if extensions.success_event is not None:

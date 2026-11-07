@@ -153,7 +153,8 @@ class JumpProgress:
     marks that the request's first real flight has touched down (see
     :func:`advance_flight_latch`); producers without that latch pass None and
     then cannot pay flight terms on jump rows. All are read after the task
-    owner observed the physical tick.
+    owner observed the physical tick. ``platform_bound`` certifies that the
+    selected platform evidence belongs to the same still-live physical request.
     """
 
     reference_stage: Tensor
@@ -164,9 +165,11 @@ class JumpProgress:
     peak_rise: Tensor | None = None      # running native root-height rise; differentiable in imagination
     requested_rise: Tensor | None = None
     physical_active: Tensor | None = None  # current physical request >= 0, observed after this physics tick
+    platform_bound: Tensor | None = None  # selected platform evidence belongs to that same live request
 
     def validate(self, mode: Tensor) -> None:
-        flags = tuple(flag for flag in (self.ascent_seen, self.flight_closed, self.flight_started, self.physical_active)
+        flags = tuple(flag for flag in (self.ascent_seen, self.flight_closed, self.flight_started,
+                                       self.physical_active, self.platform_bound)
                       if flag is not None)
         if (self.reference_stage.shape != mode.shape or self.reference_stage.device != mode.device
                 or self.reference_stage.dtype != torch.long
@@ -191,14 +194,16 @@ class JumpProgress:
                 or len({item.flight_started is None for item in items}) != 1
                 or len({item.peak_rise is None for item in items}) != 1
                 or len({item.requested_rise is None for item in items}) != 1
-                or len({item.physical_active is None for item in items}) != 1):
+                or len({item.physical_active is None for item in items}) != 1
+                or len({item.platform_bound is None for item in items}) != 1):
             raise ValueError('Jump progress coverage changes within a physical interval')
         optional = lambda name: (None if getattr(items[0], name) is None
                                  else torch.cat([getattr(item, name) for item in items]))
         return JumpProgress(torch.cat([item.reference_stage for item in items]),
                             torch.cat([item.ascent_seen for item in items]),
                             optional('flight_closed'), optional('landed_s'), optional('flight_started'),
-                            optional('peak_rise'), optional('requested_rise'), optional('physical_active'))
+                            optional('peak_rise'), optional('requested_rise'), optional('physical_active'),
+                            optional('platform_bound'))
 
 
 def advance_flight_latch(request: Tensor, lifted: Tensor, closed: Tensor, *, current: Tensor,
@@ -572,8 +577,13 @@ def physical_reward_densities(sample: RewardPhysics, reference: RewardReference,
     if extensions.jump_physical_tail:
         if jump_progress is None or jump_progress.physical_active is None:
             raise ValueError('Jump physical tail requires explicit per-tick physical jump activity')
+        tail_surface = ~terrain_active & ~terrain_airborne & ~rough_active
+        if jump_progress.platform_bound is not None:
+            # Terrain reward routing must not erase an explicit platform
+            # request's physical tail after the protocol returns to NORMAL.
+            tail_surface = tail_surface | jump_progress.platform_bound
         physical_tail = (jump_progress.physical_active & (reference.mode == int(CommandMode.NORMAL))
-                         & ~terrain_active & ~terrain_airborne & ~rough_active & ~gimbal_active)
+                         & tail_surface & ~gimbal_active)
     settling_scope = jump | physical_tail
     if extensions.jump_missed:
         from transformer_rl.formal.tasks.jump import ReferenceStage
