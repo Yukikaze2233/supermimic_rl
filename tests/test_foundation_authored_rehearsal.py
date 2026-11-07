@@ -29,15 +29,17 @@ COORDINATE = 1_121_746_944  # Recorded PPO foundation coordinate, not a new sche
 ATLAS_SHA = '8e34c6e3cb90ec48643f3d74d124c4eaaa829ff39f6e37bd11405023da08a594'
 
 
-def configuration(enabled):
+def configuration(enabled, every=None):
     value = json.loads((ROOT / 'configs/gpufree/ppo-course-gated-v7.json').read_text())
     if enabled:
         value['base']['foundation_authored_rehearsal'] = True
+    if every is not None:
+        value['base']['foundation_authored_rehearsal_every'] = every
     return value
 
 
-def curriculum(enabled=True, n=4096, seed=7, coordinate=COORDINATE):
-    result = make_course_curriculum(n, 'cpu', seed, configuration(enabled))
+def curriculum(enabled=True, n=4096, seed=7, coordinate=COORDINATE, every=None):
+    result = make_course_curriculum(n, 'cpu', seed, configuration(enabled, every))
     result.set_progress(coordinate, 18924)
     return result
 
@@ -88,8 +90,9 @@ def test_disabled_configuration_and_router_identity_remain_legacy(atlas):
         CourseCurriculumConfig(foundation_authored_rehearsal=1)
 
 
-def test_named_assets_receive_the_derived_quota_without_changing_other_routes(atlas):
-    old, new = curriculum(False, n=1200), curriculum(True, n=1200)
+@pytest.mark.parametrize('every', [5, 2])
+def test_named_assets_receive_the_derived_quota_without_changing_other_routes(atlas, every):
+    old, new = curriculum(False, n=1200), curriculum(True, n=1200, every=every)
     before, after = router(atlas, old, enabled=False), router(atlas, new)
     ids = torch.arange(1200)
     selected_count = terrain_count = 0
@@ -119,8 +122,9 @@ def test_named_assets_receive_the_derived_quota_without_changing_other_routes(at
     counts = after.actual_metrics()['foundation_rehearsal_reset_counts']
     assert sum(counts.values()) == selected_count
     assert abs(counts['road_step'] - counts['central_steps']) <= 1
-    assert abs(selected_count - terrain_count / 6 / 5) <= 1
-    assert abs(selected_count / (12 * 1200) - .01) < .0002
+    assert abs(selected_count - terrain_count / 6 / every) <= 1
+    assert abs(selected_count / (12 * 1200) - .3 / 6 / every) < .0002
+    assert after.receipt()['foundation_rehearsal']['slot_period'] == every
     assert new.terrain_level_cap(10) == old.terrain_level_cap(10) == 1
     assert new.terrain_step_up_cap_m() == old.terrain_step_up_cap_m() < .072
     assert new.sample_counts['family'] == old.sample_counts['family']
@@ -128,8 +132,9 @@ def test_named_assets_receive_the_derived_quota_without_changing_other_routes(at
 
 
 @pytest.mark.parametrize('coordinate', [800_000_000, 1_867_776_000, 2_024_686_819])
-def test_other_stages_including_current_world_course_are_identical(atlas, coordinate):
-    old, new = [curriculum(enabled, n=256, coordinate=coordinate) for enabled in (False, True)]
+@pytest.mark.parametrize('every', [5, 2])
+def test_other_stages_including_current_world_course_are_identical(atlas, coordinate, every):
+    old, new = [curriculum(enabled, n=256, coordinate=coordinate, every=every) for enabled in (False, True)]
     left, right = old.sample(torch.arange(256)), new.sample(torch.arange(256))
     assert_draw_equal(left, right)
     assert not new.foundation_authored_rehearsal_rows(torch.arange(256)).any()
@@ -140,13 +145,14 @@ def test_other_stages_including_current_world_course_are_identical(atlas, coordi
     assert torch.equal(before.generator.get_state(), after.generator.get_state())
 
 
-def test_restore_retains_slot_phase_and_routing_rng_across_irregular_batches(atlas):
-    original = curriculum(n=256)
+@pytest.mark.parametrize('every', [5, 2])
+def test_restore_retains_slot_phase_and_routing_rng_across_irregular_batches(atlas, every):
+    original = curriculum(n=256, every=every)
     first = router(atlas, original)
     for ids in (torch.tensor([3]), torch.arange(83), torch.tensor([1, 97, 45]), torch.arange(191)):
         route(first, original, ids, original.sample(ids))
     state, routing = deepcopy(original.state_dict()), deepcopy(first.state_dict())
-    restored = curriculum(n=256, seed=981)
+    restored = curriculum(n=256, seed=981, every=every)
     restored.load_state_dict(state)
     assert not restored.foundation_authored_rehearsal_rows(torch.arange(256)).any()
     second = router(atlas, restored, seed=777)
@@ -163,8 +169,9 @@ def test_restore_retains_slot_phase_and_routing_rng_across_irregular_batches(atl
         assert torch.equal(first.generator.get_state(), second.generator.get_state())
 
 
-def test_single_row_sampling_keeps_balanced_authored_rotation():
-    course = curriculum(n=1)
+@pytest.mark.parametrize('every', [5, 2])
+def test_single_row_sampling_keeps_balanced_authored_rotation(every):
+    course = curriculum(n=1, every=every)
     selected = []
     for _ in range(1200):
         draw = course.sample([0])
@@ -283,3 +290,53 @@ def test_opt_in_requires_a_distinct_sampling_identity_and_router_contract(atlas)
     installed = install_authored_routing(env, rehearsal_curriculum=on)
     assert installed is install_authored_routing(env, rehearsal_curriculum=on)
     assert env.authored_routing_receipt['foundation_rehearsal']['slot_period'] == 5
+
+
+def test_default_period_preserves_enabled_legacy_identity_and_draws():
+    old, explicit = curriculum(n=256), curriculum(n=256, every=5)
+    assert old.config.to_dict() == explicit.config.to_dict() == configuration(True)['base']
+    assert 'foundation_authored_rehearsal_every' not in old.state_dict()['config']
+    assert old.foundation_authored_rehearsal_receipt() == explicit.foundation_authored_rehearsal_receipt()
+    for ids in (torch.arange(241), torch.tensor([3]), torch.arange(109)):
+        assert_draw_equal(old.sample(ids), explicit.sample(ids))
+    explicit.load_state_dict(old.state_dict())
+    assert_draw_equal(old.sample(torch.arange(256)), explicit.sample(torch.arange(256)))
+
+
+@pytest.mark.parametrize('value', [0, -1, True, 2.5, '2', None])
+def test_rehearsal_period_requires_a_positive_integer(value):
+    with pytest.raises(ValueError, match='positive integer'):
+        CourseCurriculumConfig(foundation_authored_rehearsal_every=value)
+
+
+def test_candidate_changes_only_rehearsal_frequency_and_preserves_other_skills():
+    before = json.loads((ROOT / 'configs/gpufree/ppo-course-gated-v8-early-authored.json').read_text())
+    after = json.loads((ROOT / 'configs/gpufree/ppo-course-gated-v9-authored-half.json').read_text())
+    assert after == {**before, 'base': {**before['base'], 'foundation_authored_rehearsal_every': 2}}
+    old, new = [make_course_curriculum(1200, 'cpu', 7, value) for value in (before, after)]
+    for course in (old, new):
+        course.set_progress(COORDINATE, 18924)
+        course.set_opened_gates(None)  # Existing schedule progression.
+        assert course.command_context().domain.jump_m[1] == .4
+    selected = {5: [], 2: []}
+    for count in (1200, 83, 1, 191, 1200, 900, 157, 3, 1200, 1200):
+        ids = torch.arange(count)
+        left, right = old.sample(ids), new.sample(ids)
+        a, b = [course.foundation_authored_rehearsal_rows(ids) for course in (old, new)]
+        assert_draw_equal(left, right, except_fields=('terrain_kind', 'step_up_m'))
+        assert_draw_equal(left, right, ~(a | b))
+        for every, draw, chosen in ((5, left, a), (2, right, b)):
+            selected[every].extend(draw.terrain_kind[chosen].tolist())
+        assert old.sample_counts['family'] == new.sample_counts['family']
+        assert old.sample_counts['recovery_posture'] == new.sample_counts['recovery_posture']
+        assert old.sample_counts['jump_motion'] == new.sample_counts['jump_motion']
+        assert torch.equal(old.sampler.generator.get_state(), new.sampler.generator.get_state())
+    for values in selected.values():
+        assert values == [3, 7] * (len(values) // 2) + ([3] if len(values) % 2 else [])
+    assert len(new.sample_counts['recovery_posture']) == 22
+    assert all(count > 0 for count in new.sample_counts['recovery_posture'])
+    stationary, moving = new.sample_counts['jump_motion']
+    assert abs(stationary - moving) <= 1
+    assert len(selected[2]) > 2 * len(selected[5])
+    with pytest.raises(ValueError, match='identity/configuration'):
+        new.load_state_dict(old.state_dict())

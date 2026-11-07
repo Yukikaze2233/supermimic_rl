@@ -85,9 +85,10 @@ class CourseCurriculumConfig:
     # may draw it}. Postures absent from the map use the first stage. Empty keeps
     # every configured posture from the first recovery birth on.
     recovery_posture_stages: dict = field(default_factory=dict)
-    # Reuse one fifth of the existing STEP_UP birth slots for the two named
-    # authored assets. This is a birth quota, not the native random ceiling mask.
+    # Reuse a periodic share of STEP_UP births for the two named authored
+    # assets. The default retains the original one-in-five birth quota.
     foundation_authored_rehearsal: bool = False
+    foundation_authored_rehearsal_every: int = 5
     # Six intermediate side-roll births replace alternate easy-pose slots;
     # original difficult-pose and task-family shares remain unchanged.
     recovery_roll_bridge: bool = False
@@ -160,6 +161,9 @@ class CourseCurriculumConfig:
         object.__setattr__(self, "recovery_posture_stages", stages)
         if type(self.foundation_authored_rehearsal) is not bool:
             raise ValueError("foundation_authored_rehearsal must be boolean")
+        if (type(self.foundation_authored_rehearsal_every) is not int
+                or self.foundation_authored_rehearsal_every < 1):
+            raise ValueError("foundation_authored_rehearsal_every must be a positive integer")
         if type(self.recovery_roll_bridge) is not bool:
             raise ValueError("recovery_roll_bridge must be boolean")
         if self.jump_standing_fraction_of_stage >= self.jump_full_motion_fraction_of_stage:
@@ -183,6 +187,9 @@ class CourseCurriculumConfig:
         # A disabled opt-in must preserve old checkpoint configuration identity.
         if not self.foundation_authored_rehearsal:
             result.pop("foundation_authored_rehearsal")
+        # Existing enabled sources also omit the original fixed period.
+        if self.foundation_authored_rehearsal_every == 5:
+            result.pop("foundation_authored_rehearsal_every")
         if not self.recovery_roll_bridge:
             result.pop("recovery_roll_bridge")
         return result
@@ -372,13 +379,14 @@ class SuperMimicCurriculum(FormalTaskCurriculum):
                 if self.stage >= self.stage_names.index('authored_steps'):
                     step[rows[endpoint]] = self.domain.step_up_m[1]
                 if rehearsal is not None and self.stage_name == 'terrain_foundation':
-                    # The foundation cycle already gives STEP_UP one
-                    # slot. Every fifth such slot is shared equally by the two
-                    # real assets, without consuming another random draw.
+                    # Select a periodic share of the existing STEP_UP slots.
+                    # Divide by the same period to alternate the two assets
+                    # across batches and restores without extra random draws.
                     cycle = ordinal // len(pool)
-                    selected = ((terrain[rows] == int(TerrainKind.STEP_UP)) & (cycle % 5 == 0))
+                    every = self.config.foundation_authored_rehearsal_every
+                    selected = ((terrain[rows] == int(TerrainKind.STEP_UP)) & (cycle % every == 0))
                     chosen = rows[selected]
-                    terrain[chosen] = torch.where((cycle[selected] // 5) % 2 == 0,
+                    terrain[chosen] = torch.where((cycle[selected] // every) % 2 == 0,
                                                  int(TerrainKind.STEP_UP), int(TerrainKind.TWO_PLATFORMS))
                     step[chosen] = self.domain.step_up_m[1]
                     rehearsal[chosen] = True
@@ -455,7 +463,7 @@ class SuperMimicCurriculum(FormalTaskCurriculum):
             "contract": "foundation_authored_birth_rehearsal_v1",
             "stage": self.stage_names.index('terrain_foundation'),
             "source_slots": "STEP_UP in the configured foundation terrain cycle",
-            "slot_period": 5,
+            "slot_period": self.config.foundation_authored_rehearsal_every,
             "asset_cycle": ["road_step", "central_steps"],
             "requested_step_up_m": self.domain.step_up_m[1],
             "selection": "persisted terrain-family ordinal; no extra random draws",
