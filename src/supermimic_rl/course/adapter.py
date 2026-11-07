@@ -450,16 +450,25 @@ class CourseAdapter(IsaacAdapter):
         self.curriculum.set_progress(real_transitions=real_transitions, actor_updates=actor_updates)
 
     def training_state_dict(self):
-        return {"format": "supermimic_course_v1", "curriculum": self.curriculum.state_dict(),
-                "course": self.env._terrain_course.state_dict(),
-                "control_timing": self.env.control_timing_state_dict(),
-                "sensors": self.env._sensor_model.checkpoint_state_dict()}
+        state = {"format": "supermimic_course_v1", "curriculum": self.curriculum.state_dict(),
+                 "course": self.env._terrain_course.state_dict(),
+                 "control_timing": self.env.control_timing_state_dict(),
+                 "sensors": self.env._sensor_model.checkpoint_state_dict()}
+        platform = getattr(self.env, 'supermimic_platform_course', None)
+        if platform is not None:
+            state['platform_course'] = platform.state_dict()
+        return state
 
     def load_training_state_dict(self, state):
         if state["format"] != "supermimic_course_v1":
             raise ValueError("Course checkpoint format differs")
+        platform = getattr(self.env, 'supermimic_platform_course', None)
+        if (platform is None) != ('platform_course' not in state):
+            raise ValueError('Platform course checkpoint requires an explicit source migration')
         self.curriculum.load_state_dict(state["curriculum"])
         self.env._terrain_course.restore_after_physical_reset(state["course"])
+        if platform is not None:
+            platform.restore_after_physical_reset(state['platform_course'])
         self.env.restore_control_timing(state["control_timing"])
         sensor = self.env._sensor_model
         sensor.initialized.zero_()
