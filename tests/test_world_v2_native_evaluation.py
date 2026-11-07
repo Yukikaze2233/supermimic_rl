@@ -151,3 +151,30 @@ def test_legacy_evaluation_retains_original_summary_and_record_options(monkeypat
     assert 'record_platform' not in calls['collector_options']
     assert 'platform_landing' not in calls['collector_options']
     assert calls['collector_options']['record_jumps'] is True
+
+
+def test_mixed_platform_rows_follow_begin_reset_but_do_not_claim_full_run_membership(monkeypatch):
+    env, actor, platform, calls, original = platform_evaluation_fixture(monkeypatch)
+    platform.plan = SimpleNamespace(sampler=object())
+
+    def begin(schema):
+        calls['begin'] = True
+        platform.platform_rows = torch.tensor([True, False])
+
+    def another_episode(*args):
+        # A later reset changes the same physical row's task assignment.
+        platform.platform_rows = torch.tensor([False, True])
+
+    env.adapter.evaluation_begin = begin
+    env.adapter.evaluation_step = another_episode
+    report = evaluation.evaluate_native(env, actor, 1)
+    scope = report['platform_evaluation_scope']
+    assert scope['planned_env_ids'] == [0]
+    assert 'initial episode' in scope['planned_env_ids_scope']
+    assert platform.platform_rows.tolist() == [False, True]
+    interpretation = report['task_suite']['flat_anchor_jump_diagnostics']['platform_interpretation']
+    assert interpretation['planned_env_ids'] == [0]
+    assert interpretation['includes_platform_rows'] is None
+    assert interpretation['initial_includes_platform_rows'] is True
+    assert 'not a full-run' in interpretation['planned_env_ids_scope']
+    assert report['task_suite']['flat_anchor_jump_diagnostics']['totals'] == original['jump_diagnostics']['totals']

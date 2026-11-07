@@ -22,12 +22,6 @@ def evaluate_native(environment, actor, steps, *, on_progress=None,
     owner = environment.adapter
     platform = getattr(owner.env, 'supermimic_platform_course', None)
     platform_rows = None
-    if platform is not None:
-        rows = platform.platform_rows
-        if (not isinstance(rows, torch.Tensor) or rows.shape != (environment.num_envs,)
-                or rows.dtype != torch.bool):
-            raise ValueError('Platform evaluation requires explicit planned native rows')
-        platform_rows = rows.nonzero().flatten().cpu().tolist()
     features = getattr(actor, 'features', None)
     if features is not None and features.configuration is not None:
         features.validate_reference(owner.env._terrain_course.tasks.reference.config)
@@ -36,6 +30,16 @@ def evaluate_native(environment, actor, steps, *, on_progress=None,
     if fixed_suite:
         begin(environment.schema)
         environment.current = environment._pack(owner.current)
+    if platform is not None:
+        # Fixed evaluation may replace the initial training routes and reset
+        # every caller. Capture the resulting episode plans, not those of the
+        # discarded setup birth. Later resets may change mixed-course plans.
+        rows = platform.platform_rows
+        if (not isinstance(rows, torch.Tensor) or rows.shape != (environment.num_envs,)
+                or rows.dtype != torch.bool):
+            raise ValueError('Platform evaluation requires explicit planned native rows')
+        platform_rows = rows.nonzero().flatten().cpu().tolist()
+    mixed_platform = getattr(getattr(platform, 'plan', None), 'sampler', None) is not None
     statistics = EpisodeStatistics(environment.num_envs, environment.device)
     masks, latest = {}, {}
     actor.eval()
@@ -110,6 +114,10 @@ def evaluate_native(environment, actor, steps, *, on_progress=None,
             'capability_source': 'platform_diagnostics only; final snapshots are not a success rate',
             'legacy_jump_events': 'Unchanged native jump pulses and aggregate counters are not '
                                   'an all-task or selected-platform success numerator'}
+        if mixed_platform:
+            report['platform_evaluation_scope'].update(
+                planned_env_ids_scope='initial episode plans after evaluation_begin only',
+                episode_assignment_source='per-interval typed platform intent; reset may change membership')
         if fixed_suite:
             suite = dict(report['task_suite'])
             if 'jump_diagnostics' in suite:
@@ -119,6 +127,14 @@ def evaluate_native(environment, actor, steps, *, on_progress=None,
                     'scope': 'Flat-anchor jump conditions include selected-platform rows; '
                              'they do not qualify platform flight, landing or success. '
                              'Original values are retained without recomputing outcomes.'}
+                if mixed_platform:
+                    diagnostic['platform_interpretation'].update(
+                        includes_platform_rows=None,
+                        initial_includes_platform_rows=bool(platform_rows),
+                        planned_env_ids_scope='initial episode plans only; not a full-run exclusion mask',
+                        scope='Mixed-episode membership must come from typed per-interval intent. '
+                              'Initial plans do not partition these aggregate flat-anchor outcomes. '
+                              'Original values are retained and do not qualify platform success.')
                 suite['flat_anchor_jump_diagnostics'] = diagnostic
             suite['success_semantics'] = (suite.get('success_semantics', '') +
                 ' Selected-platform capability is reported separately in platform_diagnostics; '
