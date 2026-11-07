@@ -281,12 +281,21 @@ class IdealStairSource:
 
     def advance(self, source, stair, *, task, motion, physical, wheel_centres, wheel_radius,
                 terrain_tile, queues, readout, goal, estimate, physics_dt_s, latency, draws, external=None,
-                admission=None, base_mode=None, jump_active=None, request_height=None, request_clock=None):
-        """Complete one boundary: detect -> release -> protocol/FSM -> rearm -> goal."""
+                admission=None, base_mode=None, jump_active=None, request_height=None, request_clock=None,
+                reservation=None):
+        """Complete one boundary: detect -> release -> protocol/FSM -> rearm -> goal.
+
+        Caller reservation suppresses only new ToF submissions. Detection,
+        latency, existing-request completion and external packets still advance.
+        """
         from transformer_rl.formal.tasks.protocol import RequestResponse
 
         trigger = self.restore(source)
         n = len(source.values)
+        if reservation is not None and (not isinstance(reservation, Tensor)
+                or reservation.shape != (n,) or reservation.device != source.values.device
+                or reservation.dtype != torch.bool):
+            raise ValueError('Stair reservation requires one bool per source row')
         external = StairPacket.empty(n, source.values.device) if external is None else external
         now = task.boundary_time(stair, physics_dt_s)
         ready, contact, tilt = task.estimate_inputs(now, estimate, source.values)
@@ -295,6 +304,8 @@ class IdealStairSource:
         idle = ready & ~owned & (stair.ids[:, 1] < 0)
         if jump_active is not None:
             idle = idle & ~jump_active
+        if reservation is not None:
+            idle = idle & ~reservation
         beam = self.profile(physical, terrain_tile, goal)
         fired, measured = self.step(trigger, beam, idle=idle, latency=latency, draws=draws)
         next_id = torch.maximum(source.ids[:, 0], stair.ids[:, 0] + 1)
