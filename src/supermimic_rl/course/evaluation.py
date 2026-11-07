@@ -556,6 +556,18 @@ class CourseEvaluation:
             self.jump_evidence.observe_transition(transition, valid)
         for row, name in enumerate(self.plan.row_names):
             total_bucket = self.buckets.setdefault(name, self._empty_bucket())
+            if authored is not None:
+                # A reset can end one attempt and start another on an invalid
+                # transition. Retain the native lifecycle ledger separately;
+                # its completion flags are not trusted capability evidence.
+                keys = ('started', 'ended', 'complete', 'ended_complete', 'incomplete')
+                ledgers = ['authored_whole_course_raw']
+                if not valid[row]:
+                    ledgers.append('authored_whole_course_excluded')
+                for ledger in ledgers:
+                    events = total_bucket.setdefault(ledger, dict.fromkeys(keys, 0))
+                    for key, occurrences in zip(keys, authored[row].tolist()):
+                        events[key] += occurrences
             if not owned[row]:
                 phase = 'script_owned'
             elif context is None:
@@ -708,6 +720,14 @@ class CourseEvaluation:
             report['jump_diagnostics'] = self.jump_evidence.summary()
         if self.stair_request_evidence is not None:
             report['stair_request_diagnostics'] = self.stair_request_evidence.summary()
+        if self._authored_pending is not None:
+            report['authored_counter_semantics'] = (
+                'authored_whole_course uses valid transition endpoints only. '
+                'authored_whole_course_raw preserves all native per-row lifecycle events, '
+                'including reset births and ends on invalid intervals; '
+                'authored_whole_course_excluded is their invalid-interval subset. '
+                'Raw completion flags are not certified successes. These are separate '
+                'ledgers, not a success numerator and denominator to divide together.')
         if self.config.recovery_qualification:
             report['command_phase_semantics'] += (
                 ' With recovery_qualification enabled, scheduled_segment also includes the fixed '

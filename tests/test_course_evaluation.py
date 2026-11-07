@@ -627,6 +627,12 @@ def test_invalid_course_rows_do_not_become_failures_successes_or_tracking_eviden
     assert bucket['routed_terrain_ranges']['routed_step_height_m']['max'] == pytest.approx([.2])
     assert bucket['gimbal']['translation_tracking']['samples'] == 2
     assert bucket['authored_whole_course']['ended'] == 2
+    assert bucket['authored_whole_course_raw']['ended'] == 5
+    assert bucket['authored_whole_course_excluded']['ended'] == 3
+    assert bucket['authored_whole_course_raw']['complete'] == 5
+    assert bucket['authored_whole_course_excluded']['complete'] == 3
+    assert bucket['authored_whole_course']['complete'] == 2
+    assert 'Raw completion flags are not certified' in report['authored_counter_semantics']
     assert not evaluator._authored_pending.any()
     assert bucket['command_phases']['scheduled_segment']['invalid_count'] == 3
     assert 'raw upstream' in report['native_counter_semantics']
@@ -669,7 +675,27 @@ def test_authored_events_keep_row_identity_through_finish_and_reset():
         assert evaluator.buckets["single"]["authored_whole_course"]["complete"] == 1
         assert evaluator.buckets["double"]["authored_whole_course"]["complete"] == 0
         assert evaluator.buckets["double"]["authored_whole_course"]["incomplete"] == 1
+        assert evaluator.buckets['single']['authored_whole_course_raw']['started'] == 2
+        assert evaluator.buckets['double']['authored_whole_course_raw']['started'] == 1
+        assert 'authored_whole_course_excluded' not in evaluator.buckets['single']
         assert evaluator._authored_pending.eq(0).all()
+        # Collision/invalid-reset intervals still close and reopen a native
+        # attempt. They must not disappear or acquire a trusted success.
+        evidence.reset(torch.tensor([0]), torch.tensor([0]), torch.zeros(1, 3))
+        transition.valid[0] = False
+        evaluator.step(transition, NativeTrackingSample(torch.zeros(2, 3), torch.zeros(2, 3)))
+        bucket = evaluator.buckets['single']
+        assert bucket['authored_whole_course_raw']['started'] == 3
+        assert bucket['authored_whole_course_raw']['ended'] == 2
+        assert bucket['authored_whole_course_excluded'] == {
+            'started': 1, 'ended': 1, 'complete': 0, 'ended_complete': 0, 'incomplete': 1}
+        assert bucket['authored_whole_course']['started'] == 2
+        assert bucket['authored_whole_course']['ended'] == 1
+        assert bucket['authored_whole_course']['complete'] == 1
+        transition.valid[0] = True
+        evaluator.step(transition, NativeTrackingSample(torch.zeros(2, 3), torch.zeros(2, 3)))
+        assert bucket['authored_whole_course_raw']['started'] == 3
+        assert bucket['authored_whole_course']['ended'] == 1
     finally:
         evaluator.close()
     assert evidence.observe.__func__ is original_observe
