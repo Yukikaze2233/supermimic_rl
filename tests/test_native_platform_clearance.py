@@ -43,7 +43,9 @@ def native_fixture():
     binding = MechanicalBinding.from_manifest(manifest, joints, names)
     origins = torch.zeros(103, 3)
     origins[101], origins[102] = torch.tensor([15., -2., .4]), torch.tensor([-8., 4., -.1])
-    router = SimpleNamespace(identity='atlas-source', origins=origins.clone(), tile=torch.tensor([101, 102, 0]))
+    tile = torch.tensor([101, 102, 101])
+    router = SimpleNamespace(identity='atlas-source', origins_table=origins.clone(),
+                             origins=origins[tile].clone(), tile=tile)
     pose = torch.zeros(3, len(names), 7)
     pose[..., 6] = 1.
     for row in range(2):
@@ -112,6 +114,7 @@ def test_cache_never_crosses_same_tick_reset_route_pose_or_selection_change(chan
         native._episode_id[0] += 1
     elif change == 'tile':
         native._terrain_course.router.tile[0] = 102
+        native._terrain_course.router.origins[0] = native._terrain_course.router.origins_table[102]
     elif change == 'selection':
         selection[0] = False
     else:
@@ -161,6 +164,61 @@ def test_atlas_mismatch_is_rejected_before_constructing_a_query():
     with pytest.raises(ValueError, match='same bound atlas'):
         NativePlatformClearance(native, terrain, selected_capture=lambda: torch.ones(3, dtype=torch.bool),
                                 query_factory=Query)
+
+
+def test_current_env_origins_are_not_the_full_table_and_allow_duplicate_reordered_tiles():
+    native, binder, selection = native_fixture()
+    router = native._terrain_course.router
+    assert router.origins.shape == (3, 3) and router.origins_table.shape == (103, 3)
+    router.tile[:] = torch.tensor([102, 101, 102])
+    router.origins.copy_(router.origins_table[router.tile])
+    selection[:] = torch.tensor([True, True, False])
+    result = binder.capture()
+    torch.testing.assert_close(result.environment_origins_world_m, router.origins, rtol=0, atol=0)
+    assert binder.query.args[2].tolist() == [102, 101, 102]
+    router.tile[1] = 102  # Two selected environments can use the same terrain tile.
+    router.origins[1] = router.origins_table[102]
+    result = binder.capture()
+    assert binder.query.calls == 2
+    torch.testing.assert_close(result.environment_origins_world_m[0], result.environment_origins_world_m[1])
+
+
+def test_same_tick_origin_mismatch_cannot_reuse_a_cached_result():
+    native, binder, _ = native_fixture()
+    binder.capture()
+    native._terrain_course.router.origins[0, 0] += 1.
+    with pytest.raises(ValueError, match='origins differ'):
+        binder.capture()
+    assert binder.query.calls == 1
+
+
+def test_constructor_compares_full_atlas_origin_table():
+    native, binder, selection = native_fixture()
+    native._terrain_course.router.origins_table[100, 0] += 1.
+    with pytest.raises(ValueError, match='same bound atlas'):
+        NativePlatformClearance(native, binder.terrain, selected_capture=lambda: selection,
+                                query_factory=Query)
+
+
+def test_real_terrain_router_restore_updates_per_environment_origins():
+    from transformer_rl.formal.tasks.terrain_courses import TerrainCourseRouter
+
+    native, _, selection = native_fixture()
+    router = TerrainCourseRouter(ASSET.parent / 'rmuc2027_course_atlas/manifest.json', 3)
+    saved = router.state_dict()
+    saved['tile'] = torch.tensor([102, 101, 102])
+    router.load_state_dict(saved)
+    native._terrain_course.router = router
+    terrain = SimpleNamespace(origins=router.origins_table.clone(), manifest_sha256=router.identity)
+    binder = NativePlatformClearance(native, terrain, selected_capture=lambda: selection.clone(), query_factory=Query)
+    sample = binder.capture()
+    assert router.origins.shape == (3, 3) and len(terrain.origins) == 103
+    torch.testing.assert_close(sample.environment_origins_world_m, terrain.origins[saved['tile']], rtol=0, atol=0)
+    saved['tile'] = torch.tensor([102, 102, 101])
+    router.load_state_dict(saved)
+    after = binder.capture()
+    assert binder.query.calls == 2 and after is not sample
+    torch.testing.assert_close(after.environment_origins_world_m, terrain.origins[saved['tile']], rtol=0, atol=0)
 
 
 def test_timestamp_snapshot_does_not_alias_native_clock_or_cache_identity():
