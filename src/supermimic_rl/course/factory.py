@@ -130,7 +130,8 @@ def create_course(configuration):
         from .action_contract import install_action_bounds
 
         action_contract = install_action_bounds(native, runtime["task"]["action_bounds"])
-        from .reward import install_jump_tracking_reference, install_shared_reward
+        from .reward import (install_jump_tracking_reference, install_shared_reward,
+                             install_stair_support_reference)
 
         from ..reward_kernel import RewardExtensions
 
@@ -167,6 +168,8 @@ def create_course(configuration):
             extensions=extensions, flight_geometry=jump_geometry,
             jump_tasks=native._terrain_course.tasks,
             **({} if platform_owner is None else {'platform_landing': platform_owner.landing}))
+        if extensions.stair_support_transfer:
+            reward_kernel_receipt['stair_support_transfer'] = install_stair_support_reference(native)
         course_schedule_receipt = install_jump_first_command_pool(native._terrain_course.tasks, curriculum)
         from .gimbal_arbitration import install_request_gimbal_exclusion
 

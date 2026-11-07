@@ -189,6 +189,9 @@ class OrdinaryFlatReward:
             raise ValueError('The four-tick reward requires the recorded 200/50 Hz clocks')
         # Native-collection extensions (if any) are part of the pinned source identity.
         self.extensions = RewardExtensions(**source.get('reward_kernel', {}).get('extensions', {}))
+        if self.extensions.stair_support_transfer:
+            raise ValueError('Stair support transfer is unsupported by compact world-model contact labels: '
+                             'base net force direction is not recorded or predicted')
         self.request_gimbal_exclusion = source.get('request_gimbal_exclusion') is not None
         if self.request_gimbal_exclusion:
             from ..course.gimbal_arbitration import arbitration_receipt

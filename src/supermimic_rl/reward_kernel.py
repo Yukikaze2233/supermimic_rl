@@ -111,6 +111,13 @@ class RewardExtensions:
     closed-chain minimum, normalized by that same source's reachable span.
     Both use the first real flight window, never the supported push. Geometry
     remains reward-only and does not change observations or physical success.
+
+    ``stair_support_transfer`` keeps velocity tracking available during a
+    permitted ordinary STAIR request. Once the base has upward net contact
+    force, its extension target is an upper bound, allowing the legs to lift
+    onto the step. Only that supported base is exempt from harmful contact;
+    other bodies retain their costs. Net world-Z force is separate evidence:
+    a scalar contact norm cannot distinguish support from a riser impact.
     """
 
     jump_flight: float = 0.        # per second in the request's first real flight (after real ascent)
@@ -129,8 +136,11 @@ class RewardExtensions:
     jump_extension_height_floor: bool = False  # release only above-reference height in pre-touchdown EXTENSION
     jump_flight_clearance: bool = False  # make the existing flight budget differentiable in wheel clearance
     jump_tuck: float = 0.  # per second at the source's minimum virtual leg length, only in real flight
+    stair_support_transfer: bool = False  # permit supported ordinary STAIR leg retraction
 
     def __post_init__(self):
+        if type(self.stair_support_transfer) is not bool:
+            raise ValueError('Stair support transfer requires a boolean flag')
         if (type(self.jump_flight_clearance) is not bool
                 or self.jump_flight_clearance and self.jump_flight <= 0):
             raise ValueError('Jump flight clearance requires a boolean flag and positive jump_flight weight')
@@ -152,7 +162,7 @@ class RewardExtensions:
         return bool(self.jump_flight or self.jump_lift or self.jump_push or self.jump_missed or self.jump_settle
                     or self.jump_landing_rate or self.recovery_quiet or self.success_event is not None
                     or self.ordinary_leg_acceleration is not None or self.stationary_quiet
-                    or self.jump_extension_height_floor or self.jump_tuck)
+                    or self.jump_extension_height_floor or self.jump_tuck or self.stair_support_transfer)
 
     @property
     def needs_jump_progress(self) -> bool:
@@ -401,7 +411,8 @@ def gimbal_tracking_densities(reference, velocity_world):
 
 def physical_reward_densities(sample: RewardPhysics, reference: RewardReference,
                              history: RewardHistory, parameters: RewardParameters, *,
-                             jump_progress: JumpProgress | None = None) -> RewardDensities:
+                             jump_progress: JumpProgress | None = None,
+                             stair_base_net_upward_n: Tensor | None = None) -> RewardDensities:
     """Pure densities; integrate with the physical dt exactly once outside."""
     invalid = torch.zeros_like(reference.mode, dtype=torch.bool)
     failure_scale = torch.ones_like(sample.height_above_ground_m)
@@ -458,12 +469,30 @@ def physical_reward_densities(sample: RewardPhysics, reference: RewardReference,
         # ToF owns visible height changes. No hidden +0.12/.36 target.
         ordinary_eh = torch.where(rough_active,
             reference.rough_dash.body_extension_m - command[:, 3], ordinary_eh)
+    stair_transfer = stair_supported = torch.zeros_like(ordinary)
+    if parameters.extensions.stair_support_transfer:
+        if (stair_base_net_upward_n is None
+                or stair_base_net_upward_n.shape != ordinary.shape
+                or stair_base_net_upward_n.device != ordinary.device
+                or not stair_base_net_upward_n.is_floating_point()):
+            raise ValueError('Stair support transfer requires same-tick base net upward force rows')
+        if reference.intentional_base_contact is not None:
+            stair_transfer = ((reference.mode == int(CommandMode.STAIR))
+                              & reference.intentional_base_contact & ~gimbal_active)
+        valid_force = torch.isfinite(stair_base_net_upward_n) & (stair_base_net_upward_n >= 0)
+        invalid |= stair_transfer & ~valid_force
+        stair_base_net_upward_n = torch.where(valid_force, stair_base_net_upward_n, 0.)
+        # Reuse the native harmful-contact threshold, without treating a
+        # horizontal collision's large normal load as vertical support.
+        stair_supported = stair_transfer & (stair_base_net_upward_n > 3.)
+        ordinary_eh = torch.where(stair_supported, ordinary_eh.clamp_min(0), ordinary_eh)
     full, zero = VELOCITY_HEIGHT_GATE_M
     velocity_gate = torch.where((reference.mode == int(CommandMode.NORMAL)) & ~terrain_active,
                                 ((zero - support_eh.abs()) / (zero - full)).clamp(0, 1), 1.)
     if rough_dash:
         velocity_gate = torch.where(ordinary,
             ((zero - ordinary_eh.abs()) / (zero - full)).clamp(0, 1), velocity_gate)
+    velocity_gate = torch.where(stair_transfer, 1., velocity_gate)
     jump_eh = sample.root_world_z_m - reference.jump_height_world_z_m
     eh = torch.where(jump, jump_eh, ordinary_eh)
     if parameters.extensions.jump_extension_height_floor:
@@ -569,12 +598,13 @@ def physical_reward_densities(sample: RewardPhysics, reference: RewardReference,
         cost['leg_acceleration'] = torch.where(ordinary,
             parameters.extensions.ordinary_leg_acceleration * ddq[:, :4].square().sum(-1),
             cost['leg_acceleration'])
-    if reference.intentional_base_contact is not None and not rough_dash:
+    if reference.intentional_base_contact is not None and (not rough_dash or parameters.extensions.stair_support_transfer):
         base = parameters.base_index
         # Explicitly permitted terrain base contact exempts only the base.
         others = [index for index in parameters.harmful_indices if index != base]
+        exempt_base = (stair_supported if rough_dash else reference.intentional_base_contact)
         cost['harmful_contact'] = torch.where(
-            reference.intentional_base_contact,
+            exempt_base,
             2 * (sample.body_normal_load_n[:, others] > 3).any(-1).float(), cost['harmful_contact'])
     if rough_dash:
         # Active additions in the published rough_dash 2026-07-19 recipe.
@@ -865,6 +895,11 @@ def physical_reward_densities(sample: RewardPhysics, reference: RewardReference,
         gates['jump_flight_geometry_available'] = flight_geometry_available
         errors['jump_common_clearance_m'] = common_clearance
         errors['jump_tuck_length_excess_m'] = tuck_shortfall
+    if extensions.stair_support_transfer:
+        gates['stair_support_transfer'] = stair_transfer
+        gates['stair_base_supported'] = stair_supported
+        errors['stair_objective_height_error_m'] = torch.where(stair_transfer, ordinary_eh, 0.)
+        errors['stair_base_net_upward_n'] = torch.where(stair_transfer, stair_base_net_upward_n, 0.)
     if extensions.jump_missed and jump_progress is not None and jump_progress.platform_target is not None:
         target = jump_progress.platform_target
         gates['jump_target_eligible'] = target.eligible

@@ -60,7 +60,8 @@ class SharedRewardComposer(PhysicalRewardComposer):
         densities = physical_reward_densities(
             sample, reference,
             RewardHistory(window['dq'], window['action_cost'], window['action2_cost'], self._action_count),
-            RewardParameters.from_composer(self), jump_progress=progress)
+            RewardParameters.from_composer(self), jump_progress=progress,
+            stair_base_net_upward_n=getattr(self, 'supermimic_stair_base_net_upward_n', None))
         if (invalid | densities.invalid).any():
             raise ValueError('reward input, PRE-reset identity, timing, phase or finite density bound differs')
         positive, cost = densities.positive, densities.cost
@@ -169,6 +170,38 @@ def install_jump_tracking_reference(native) -> None:
     reward.observe = observe_with_tracking_reference
 
 
+def install_stair_support_reference(native) -> dict:
+    """Pass the current native endpoint's base net force through its composer.
+
+    The upstream RewardPhysics has scalar contact loads but no force direction.
+    Keep this reward-only evidence scoped to the synchronous observe call so a
+    later call cannot accidentally consume the preceding physics tick.
+    """
+    reward = native._formal_reward
+    composer, observe = reward.composer, reward.observe
+    if not composer.supermimic_reward_extensions.stair_support_transfer:
+        raise ValueError('Native stair support requires its explicit reward extension')
+    base = native._base_body_index
+    composer.supermimic_stair_base_net_upward_n = None
+
+    def observe_with_stair_support(sample, state, **kwargs):
+        force = sample.terrain_contact_force_world_n
+        if (force.ndim != 3 or force.shape[0] != composer.num_envs
+                or force.shape[2] != 3 or base >= force.shape[1]):
+            raise ValueError('Native stair support requires full body world-force vectors')
+        composer.supermimic_stair_base_net_upward_n = force[:, base, 2].clamp_min(0)
+        try:
+            return observe(sample, state, **kwargs)
+        finally:
+            composer.supermimic_stair_base_net_upward_n = None
+
+    reward.observe = observe_with_stair_support
+    return {'source': 'NativePhysicalSample.terrain_contact_force_world_n',
+            'measure': 'positive_world_z_component_of_base_net_contact_force',
+            'timing': 'current_physical_endpoint_during_native_reward_observe',
+            'support_threshold_n': 3.}
+
+
 def install_shared_reward(composer, *, verify_native=False, extensions: RewardExtensions = RewardExtensions(),
                           jump_tasks=None, platform_landing=None, flight_geometry=None):
     """Instance-local installation; the frozen native source stays untouched.
@@ -229,6 +262,8 @@ def install_shared_reward(composer, *, verify_native=False, extensions: RewardEx
             receipt['extensions'].pop('jump_physical_tail')
         if not extensions.jump_extension_height_floor:
             receipt['extensions'].pop('jump_extension_height_floor')
+        if not extensions.stair_support_transfer:
+            receipt['extensions'].pop('stair_support_transfer')
     return receipt
 
 
