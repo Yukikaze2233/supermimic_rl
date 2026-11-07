@@ -79,7 +79,7 @@ class PlatformTask:
     def advance(self, intent: PlatformIntentState, jump: JumpTaskState, *, motion, stair, source,
                 physical, wheel_centres, wheel_radius, terrain_tile, queues, readout, goal,
                 estimate, task_family, ground_z, interval_uniform, latency, draws,
-                retain_peak_gradient=False) -> PlatformBoundary:
+                retain_peak_gradient=False, request_gimbal_exclusion=False) -> PlatformBoundary:
         """Advance admission -> jump -> caller consumption -> ToF/stair.
 
         ``jump`` must contain the just-completed interval's physical evidence;
@@ -92,6 +92,8 @@ class PlatformTask:
         including when all rows are owned or inactive. No RNG is accessed here.
         Caller plan/reset and landing-state propagation remain with the rollout.
         """
+        from ..course.gimbal_arbitration import request_owns_chassis
+
         now = self.jump_task.boundary_time(jump)
         prepared = self._prepare(intent, jump, motion, stair, ground_z, now)
         following, admitted = motion.advance_admission(queues, readout,
@@ -120,5 +122,7 @@ class PlatformTask:
             external=packet, reservation=following_intent.reservation,
             admission=(replace(following, current=jumped.command), jumped.command),
             base_mode=jumped.mode, jump_active=jumped.state.active_id >= 0,
-            request_height=jumped.request_height, request_clock=jumped.request_clock)
+            request_height=jumped.request_height, request_clock=jumped.request_clock,
+            request_owned=(None if not request_gimbal_exclusion else
+                           request_owns_chassis(task_family, jumped.state.physical_id)))
         return PlatformBoundary(following_intent, jumped, advanced)

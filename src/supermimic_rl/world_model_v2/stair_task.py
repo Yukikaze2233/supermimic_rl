@@ -175,7 +175,8 @@ class StairTask:
         return ready, torch.where(ready[:, None], contact, 0.), torch.where(ready, tilt, 0.)
 
     def advance_motion(self, state, packet, *, motion, queues, readout, goal, estimate, physics_dt_s,
-                       admission=None, base_mode=None, jump_active=None, request_height=None, request_clock=None):
+                       admission=None, base_mode=None, jump_active=None, request_height=None, request_clock=None,
+                       request_owned=None):
         """Compose native command admission -> request FSM -> gimbal task.
 
         Called after the preceding interval's reward/termination. The returned
@@ -196,7 +197,8 @@ class StairTask:
         jump_active = base_mode == int(CommandMode.JUMP) if jump_active is None else jump_active
         result = self.advance(state, packet, now_s=now, estimate=estimate, admitted=admitted,
                               base_mode=base_mode, jump_active=jump_active)
-        following, next_goal = following.finish_command(result.command, goal, mode=result.mode)
+        following, next_goal = following.finish_command(result.command, goal, mode=result.mode,
+                                                         request_owned=request_owned)
         if request_height is not None:
             if request_clock is None:
                 raise ValueError('Jump goal needs both the native requested height and visible clock')

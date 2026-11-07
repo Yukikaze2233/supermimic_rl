@@ -131,7 +131,7 @@ class MotionTask:
             heading=heading)
         return following, admitted
 
-    def finish_command(self, admitted, goal, *, mode=None):
+    def finish_command(self, admitted, goal, *, mode=None, request_owned=None):
         """Apply gimbal eligibility after the request-conditioned command/mode.
 
         The controller stream retains the unassisted command in ``current``;
@@ -140,6 +140,10 @@ class MotionTask:
         selected_mode = self.route[..., 3] if mode is None else mode
         eligible = ((self.route[..., 1] == 0) & (self.route[..., 2] == 1) & (selected_mode == 0)
                     & (self.timing[..., 0] >= self.gimbal[..., 4]) & (admitted[..., :3] != 0).any(-1))
+        if request_owned is not None:
+            if request_owned.shape != eligible.shape or request_owned.dtype != torch.bool:
+                raise ValueError('Chassis request ownership requires one bool per command row')
+            eligible = eligible & ~request_owned
         special = (self.gimbal[..., 0] > .5) & eligible
         command = torch.cat((torch.where(special[..., None], 0., admitted[..., :2]),
                               torch.where(special, self.gimbal[..., 3], admitted[..., 2])[..., None],

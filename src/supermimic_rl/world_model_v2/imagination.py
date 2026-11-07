@@ -161,6 +161,9 @@ class Imagination:
         if critic.jumps != (jump_task is not None) or jump_task is not None and stair_source is None:
             raise ValueError('Jump imagination needs its physical task, source arbitration and critic state together')
         self.jump_task = jump_task
+        self.request_gimbal_exclusion = getattr(reward, 'request_gimbal_exclusion', False)
+        if self.request_gimbal_exclusion and jump_task is None:
+            raise ValueError('Request-owned gimbal arbitration needs recorded jump state')
         if critic.jump_trigger != (jump_task is not None and jump_task.config.trigger is not None):
             raise ValueError('Jump gate rollout and critic causal features must be enabled together')
         if critic.recovery != (recovery_task is not None) or recovery_task is not None and jump_task is None:
@@ -590,7 +593,8 @@ class Imagination:
                         ground_z=ground, interval_uniform=start['jump_uniform'][rows, step],
                         latency=start['tof_latency'][rows, step], draws=start['tof_uniform'][rows, step],
                         retain_peak_gradient=getattr(getattr(self.reward, 'extensions', None),
-                                                     'jump_peak_completion', False))
+                                                     'jump_peak_completion', False),
+                        request_gimbal_exclusion=self.request_gimbal_exclusion)
                     advanced = platform_boundary.source
                     jump = _scatter_prediction(rows, platform_boundary.jump.state, jump)
                     platform_intent = _scatter_prediction(rows, platform_boundary.intent, platform_intent)
@@ -614,6 +618,11 @@ class Imagination:
                     jump_inputs = {'admission': (following, jumped.command), 'base_mode': jumped.mode,
                         'jump_active': jumped.state.active_id >= 0, 'request_height': jumped.request_height,
                         'request_clock': jumped.request_clock}
+                    if self.request_gimbal_exclusion:
+                        from ..course.gimbal_arbitration import request_owns_chassis
+
+                        jump_inputs['request_owned'] = request_owns_chassis(
+                            start['task_family'][rows, 0].long(), jumped.state.physical_id)
                     jump = _scatter_prediction(rows, jumped.state, jump)
                 if platform_intent is None:
                     advanced = self.stair_source.advance(_take_rows(source, rows), _take_rows(stair, rows),

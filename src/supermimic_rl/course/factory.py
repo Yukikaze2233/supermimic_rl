@@ -168,6 +168,10 @@ def create_course(configuration):
             jump_tasks=native._terrain_course.tasks,
             **({} if platform_owner is None else {'platform_landing': platform_owner.landing}))
         course_schedule_receipt = install_jump_first_command_pool(native._terrain_course.tasks, curriculum)
+        from .gimbal_arbitration import install_request_gimbal_exclusion
+
+        gimbal_arbitration_receipt = install_request_gimbal_exclusion(
+            native, enabled=configuration.get('request_gimbal_exclusion', False))
         jump_takeoff_receipt = stair_label_receipt = None
         if configuration.get("jump_takeoff") is not None:
             from .jump_takeoff import install_jump_takeoff
@@ -226,6 +230,8 @@ def create_course(configuration):
             "sdk_versions": {package: metadata.version(package) for package in strategy.sdk_packages}}
         if stair_retry_receipt is not None:
             provenance['stair_timeout_retry'] = stair_retry_receipt
+        if gimbal_arbitration_receipt is not None:
+            provenance['request_gimbal_exclusion'] = gimbal_arbitration_receipt
         if recovery_bridge_receipt is not None:
             provenance['recovery_roll_bridge'] = recovery_bridge_receipt
         if platform_owner is not None:

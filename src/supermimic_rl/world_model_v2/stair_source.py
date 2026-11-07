@@ -282,7 +282,7 @@ class IdealStairSource:
     def advance(self, source, stair, *, task, motion, physical, wheel_centres, wheel_radius,
                 terrain_tile, queues, readout, goal, estimate, physics_dt_s, latency, draws, external=None,
                 admission=None, base_mode=None, jump_active=None, request_height=None, request_clock=None,
-                reservation=None):
+                reservation=None, request_owned=None):
         """Complete one boundary: detect -> release -> protocol/FSM -> rearm -> goal.
 
         Caller reservation suppresses only new ToF submissions. Detection,
@@ -319,7 +319,8 @@ class IdealStairSource:
             torch.where(matched, external.completed_id, completed), external.safety_abort)
         boundary = task.advance_motion(stair, packet, motion=motion, queues=queues, readout=readout,
             goal=goal, estimate=estimate, physics_dt_s=physics_dt_s, admission=admission,
-            base_mode=base_mode, jump_active=jump_active, request_height=request_height, request_clock=request_clock)
+            base_mode=base_mode, jump_active=jump_active, request_height=request_height,
+            request_clock=request_clock, request_owned=request_owned)
         result = boundary.stair
         accepted = result.response == int(RequestResponse.ACCEPTED)
         trigger.record_responses(fired, accepted, active_id=result.protocol_active_id)

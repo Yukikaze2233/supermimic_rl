@@ -189,6 +189,12 @@ class OrdinaryFlatReward:
             raise ValueError('The four-tick reward requires the recorded 200/50 Hz clocks')
         # Native-collection extensions (if any) are part of the pinned source identity.
         self.extensions = RewardExtensions(**source.get('reward_kernel', {}).get('extensions', {}))
+        self.request_gimbal_exclusion = source.get('request_gimbal_exclusion') is not None
+        if self.request_gimbal_exclusion:
+            from ..course.gimbal_arbitration import arbitration_receipt
+
+            if source['request_gimbal_exclusion'] != arbitration_receipt():
+                raise ValueError('Imagined chassis request ownership differs from its native source')
         self.jump_geometry = None
         if self.extensions.jump_flight_clearance or self.extensions.jump_tuck:
             self.jump_geometry = JumpRewardGeometry(geometry)
