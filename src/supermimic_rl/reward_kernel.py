@@ -99,6 +99,14 @@ class RewardExtensions:
     ``ordinary_leg_acceleration`` overrides the physical acceleration cost
     only for normal, slope and stair locomotion. None retains the native
     5e-7 coefficient; jump and recovery always retain their native cost.
+
+    ``jump_flight_clearance`` spends the existing flight reward on continuous
+    common wheel clearance instead of a binary contact event. Requested root
+    rise normalizes distance; it is not a new clearance success threshold.
+    ``jump_tuck`` rewards shortening each virtual leg toward the source's
+    closed-chain minimum, normalized by that same source's reachable span.
+    Both use the first real flight window, never the supported push. Geometry
+    remains reward-only and does not change observations or physical success.
     """
 
     jump_flight: float = 0.        # per second in the request's first real flight (after real ascent)
@@ -115,8 +123,13 @@ class RewardExtensions:
     stationary_quiet: float = 0.  # per second at upright target height and quiet supported NORMAL standstill
     jump_physical_tail: bool = False  # retain existing completion/landing terms until physical request ends
     jump_extension_height_floor: bool = False  # release only above-reference height in pre-touchdown EXTENSION
+    jump_flight_clearance: bool = False  # make the existing flight budget differentiable in wheel clearance
+    jump_tuck: float = 0.  # per second at the source's minimum virtual leg length, only in real flight
 
     def __post_init__(self):
+        if (type(self.jump_flight_clearance) is not bool
+                or self.jump_flight_clearance and self.jump_flight <= 0):
+            raise ValueError('Jump flight clearance requires a boolean flag and positive jump_flight weight')
         if type(self.jump_extension_height_floor) is not bool:
             raise ValueError('Jump extension height floor requires a boolean flag')
         if type(self.jump_peak_completion) is not bool or self.jump_peak_completion and self.jump_missed <= 0:
@@ -124,7 +137,7 @@ class RewardExtensions:
         if type(self.jump_physical_tail) is not bool or self.jump_physical_tail and not self.jump_peak_completion:
             raise ValueError('Jump physical tail requires a boolean flag and enabled jump_peak_completion')
         values = (self.jump_flight, self.jump_lift, self.jump_lift_cap_m_s, self.jump_push, self.jump_missed,
-                  self.jump_settle, self.jump_landing_rate, self.recovery_quiet, self.stationary_quiet,
+                  self.jump_settle, self.jump_landing_rate, self.recovery_quiet, self.stationary_quiet, self.jump_tuck,
                   0. if self.ordinary_leg_acceleration is None else self.ordinary_leg_acceleration,
                   1. if self.success_event is None else self.success_event)
         if any(type(value) not in (int, float) or not math.isfinite(value) or value < 0 for value in values):
@@ -135,12 +148,53 @@ class RewardExtensions:
         return bool(self.jump_flight or self.jump_lift or self.jump_push or self.jump_missed or self.jump_settle
                     or self.jump_landing_rate or self.recovery_quiet or self.success_event is not None
                     or self.ordinary_leg_acceleration is not None or self.stationary_quiet
-                    or self.jump_extension_height_floor)
+                    or self.jump_extension_height_floor or self.jump_tuck)
 
     @property
     def needs_jump_progress(self) -> bool:
         return bool(self.jump_flight or self.jump_lift or self.jump_push or self.jump_missed or self.jump_settle
-                    or self.jump_landing_rate or self.stationary_quiet or self.jump_extension_height_floor)
+                    or self.jump_landing_rate or self.stationary_quiet or self.jump_extension_height_floor
+                    or self.jump_tuck)
+
+
+@dataclass(frozen=True)
+class JumpFlightGeometry:
+    """Reward-only two-wheel geometry in metres, from the same bound source.
+
+    Clearance uses the actual collision-cylinder bottom and its local ground.
+    Virtual length is hip-axis origin to wheel-link origin, not root-to-wheel
+    distance or a world-Z projection. Minimum and span are expanded source
+    constants over that source's configured closed-chain stop interval.
+    ``valid`` carries terrain/FK availability; it is not a learned contact gate.
+    """
+
+    wheel_clearance_m: Tensor
+    leg_length_m: Tensor
+    minimum_leg_length_m: Tensor
+    leg_length_range_m: Tensor
+    valid: Tensor
+
+    def validate(self, prototype: Tensor) -> None:
+        values = (self.wheel_clearance_m, self.leg_length_m,
+                  self.minimum_leg_length_m, self.leg_length_range_m)
+        if (self.valid.shape != prototype.shape or self.valid.device != prototype.device
+                or self.valid.dtype != torch.bool
+                or any(value.shape != (*prototype.shape, 2) or value.device != prototype.device
+                       or not value.is_floating_point() for value in values)):
+            raise ValueError('Jump flight geometry needs matching floating two-wheel rows and a boolean validity mask')
+
+    @classmethod
+    def cat(cls, items):
+        items = tuple(items)
+        return cls(*(torch.cat([getattr(item, name) for item in items])
+                     for name in cls.__dataclass_fields__))
+
+    def intervals(self, count):
+        return type(self)(*(getattr(self, name).unflatten(0, (count, 4))
+                            for name in self.__dataclass_fields__))
+
+    def tick(self, index):
+        return type(self)(*(getattr(self, name)[:, index] for name in self.__dataclass_fields__))
 
 
 @dataclass(frozen=True)
@@ -149,7 +203,7 @@ class JumpProgress:
 
     ``reference_stage`` is the reference clock stage (int64), held across one
     policy interval. ``ascent_seen`` is the native per-request latch of real
-    ascent (upward COM speed > 0.15 m/s and rise > 1 cm). ``flight_started``
+    ascent (upward root-origin speed > 0.15 m/s and rise > 1 cm). ``flight_started``
     additionally requires the native two airborne ticks: extending a supported
     leg can satisfy ascent alone. ``flight_closed``
     marks that the request's first real flight has touched down (see
@@ -169,6 +223,7 @@ class JumpProgress:
     physical_active: Tensor | None = None  # current physical request >= 0, observed after this physics tick
     platform_bound: Tensor | None = None  # selected platform evidence belongs to that same live request
     platform_target: PlatformTargetProgress | None = None  # continuous cost only before both-wheel landing
+    flight_geometry: JumpFlightGeometry | None = None  # true wheel clearance and source-normalized virtual legs
 
     def validate(self, mode: Tensor) -> None:
         flags = tuple(flag for flag in (self.ascent_seen, self.flight_closed, self.flight_started,
@@ -183,6 +238,8 @@ class JumpProgress:
             raise ValueError('Jump progress needs matching int64 reference stages, boolean latches and float times')
         if self.platform_target is not None:
             self.platform_target.validate(mode)
+        if self.flight_geometry is not None:
+            self.flight_geometry.validate(mode)
         peaks = (self.peak_rise, self.requested_rise)
         if ((peaks[0] is None) != (peaks[1] is None)
                 or any(value is not None and (value.shape != mode.shape or value.device != mode.device
@@ -201,7 +258,8 @@ class JumpProgress:
                 or len({item.requested_rise is None for item in items}) != 1
                 or len({item.physical_active is None for item in items}) != 1
                 or len({item.platform_bound is None for item in items}) != 1
-                or len({item.platform_target is None for item in items}) != 1):
+                or len({item.platform_target is None for item in items}) != 1
+                or len({item.flight_geometry is None for item in items}) != 1):
             raise ValueError('Jump progress coverage changes within a physical interval')
         optional = lambda name: (None if getattr(items[0], name) is None
                                  else torch.cat([getattr(item, name) for item in items]))
@@ -211,7 +269,9 @@ class JumpProgress:
                             optional('peak_rise'), optional('requested_rise'), optional('physical_active'),
                             optional('platform_bound'),
                             None if items[0].platform_target is None else
-                            PlatformTargetProgress.cat(item.platform_target for item in items))
+                            PlatformTargetProgress.cat(item.platform_target for item in items),
+                            None if items[0].flight_geometry is None else
+                            JumpFlightGeometry.cat(item.flight_geometry for item in items))
 
 
 def advance_flight_latch(request: Tensor, lifted: Tensor, closed: Tensor, *, current: Tensor,
@@ -644,7 +704,10 @@ def physical_reward_densities(sample: RewardPhysics, reference: RewardReference,
         target_scope = (target.eligible & jump_progress.platform_bound
                         & jump_progress.physical_active)
         cost['jump_target'] = extensions.jump_missed * torch.where(target_scope, target.cost, 0.)
-    if extensions.jump_flight or extensions.jump_lift:
+    flight_geometry_available = torch.zeros_like(jump)
+    common_clearance = torch.zeros_like(v_up)
+    tuck_shortfall = torch.zeros_like(v_up)
+    if extensions.jump_flight or extensions.jump_lift or extensions.jump_tuck:
         # As SCUT's takeoff state machine, the flight window opens at the
         # physical takeoff event (not the reference clock), so late real
         # jumps still count, and closes at the first touchdown of the request.
@@ -655,9 +718,53 @@ def physical_reward_densities(sample: RewardPhysics, reference: RewardReference,
                     raise ValueError('Jump flight rewards require the first-flight latch of the request')
             else:
                 flying = jump & (phase == int(RewardPhase.FLIGHT)) & ascended & ~closed
+        geometry_flight = flying
+        flight_score = flying.to(v_up.dtype)
+        if extensions.jump_flight_clearance or extensions.jump_tuck:
+            geometry = None if jump_progress is None else jump_progress.flight_geometry
+            if geometry is None:
+                if jump.any():
+                    raise ValueError('Jump geometric flight rewards require an explicit flight geometry producer')
+                if extensions.jump_tuck:
+                    positive['jump_tuck'] = torch.zeros_like(v_up)
+            else:
+                geometry.validate(reference.mode)
+                numeric = (torch.isfinite(torch.stack((geometry.wheel_clearance_m, geometry.leg_length_m,
+                                                       geometry.minimum_leg_length_m,
+                                                       geometry.leg_length_range_m), -1)).all((-2, -1))
+                           & (geometry.leg_length_m > 0).all(-1)
+                           & (geometry.minimum_leg_length_m > 0).all(-1)
+                           & (geometry.leg_length_range_m > 0).all(-1))
+                requested = jump_progress.requested_rise
+                if extensions.jump_flight_clearance:
+                    if requested is None:
+                        if jump.any():
+                            raise ValueError('Jump flight clearance requires the admitted requested rise')
+                        requested = torch.ones_like(v_up)
+                    numeric &= torch.isfinite(requested) & (requested > 0)
+                invalid |= geometry_flight & geometry.valid & ~numeric
+                flight_geometry_available = geometry_flight & geometry.valid & numeric
+                # Invalid terrain rows follow the existing producer's reset/mask
+                # path. Select finite values before arithmetic so an unrelated
+                # missing query cannot poison another row's BPTT derivative.
+                available = flight_geometry_available[:, None]
+                clearance = torch.where(available, geometry.wheel_clearance_m, 0.)
+                common_clearance = clearance.amin(-1)
+                if extensions.jump_flight_clearance:
+                    scale = torch.where(flight_geometry_available, requested, 1.)
+                    raised = common_clearance.clamp_min(0)
+                    flight_score = raised / (scale + raised)
+                if extensions.jump_tuck:
+                    length = torch.where(available, geometry.leg_length_m, 0.)
+                    minimum = torch.where(available, geometry.minimum_leg_length_m, 0.)
+                    span = torch.where(available, geometry.leg_length_range_m, 1.)
+                    shortfall = (length - minimum).clamp_min(0)
+                    tuck_shortfall = shortfall.mean(-1)
+                    tuck_score = (1 + (shortfall / span).square()).reciprocal().mean(-1)
+                    positive['jump_tuck'] = (extensions.jump_tuck * flight_geometry_available * tuck_score)
         flying = flying.to(v_up.dtype)
         rise = sample.velocity_origin_world_m_s[:, 2].clamp(0, extensions.jump_lift_cap_m_s)
-        positive['jump_flight'] = extensions.jump_flight * flying
+        positive['jump_flight'] = extensions.jump_flight * flight_score
         positive['jump_lift'] = extensions.jump_lift * flying * rise
     if extensions.jump_push:
         # Supported (not airborne) while the reference demands upward speed,
@@ -718,7 +825,7 @@ def physical_reward_densities(sample: RewardPhysics, reference: RewardReference,
     positive_bound = torch.where(gimbal_active, 11., 8.)
     positive_bound = (positive_bound + extensions.jump_flight + extensions.jump_lift * extensions.jump_lift_cap_m_s
                       + extensions.jump_push + extensions.jump_settle + extensions.recovery_quiet
-                      + extensions.stationary_quiet)
+                      + extensions.stationary_quiet + extensions.jump_tuck)
     if rough_dash:
         # 10 centering + 20 zero torque + 10 directional wheel speed.
         positive_bound = positive_bound + 40 * rough_active
@@ -743,6 +850,10 @@ def physical_reward_densities(sample: RewardPhysics, reference: RewardReference,
               'jump_world_height_m': jump_eh, 'jump_world_vertical_m_s': evz,
               'roll_rad': pose[:, 0], 'pitch_rad': pose[:, 1],
               'stationary_world_xy_speed_m_s': horizontal.norm(dim=-1), 'leg_fork_m': fork}
+    if extensions.jump_flight_clearance or extensions.jump_tuck:
+        gates['jump_flight_geometry_available'] = flight_geometry_available
+        errors['jump_common_clearance_m'] = common_clearance
+        errors['jump_tuck_length_excess_m'] = tuck_shortfall
     if extensions.jump_missed and jump_progress is not None and jump_progress.platform_target is not None:
         target = jump_progress.platform_target
         gates['jump_target_eligible'] = target.eligible
