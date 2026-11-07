@@ -39,7 +39,8 @@ def atlas_contact_profile(path, expected_sha256):
         "native_other_body_mu": "(.25 + source_ground_mu) / (2 * atlas_reference_mu)",
         "effective_pair": "source_average_pair * actual_tile_mu / atlas_reference_mu",
         "sampling": "one CPU uniform ground draw per environment at startup; seed xor 0x434F4E54",
-        "nominal_lanes": "contact draw retained, as in the source contact domain",
+        "nominal_lanes": "preserve original native robot materials using the existing startup nominal mask",
+        "mixture": "project nominal/low-grip mixture; differs from source contact-on-all-lanes semantics",
         "terrain_materials_changed": False, "terrain_geometry_changed": False,
         "restitution_unchanged": True, "reset_resampling": False,
         "classification": "derived atlas-relative simulation stress; not measured hardware friction",
@@ -166,6 +167,8 @@ def apply_physx_contact_mapping(reader, randomization, profile, scene, *, tensor
     target[:, :, :2] = body[:, None, None]
     for start, end in reader._ranges:
         target[:, start:end, :2] = wheel[:, None, None]
+    nominal = randomization.nominal.detach().cpu()
+    target[nominal] = source[nominal]
     reader._startup_applied = True
     indices = torch.arange(reader.num_envs, dtype=torch.int32)
     reader._view.set_material_properties(tensor_to_native(target.contiguous()), tensor_to_native(indices))
@@ -185,18 +188,29 @@ def apply_physx_contact_mapping(reader, randomization, profile, scene, *, tensor
                     if all(not start <= index < end for start, end in reader._ranges)]
     body_actual = actual[:, body_indices, :2]
     # These products use the native readback, not merely the sampled requests.
-    flat_pair_error = (wheel_actual * reference - wheel_pair[:, None, None]).abs().max()
-    body_pair_error = (body_actual * reference - body_pair[:, None, None]).abs().max()
+    stress = ~nominal
+    flat_pair_error = ((wheel_actual[stress] * reference - wheel_pair[stress, None, None]).abs().max()
+                       if stress.any() else torch.tensor(0.))
+    body_pair_error = ((body_actual[stress] * reference - body_pair[stress, None, None]).abs().max()
+                       if stress.any() else torch.tensor(0.))
     pair_values = wheel_actual[:, :, None, :] * after_mu[None, None, :, :2]
     body_values = body_actual[:, :, None, :] * after_mu[None, None, :, :2]
     receipt = {
         "profile": profile, "status": "native_readback_matched", "seed": randomization.seed,
         "ground_draw_sha256": _digest(ground), "robot_native_sha256": _digest(actual),
+        "original_robot_native_sha256": _digest(source),
         "terrain_bound_sha256": _digest(after_mu), "scene_readback": evidence,
         "robot_environment_count": reader.num_envs, "robot_shapes_per_environment": actual.shape[1],
         "source_ground_draw_range": [float(ground.min()), float(ground.max())],
-        "native_wheel_mu_range": [float(wheel.min()), float(wheel.max())],
-        "native_other_body_mu_range": [float(body.min()), float(body.max())],
+        "sampled_stress_wheel_mu_range": [float(wheel.min()), float(wheel.max())],
+        "sampled_stress_other_body_mu_range": [float(body.min()), float(body.max())],
+        "native_wheel_mu_range": [float(wheel_actual.min()), float(wheel_actual.max())],
+        "native_other_body_mu_range": [float(body_actual.min()), float(body_actual.max())],
+        "nominal_rows": int(nominal.sum()), "low_grip_rows": int(stress.sum()),
+        "nominal_mask_sha256": _digest(nominal),
+        "original_nominal_native_sha256": _digest(source[nominal]),
+        "actual_nominal_native_sha256": _digest(actual[nominal]),
+        "nominal_native_properties_unchanged": bool(torch.equal(actual[nominal], source[nominal])),
         "actual_reference_wheel_pair_error_max": float(flat_pair_error),
         "actual_reference_body_pair_error_max": float(body_pair_error),
         "actual_wheel_pair_all_tiles_range": [float(pair_values.min()), float(pair_values.max())],

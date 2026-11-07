@@ -68,7 +68,7 @@ def setup(tmp_path, *, reference=.7):
     robot = SimpleNamespace(body_names=["base_link", "L_link3", "R_link3", "gimbal"],
                             root_view=view, _physics_sim_view=source)
     reader = WheelMaterialReader(robot, (1, 2), num_envs=8, device="cpu", native_to_tensor=lambda x: x)
-    randomization = CourseRandomization(8, 71, config=RequestedRandomizationConfig(nominal_fraction=1.))
+    randomization = CourseRandomization(8, 71, config=RequestedRandomizationConfig(nominal_fraction=.25))
     return reader, randomization, profile, Scene(), atlas
 
 
@@ -78,6 +78,7 @@ def apply(reader, randomization, profile, scene):
 
 def test_flat_source_pair_and_authored_tile_ratios_from_full_native_readback(tmp_path):
     reader, randomization, profile, scene, _ = setup(tmp_path)
+    randomization.nominal[[1, 6]] = True  # Exercise both lanes without relying on an eight-row Bernoulli draw.
     before = reader._read_native().clone()
     before_scene = scene.values.clone()
     rng = torch.get_rng_state().clone()
@@ -88,19 +89,26 @@ def test_flat_source_pair_and_authored_tile_ratios_from_full_native_readback(tmp
     ground = .3 + .2 * torch.rand(8, generator=torch.Generator().manual_seed(71 ^ 0x434F4E54))
     wheel, body = (.1 + ground) / 2, (.25 + ground) / 2
     actual = reader._read_native()
-    torch.testing.assert_close(actual[:, 1:5, :2] * .7, wheel[:, None, None].expand(-1, 4, 2))
-    torch.testing.assert_close(actual[:, [0, 5], :2] * .7, body[:, None, None].expand(-1, 2, 2))
+    stress = ~randomization.nominal
+    assert stress.any() and randomization.nominal.any()
+    torch.testing.assert_close(actual[stress, 1:5, :2] * .7, wheel[stress, None, None].expand(-1, 4, 2))
+    torch.testing.assert_close(actual[stress][:, [0, 5], :2] * .7, body[stress, None, None].expand(-1, 2, 2))
     for terrain in scene.values[:, 0]:
-        torch.testing.assert_close(actual[:, 1, 0] * terrain, wheel * terrain / .7)
+        torch.testing.assert_close(actual[stress, 1, 0] * terrain, wheel[stress] * terrain / .7)
     assert torch.equal(actual[:, :, 2], before[:, :, 2])
+    assert torch.equal(actual[randomization.nominal], before[randomization.nominal])
     assert torch.equal(before_scene, scene.values)
-    assert randomization.nominal.all() and ground.unique().numel() == 8
+    assert ground.unique().numel() == 8
     assert reader._view.writes == 1 and scene.reads == 2
     assert result["actual_reference_wheel_pair_error_max"] < 3e-8
     assert result["restitution_unchanged"] and result["native_all_robot_shapes_readback"]
+    assert result["nominal_native_properties_unchanged"]
+    assert result["nominal_rows"] == int(randomization.nominal.sum())
+    assert result["low_grip_rows"] == int(stress.sum())
     assert not result["terrain_materials_changed"]
     assert contact_provenance(reader, backend="physx")["applied"]
-    torch.testing.assert_close(reader.features()[:, [0, 1, 3, 4]], (wheel / .7)[:, None].expand(-1, 4))
+    torch.testing.assert_close(reader.features()[stress][:, [0, 1, 3, 4]],
+                               (wheel[stress] / .7)[:, None].expand(-1, 4))
     with pytest.raises(ValueError, match="startup ownership"):
         apply(reader, randomization, profile, scene)
 
@@ -158,3 +166,18 @@ def test_sampled_floats_are_setup_evidence_not_environment_identity(tmp_path):
     assert first.receipt["requested_contact_mapping"]["ground_draw_sha256"] != second.receipt[
         "requested_contact_mapping"]["ground_draw_sha256"]
     assert contact_provenance(first, backend="physx") == contact_provenance(second, backend="physx")
+
+
+def test_all_nominal_preserves_arbitrary_original_properties_and_consumes_same_contact_draw(tmp_path):
+    reader, dr, profile, scene, _ = setup(tmp_path)
+    dr.nominal[:] = True
+    before = reader._read_native().clone()
+    result = apply(reader, dr, profile, scene)
+    assert torch.equal(reader._read_native(), before)
+    assert result["nominal_rows"] == 8 and result["low_grip_rows"] == 0
+    assert result["actual_reference_wheel_pair_error_max"] == 0.
+    other, other_dr, other_profile, other_scene, _ = setup(tmp_path)
+    other_dr.nominal[:] = False
+    stress_result = apply(other, other_dr, other_profile, other_scene)
+    assert result["ground_draw_sha256"] == stress_result["ground_draw_sha256"]
+    assert stress_result["low_grip_rows"] == 8 and stress_result["nominal_rows"] == 0
