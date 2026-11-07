@@ -85,6 +85,17 @@ class FixedCourseScenarios:
         self.scenarios = {name: bank[name] for name in names}
         self.names = tuple(names)
         self.row_names = tuple(names[row % len(names)] for row in range(adapter.num_envs))
+        # An even-sized recovery suite otherwise assigns every repetition of
+        # left/right poses to opposite gimbal endpoints. Balance each posture's
+        # repetitions without changing the native endpoints or drawing RNG.
+        occurrences = {}
+        pitch_slots = []
+        for row, name in enumerate(self.row_names):
+            recovery = self.scenarios[name]['family'] == 'RECOVERY'
+            balanced = recovery and (config.recovery_qualification or config.recovery_bridges)
+            pitch_slots.append(occurrences.get(name, 0) % 2 if balanced else row % 2)
+            occurrences[name] = occurrences.get(name, 0) + 1
+        self.gimbal_pitch_slots = tuple(pitch_slots)
         self.births = torch.zeros(adapter.num_envs, dtype=torch.long, device=self.device)
         self.command_source = torch.zeros_like(self.births)
         self.qualification_clock = None
@@ -246,11 +257,11 @@ class FixedCourseScenarios:
             course.mode[row] = int(mode)
             course.special[row] = special
             course.target[row, 0] = world_angles[row, 0] if mode != GimbalMode.BODY_FIXED else 0.
-            # Opposite endpoints exist from birth, even if episodes end before
-            # the first segment boundary. Repeated rows of the 27-case suite
-            # also receive opposite endpoints because its length is odd.
+            # Recovery repetitions use both endpoints even when every episode
+            # finishes before the first segment boundary. Other suites retain
+            # their original row-based assignment.
             segment = int(self.env._terrain_course.tasks.elapsed[row] / self.pool.config.segment_s[0])
-            course.target[row, 1] = c.pitch_target_rad[(row + segment) % 2]
+            course.target[row, 1] = c.pitch_target_rad[(self.gimbal_pitch_slots[row] + segment) % 2]
             course.rate[row] = c.yaw_rate_rad_s[int(case["rotation_sign"] > 0)] if sweep else 0.
             course.speed[row] = c.translation_speed_m_s[1] if special else 0.
             course.direction[row] = 0.
@@ -355,7 +366,8 @@ class FixedCourseScenarios:
                     "coordinate_semantics": "isolated evaluation difficulty; not claimed training samples"},
                 "assigned_rows": {name: self.row_names.count(name) for name in self.names},
                 "row_assignment": [{"env_id": row, "scenario": name,
-                                    "initial_pitch_target_rad": self.env._gimbal_course.config.pitch_target_rad[row % 2]}
+                                    "initial_pitch_target_rad": self.env._gimbal_course.config.pitch_target_rad[
+                                        self.gimbal_pitch_slots[row]]}
                                    for row, name in enumerate(self.row_names)],
                 "unassigned_scenarios": [name for name in self.names if name not in self.row_names],
                 "parameters": {"task_domain": asdict(self.domain),
@@ -364,6 +376,13 @@ class FixedCourseScenarios:
                 "parameter_source": "instantiated pinned native contracts; jump low/high=effective domain endpoints, intermediate=initial-domain upper endpoint capped by effective domain; not success thresholds",
                 "placement": "requested terrain kind/height; actual routed tiles and declared collision profiles are reported separately",
                 "randomness": "scheduled command targets and collision tiles fixed; native birth/recovery handoff commands, request timing, birth, dynamics and sensor DR retained; training terrain coverage/proficiency routing excluded"}
+        if self.config.recovery_qualification or self.config.recovery_bridges:
+            result['recovery_gimbal_assignment'] = {
+                'version': 1,
+                'initial_pitch': 'Alternate existing pitch endpoints by occurrence within each recovery scenario.',
+                'segment_pitch': 'Retain the existing alternating segment schedule from each assigned endpoint.',
+                'randomness': 'No additional random draws; this balances targets, not all native birth/DR states.',
+            }
         if self.config.recovery_qualification:
             result['randomness'] = ('Native birth, handoff and segment RNG draws remain unchanged; '
                 'recovery requests inside the qualification budget use the pre-authored stationary override. '

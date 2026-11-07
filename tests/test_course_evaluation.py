@@ -174,6 +174,41 @@ def test_fixed_bridge_selection_requires_installed_geometry_and_boolean_config(a
     assert plan._restore == []
 
 
+@pytest.mark.parametrize('bridges', [False, True])
+def test_recovery_repetitions_balance_gimbal_endpoints_without_rng_draws(adapter, bridges):
+    from transformer_rl.formal.tasks.gimbal_course import GimbalCourse
+    from transformer_rl.formal.tasks.recovery import RECOVERY_NAMES
+
+    count = 22 if bridges else 16
+    adapter.num_envs = 4 * count
+    adapter.curriculum = type(adapter.curriculum)(adapter.num_envs, config=replace(
+        adapter.curriculum.config, recovery_roll_bridge=bridges, recovery_postures=RECOVERY_NAMES))
+    course = GimbalCourse(adapter.env._gimbal_course.config, adapter.num_envs)
+    adapter.env._gimbal_course = course
+    adapter.env._terrain_course.tasks.elapsed = torch.zeros(adapter.num_envs)
+    adapter.env._terrain_course.recovery = SimpleNamespace(config=SimpleNamespace(timeout_s=5.))
+    rng = adapter.curriculum.sampler.generator.get_state().clone()
+    plan = FixedCourseScenarios(adapter, CourseEvaluationConfig(
+        family='RECOVERY', recovery_qualification=True, recovery_bridges=bridges))
+    assert len(plan.names) == count
+    rows = torch.arange(adapter.num_envs)
+    angles = torch.zeros(adapter.num_envs, 2)
+    eligible = torch.ones(adapter.num_envs, dtype=torch.bool)
+    plan.draw_gimbal(rows, angles, eligible, update=0)
+    initial = course.target[:, 1].clone()
+    for name in plan.names:
+        selected = [row for row, scenario in enumerate(plan.row_names) if scenario == name]
+        assert initial[selected].tolist() == pytest.approx(list(course.config.pitch_target_rad) * 2)
+    description = plan.description()
+    assert description['recovery_gimbal_assignment']['version'] == 1
+    assert [r['initial_pitch_target_rad'] for r in description['row_assignment']] == pytest.approx(initial.tolist())
+    adapter.env._terrain_course.tasks.elapsed.fill_(plan.pool.config.segment_s[0])
+    plan.draw_gimbal(rows, angles, eligible, update=0)
+    assert course.target[:, 1].tolist() == pytest.approx(
+        [course.config.pitch_target_rad[1 - slot] for slot in plan.gimbal_pitch_slots])
+    torch.testing.assert_close(rng, adapter.curriculum.sampler.generator.get_state(), atol=0, rtol=0)
+
+
 def test_fixed_jump_evaluation_uses_the_selected_schedule_order_and_domain(adapter):
     from supermimic_rl.course.jump_first import JumpFirstCurriculum
 
