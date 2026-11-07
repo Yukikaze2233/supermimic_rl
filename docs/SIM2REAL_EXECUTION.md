@@ -13,6 +13,14 @@
 
 轮时延在每个 5 ms 物理步的力矩边界计算。5 ms 单位脉冲的左/右响应分别为 `[0,.9,.1,0]`、`[.3,.7,0,0]`，保存延迟后零阶保持指令的区间平均冲量；没有向上取整成 10/5 ms。这不保证接触与饱和下的轨迹等同于更高物理频率。
 
+## 轮聚合时延的 episode 随机化
+
+factory 的 `wheel_delay_randomization=true` 启用 PPO 的可选模型参数压力分布。范围来自冻结 `wheel_model.json` 的 `uncertainty.delay`：训练方向之间的聚合时延为 3–6 ms。它不是逐 tick 抖动的实测概率分布，也不是独立 USB 时延。
+
+每个 episode 为左右轮分别抽取 U[3,6] ms，按已有课程 smoothstep 从名义值插值到该范围。已有共享 nominal lanes（默认约 25%）保持左 5.5 / 右 3.5 ms。抽样值**替代**原聚合时延，继续用同一物理力矩队列，不串联新延迟。部分 reset 只重采并清空对应行；临时禁用电机只清队列、不重采时延。独立 RNG 不消耗现有 DR 随机流，组件 checkpoint 显式保存该 RNG。
+
+`course-provenance.json` 的 `wheel_delay_randomization` 记录分布、范围来源和归属；每次 snapshot 的 `requested.wheel_aggregate_delay_s` 记录实际左右轮秒数。默认关闭时，旧 context、队列、receipt 和 DR 随机流不变；开启后 snapshot 的 context 明确增加两维，Actor 5×35 与原生 critic 不变。原生子步诊断仍可记录。当前 compact 世界模型使用固定时延假设，因此 `SnapshotLayout` 明确拒绝该新 context；不能把旧 WM 当作已覆盖这种域随机化。
+
 ## PhysX 轮静摩擦
 
 factory 的 `identified_friction_mode="native_floor"` 启用已存在的模型分工：PhysX 承担轮静摩擦和动摩擦基值，软件只计算剩余运动摩擦。默认 `software_dynamic` 保留旧运行语义；Kamino 不支持这对独立系数，不能直接启用。

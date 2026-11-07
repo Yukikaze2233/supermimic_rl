@@ -23,6 +23,9 @@ def _read_pinned(path, digest):
 
 def create_course(configuration):
     """Full45 history MLP course using the source FSM and exact static terrain."""
+    wheel_delay_randomization = configuration.get('wheel_delay_randomization', False)
+    if type(wheel_delay_randomization) is not bool:
+        raise ValueError('Wheel delay randomization must be a boolean')
     motion_trajectory_owner = configuration.get('motion_trajectory_owner', False)
     if type(motion_trajectory_owner) is not bool:
         raise ValueError('Motion trajectory owner must be a boolean')
@@ -112,7 +115,8 @@ def create_course(configuration):
         execution = IdentifiedExecution(
             configuration["num_envs"], configuration["device"], sensors.physics_dt_s,
             asset_directory=asset_directory, bundle_directory=configuration["identified_bundle"],
-            friction_mode=strategy.identified_friction_mode)
+            friction_mode=strategy.identified_friction_mode,
+            wheel_delay_randomization=wheel_delay_randomization)
         cfg = build_course_env_cfg(
             asset, atlas, num_envs=configuration["num_envs"], device=configuration["device"],
             seed=configuration.get("seed", 7), environment_spacing_m=runtime["environment_spacing_m"],
@@ -125,8 +129,16 @@ def create_course(configuration):
                                  device=configuration["device"], declarative_scene=launcher.declarative_scene, backend=backend)
         configure_identified_actuators(cfg, execution, backend=strategy.execution_backend)
         cfg.loop_telemetry_enabled = True
-        randomization = CourseRandomization(configuration["num_envs"], configuration.get("seed", 7),
-                                            configuration["device"], RequestedRandomizationConfig(**runtime["requested_randomization"]))
+        randomization_type = CourseRandomization
+        randomization_arguments = {}
+        if wheel_delay_randomization:
+            from .wheel_delay import WheelDelayRandomization
+
+            randomization_type = WheelDelayRandomization
+            randomization_arguments['execution'] = execution
+        randomization = randomization_type(configuration["num_envs"], configuration.get("seed", 7),
+                                            configuration["device"], RequestedRandomizationConfig(**runtime["requested_randomization"]),
+                                            **randomization_arguments)
         randomized_type = strategy.environment_type(WheeledLabEnv, randomization, execution)
         environment_type = make_environment(make_root_twist_corrected_environment(randomized_type), execution)
         native = environment_type(cfg)
@@ -239,6 +251,8 @@ def create_course(configuration):
             "model_state": "full physical articulation, controller memories, local terrain scan, course memories",
             "native_execution_validated": False,
             "sdk_versions": {package: metadata.version(package) for package in strategy.sdk_packages}}
+        if wheel_delay_randomization:
+            provenance['wheel_delay_randomization'] = randomization.receipt()
         if stair_retry_receipt is not None:
             provenance['stair_timeout_retry'] = stair_retry_receipt
         if gimbal_arbitration_receipt is not None:

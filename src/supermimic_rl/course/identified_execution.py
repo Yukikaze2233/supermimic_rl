@@ -21,6 +21,9 @@ from torch import Tensor
 
 ACTION_ORDER = ("L_joint1", "LL_joint1", "R_joint1", "RR_joint1", "L_joint3", "R_joint3")
 SPRING_ORDER = ("L_spring_slide", "R_spring_slide")
+# Pinned wheel_model.json uncertainty: aggregate variation between directions,
+# not a measured per-tick jitter distribution or an additional USB latency.
+WHEEL_AGGREGATE_DELAY_BOUNDS_S = (.003, .006)
 MODEL_PINS = {
     "wheel_model.json": "01d52214771bb9dea2cb592eff4dc6fbd27bb096faa90ff1e17b5d898a1e877c",
     "leg_model.json": "90d299995f24ba38e6c1ed67e32dd40b9b2fa26e041f2f814db1e177ac040b52",
@@ -63,14 +66,18 @@ class IdentifiedExecution:
 
     def __init__(self, count: int, device: str | torch.device, dt: float, *,
                  asset_directory: str | Path, bundle_directory: str | Path,
-                 friction_mode: str, dtype: torch.dtype = torch.float32):
+                 friction_mode: str, dtype: torch.dtype = torch.float32,
+                 wheel_delay_randomization: bool = False):
         if type(count) is not int or count < 1 or not math.isfinite(dt) or dt <= 0:
             raise ValueError("Response requires positive batch size and physics dt")
         if friction_mode not in ("native_floor", "software_dynamic"):
             raise ValueError("Choose explicit native_floor or software_dynamic friction ownership")
         if dtype not in (torch.float32, torch.float64):
             raise ValueError("Response requires float32 or float64")
+        if type(wheel_delay_randomization) is not bool:
+            raise ValueError("Wheel delay randomization requires a boolean")
         self.count, self.device, self.dtype, self.dt = count, torch.device(device), dtype, float(dt)
+        self.wheel_delay_randomization = wheel_delay_randomization
         self.invariants = None
         self.friction_mode = friction_mode
         root = Path(bundle_directory).resolve()
@@ -140,7 +147,16 @@ class IdentifiedExecution:
         delay_ticks = [r["aggregate_delay_s"] / self.dt for r in rows]
         self.whole_delay = [int(math.floor(value + 1e-10)) for value in delay_ticks]
         self.fractional_delay = [value - whole for value, whole in zip(delay_ticks, self.whole_delay)]
-        self.history = torch.zeros(max(self.whole_delay) + 2, count, 2, device=self.device, dtype=dtype)
+        maximum_whole_delay = max(self.whole_delay)
+        if wheel_delay_randomization:
+            maximum_whole_delay = max(maximum_whole_delay,
+                                      math.floor(WHEEL_AGGREGATE_DELAY_BOUNDS_S[1] / self.dt + 1e-10))
+            self.wheel_aggregate_delay_s = self._tensor(
+                [r["aggregate_delay_s"] for r in rows]).expand(count, 2).clone()
+            self._wheel_delay_rows = torch.arange(count, device=self.device)
+            self._wheel_delay_whole = torch.tensor(self.whole_delay, device=self.device).expand(count, 2).clone()
+            self._wheel_delay_fraction = self._tensor(self.fractional_delay).expand(count, 2).clone()
+        self.history = torch.zeros(maximum_whole_delay + 2, count, 2, device=self.device, dtype=dtype)
         self.head = 0
         self.passive_effort = torch.zeros(count, 6, device=self.device, dtype=dtype)
         self.drive_bound = torch.full((count, 2), self.wheel_model["software_torque_cap_nm"], device=self.device, dtype=dtype)
@@ -209,9 +225,16 @@ class IdentifiedExecution:
         self.history[self.head].copy_(wheel_input)
         delayed = torch.empty_like(wheel_input)
         for k in range(2):
-            a = self.history[(self.head - self.whole_delay[k]) % len(self.history), :, k]
-            b = self.history[(self.head - self.whole_delay[k] - 1) % len(self.history), :, k]
-            delayed[:, k] = a * (1. - self.fractional_delay[k]) + b * self.fractional_delay[k]
+            if self.wheel_delay_randomization:
+                slots = (self.head - self._wheel_delay_whole[:, k]) % len(self.history)
+                a = self.history[slots, self._wheel_delay_rows, k]
+                b = self.history[(slots - 1) % len(self.history), self._wheel_delay_rows, k]
+                fraction = self._wheel_delay_fraction[:, k]
+            else:
+                a = self.history[(self.head - self.whole_delay[k]) % len(self.history), :, k]
+                b = self.history[(self.head - self.whole_delay[k] - 1) % len(self.history), :, k]
+                fraction = self.fractional_delay[k]
+            delayed[:, k] = a * (1. - fraction) + b * fraction
         self.head = (self.head + 1) % len(self.history)
         speed = actual_velocity_rad_s[:, 4:]
         direction = (speed < 0).long()
@@ -231,6 +254,30 @@ class IdentifiedExecution:
         self.passive_effort[:, :4] = -self.leg_coulomb * (actual_velocity_rad_s[:, :4] / self.leg_band).clamp(-1., 1.)
         passive = self.passive_effort.clone()
         return ExecutionEffort(result, passive, result + passive, self.drive_bound.clone())
+
+    @torch.no_grad()
+    def set_wheel_aggregate_delay(self, rows: Tensor, delay_s: Tensor) -> None:
+        """Replace aggregate delay on reset rows, clearing their old commands.
+
+        Values are held for the episode. Motor disable clears the queue through
+        reset(), without changing this parameter or consuming random numbers.
+        """
+        if not self.wheel_delay_randomization:
+            raise ValueError("Per-episode wheel delay requires the explicit opt-in")
+        if (not isinstance(rows, Tensor) or rows.ndim != 1 or rows.dtype != torch.long
+                or rows.device != self.device or ((rows < 0) | (rows >= self.count)).any()
+                or not isinstance(delay_s, Tensor) or delay_s.shape != (len(rows), 2)
+                or delay_s.device != self.device or delay_s.dtype != self.dtype):
+            raise ValueError("Wheel delay requires selected native rows and two matching SI values per row")
+        low, high = WHEEL_AGGREGATE_DELAY_BOUNDS_S
+        if not torch.isfinite(delay_s).all() or ((delay_s < low) | (delay_s > high)).any():
+            raise ValueError("Wheel aggregate delay is outside the pinned 3–6 ms uncertainty")
+        ticks = delay_s / self.dt
+        whole = ticks.floor().long()
+        self.wheel_aggregate_delay_s[rows] = delay_s
+        self._wheel_delay_whole[rows] = whole
+        self._wheel_delay_fraction[rows] = ticks - whole
+        self.reset(rows)
 
     @torch.no_grad()
     def reset(self, ids=None) -> None:
@@ -330,7 +377,7 @@ class IdentifiedExecution:
         return IdentifiedSpringForceElement(self, body_names)
 
     def receipt(self) -> dict:
-        return {
+        result = {
             "source_commit": self.source_manifest["source_commit"], "model_pins": dict(MODEL_PINS),
             "source_manifest_sha256": self.source_manifest_sha256,
             "source_files_sha256": {name: row["sha256"] for name, row in self.source_manifest["files"].items()},
@@ -360,6 +407,11 @@ class IdentifiedExecution:
                 "Software-dynamic mode omits native static breakaway; source equivalence is not claimed.",
             ],
         }
+        if self.wheel_delay_randomization:
+            result['wheel_delay_parameter_scope'] = (
+                'wheel_aggregate_delay_s above is nominal; actual episode SI values are in '
+                'requested.wheel_aggregate_delay_s; replaces aggregate delay, no additional queue')
+        return result
 
 
 class IdentifiedSpringForceElement:

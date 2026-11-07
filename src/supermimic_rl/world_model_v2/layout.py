@@ -55,6 +55,8 @@ class SnapshotLayout:
 
     def __init__(self, schema: StateSchema, *, record_terrain: bool = False,
                  record_platform: bool = False):
+        if any(field.name == 'requested.wheel_aggregate_delay_s' for field in schema.context_fields):
+            raise ValueError('World model v2 assumes fixed wheel delay; episode delay DR is currently PPO-only')
         if not schema.substep_fields:
             raise ValueError("v2 requires recorded substep truth (record_substeps=true)")
         self.schema = schema
