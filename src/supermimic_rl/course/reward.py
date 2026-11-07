@@ -48,11 +48,15 @@ class SharedRewardComposer(PhysicalRewardComposer):
                 capture_target = getattr(platform, 'target_progress', None)
                 if capture_target is not None and self.supermimic_reward_extensions.jump_missed:
                     platform_target = capture_target(platform_bound)
+            include_peak = (self.supermimic_reward_extensions.jump_peak_completion
+                            or self.supermimic_reward_extensions.jump_flight_clearance)
             progress = JumpProgress(window['jump_reference_stage'], tasks.ascent_seen.clone(), latch.closed.clone(),
                                     tasks.landed_s.clone(), latch.lifted.clone(),
-                                    tasks.peak_rise.clone() if self.supermimic_reward_extensions.jump_peak_completion else None,
-                                    tasks.active_rise.clone() if self.supermimic_reward_extensions.jump_peak_completion else None,
-                                    (tasks.physical_id >= 0).clone(), platform_bound, platform_target)
+                                    tasks.peak_rise.clone() if include_peak else None,
+                                    tasks.active_rise.clone() if include_peak else None,
+                                    (tasks.physical_id >= 0).clone(), platform_bound, platform_target,
+                                    flight_geometry=(None if self.supermimic_jump_geometry is None
+                                                     else self.supermimic_jump_geometry(sample)))
         densities = physical_reward_densities(
             sample, reference,
             RewardHistory(window['dq'], window['action_cost'], window['action2_cost'], self._action_count),
@@ -166,7 +170,7 @@ def install_jump_tracking_reference(native) -> None:
 
 
 def install_shared_reward(composer, *, verify_native=False, extensions: RewardExtensions = RewardExtensions(),
-                          jump_tasks=None, platform_landing=None):
+                          jump_tasks=None, platform_landing=None, flight_geometry=None):
     """Instance-local installation; the frozen native source stays untouched.
 
     Extensions add opt-in terms (and may replace the success event); they are
@@ -187,6 +191,10 @@ def install_shared_reward(composer, *, verify_native=False, extensions: RewardEx
         raise ValueError('Request-aware rewards require the native jump task owner')
     if platform_landing is not None and (jump_tasks is None or platform_landing.tasks is not jump_tasks):
         raise ValueError('Platform reward evidence must share the native jump task owner')
+    needs_geometry = extensions.jump_flight_clearance or extensions.jump_tuck > 0
+    if needs_geometry != (flight_geometry is not None):
+        raise ValueError('Jump geometry producer must match the enabled geometry reward extensions')
+    composer.supermimic_jump_geometry = flight_geometry
     composer.supermimic_reward_extensions = extensions
     composer.supermimic_jump_tasks = jump_tasks
     composer.supermimic_platform_landing = platform_landing
@@ -204,8 +212,14 @@ def install_shared_reward(composer, *, verify_native=False, extensions: RewardEx
                                   else "shared_physical_reward_densities"), "physics_dt_s": composer.physics_dt_s,
                "native_source_sha256": actual,
                "kernel_sha256": hashlib.sha256(Path(inspect.getfile(physical_reward_densities)).read_bytes()).hexdigest()}
+    if flight_geometry is not None:
+        receipt['jump_flight_geometry'] = flight_geometry.receipt
     if extensions.active:
         receipt["extensions"] = asdict(extensions)
+        if not extensions.jump_flight_clearance:
+            receipt['extensions'].pop('jump_flight_clearance')
+        if not extensions.jump_tuck:
+            receipt['extensions'].pop('jump_tuck')
         if not extensions.jump_peak_completion:
             # An absent opt-in keeps old source receipts and replay contracts.
             receipt['extensions'].pop('jump_peak_completion')

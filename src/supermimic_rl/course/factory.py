@@ -153,9 +153,18 @@ def create_course(configuration):
             platform_owner = NativePlatformCourse(native, platform_plan).install_physics()
         # The native sampler installation creates LabTerrainCourse and its
         # jump task owner; the environment constructor leaves it unset.
+        extensions = RewardExtensions(**configuration.get("reward_extensions", {}))
+        jump_geometry = None
+        if extensions.jump_flight_clearance or extensions.jump_tuck:
+            from .jump_reward_geometry import JumpRewardGeometry, NativeJumpRewardGeometry
+
+            linkage_pin = configuration.get('jump_reward_linkage', {})
+            jump_geometry = NativeJumpRewardGeometry(JumpRewardGeometry.load(asset_directory,
+                linkage_pin.get('path'), expected_linkage_sha256=linkage_pin.get('sha256')),
+                native._terrain_course)
         reward_kernel_receipt = install_shared_reward(
             native._formal_reward.composer, verify_native=configuration.get("audit_reward_kernel", False),
-            extensions=RewardExtensions(**configuration.get("reward_extensions", {})),
+            extensions=extensions, flight_geometry=jump_geometry,
             jump_tasks=native._terrain_course.tasks,
             **({} if platform_owner is None else {'platform_landing': platform_owner.landing}))
         course_schedule_receipt = install_jump_first_command_pool(native._terrain_course.tasks, curriculum)

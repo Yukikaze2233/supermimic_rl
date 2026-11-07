@@ -17,6 +17,7 @@ from transformer_rl.formal.tasks.gimbal_course import GimbalRewardReference
 from ..contracts import action_bounds_from_source
 from ..reward_kernel import JumpProgress, RewardExtensions, RewardParameters
 from ..course.platform_target_reward import platform_target_progress
+from ..course.jump_reward_geometry import JumpRewardGeometry
 from .execution import WHEEL_ACTION_BOUND, LegExecution
 from .geometry import RewardGeometry
 from .records import CONTACT_BODIES, WHEEL_BODIES, decode_transforms
@@ -47,6 +48,7 @@ class LocomotionRewardContext:
     task_family: torch.Tensor | None = None
     jump_task: object | None = None
     base_com_offset: torch.Tensor | None = None
+    jump_geometry: JumpRewardGeometry | None = None
 
     def with_conditions(self, conditions):
         return replace(self, body_contact_allowed=conditions[:, 1] > .5)
@@ -111,7 +113,8 @@ class LocomotionRewardContext:
                 wheel_support_load=ticks.wheel_load.clamp_min(0),
                 base_com_offset=self.base_com_offset, base_mode=mode if base_mode is None else base_mode,
                 command_height=goal[:, 3] / 5., ground_z=ground[:, :, 0],
-                retain_peak_gradient=self.assembly.parameters.extensions.jump_peak_completion,
+                retain_peak_gradient=(self.assembly.parameters.extensions.jump_peak_completion
+                                      or self.assembly.parameters.extensions.jump_flight_clearance),
                 **({} if platform_state is None else {
                     'platform_state': platform_state, 'platform_evidence': platform_evidence}))
         platform_target = None
@@ -163,7 +166,10 @@ class LocomotionRewardContext:
                     None if jump_interval.requested_rise is None else jump_interval.requested_rise[:, tick],
                     None if jump_interval.physical_active is None else jump_interval.physical_active[:, tick],
                     None if jump_interval.platform_bound is None else jump_interval.platform_bound[:, tick],
-                    None if platform_target is None else platform_target.tick(tick))))
+                    None if platform_target is None else platform_target.tick(tick),
+                    flight_geometry=(None if self.jump_geometry is None else self.jump_geometry.sample(
+                        wheel.link_position_base, wheel.bottom_world_z, ground[:, tick, 1:],
+                        ground_valid[:, tick] & wheel.valid)))))
         result = self.assembly.integrate(start, tuple(samples), action, reward_memory,
             controller_memory.wheel_torque_history, self.legs, self.encoder_bias, self.motor_strength)
         return replace(result, termination_height=torch.stack(heights, -1)[..., None],
@@ -183,6 +189,11 @@ class OrdinaryFlatReward:
             raise ValueError('The four-tick reward requires the recorded 200/50 Hz clocks')
         # Native-collection extensions (if any) are part of the pinned source identity.
         self.extensions = RewardExtensions(**source.get('reward_kernel', {}).get('extensions', {}))
+        self.jump_geometry = None
+        if self.extensions.jump_flight_clearance or self.extensions.jump_tuck:
+            self.jump_geometry = JumpRewardGeometry(geometry)
+            if source.get('reward_kernel', {}).get('jump_flight_geometry') != self.jump_geometry.receipt:
+                raise ValueError('Imagined jump reward geometry differs from its native source receipt')
         self.tuning = RewardTuning(config['robot_mass_kg'], gamma=config['gamma'], policy_dt_s=policy_dt_s,
                                    profile=config['profile'],
                                    **({} if self.extensions.success_event is None
@@ -233,7 +244,8 @@ class OrdinaryFlatReward:
         return LocomotionRewardContext(assembly, self.geometry, legs, bias,
             start['motor_strength'], state.position[:, 2] - start['height'][:, 0],
             start['failure_conditions'][:, 1] > .5, transforms.gimbal_sign, transforms.gimbal_zero_rad,
-            jump_task=self.jump_task, base_com_offset=start['sim_context'][:, 41:44])
+            jump_task=self.jump_task, base_com_offset=start['sim_context'][:, 41:44],
+            jump_geometry=self.jump_geometry)
 
 
 class TerrainLocomotionReward(OrdinaryFlatReward):
