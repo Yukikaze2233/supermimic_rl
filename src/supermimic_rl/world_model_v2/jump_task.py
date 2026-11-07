@@ -301,25 +301,31 @@ class JumpTask:
                 admitted: Tensor, base_mode: Tensor, task_family: Tensor, elapsed_s: Tensor,
                 ground_z: Tensor, blocked_by_stair: Tensor, interval_uniform: Tensor | None = None,
                 packet: RequestCommand | None = None, previous_command_height: Tensor | None = None,
-                previous_elapsed_s: Tensor | None = None, retain_peak_gradient: bool = False) -> JumpAdvance:
+                previous_elapsed_s: Tensor | None = None, retain_peak_gradient: bool = False,
+                packet_owned: Tensor | None = None) -> JumpAdvance:
         """Advance after old-interval reward, and after motion command admission.
 
         ``elapsed_s`` is MotionTask's already advanced episode clock. Random
         intervals are supplied once per full imagined batch, before microbatches
         or retries. Unknown future external packets are not synthesized.
+        An explicit packet ownership mask leaves all other rows automatic;
+        this mixed path requires the same full-batch interval draws.
         """
         from transformer_rl.formal.control.observation import CommandMode
         from transformer_rl.formal.tasks.curriculum import TaskFamily
         from transformer_rl.formal.tasks.protocol import CompletedEstimate, RequestEnd, RequestResponse
+        from supermimic_rl.course.request_selection import select_jump_request, validate_packet_owned
 
         protocol, owner = state._restore(self.config)
         n, device = len(state.ids), state.ids.device
+        validate_packet_owned(packet_owned, packet=packet, count=n, device=device)
+        automatic = packet is None or packet_owned is not None
         postponed = torch.zeros(n, dtype=torch.bool, device=device)
         trigger = None
         if self.config.trigger is not None:
             last_end, was_active = state._trigger_state()
             trigger = (last_end[:, None], state.trigger_flags)
-            if packet is None:
+            if automatic:
                 if (previous_command_height is None or previous_elapsed_s is None
                         or previous_command_height.shape != (n,) or previous_elapsed_s.shape != (n,)):
                     raise ValueError('Gated jumps need the command height and episode clock before admission')
@@ -331,6 +337,8 @@ class JumpTask:
                          & (now_s - last_end >= gate.cooldown_s))
                 due = ((task_family == int(TaskFamily.REQUEST))
                        & (previous_elapsed_s + dt >= owner.next_request_s) & (protocol.active_id < 0))
+                if packet_owned is not None:
+                    due = due & ~packet_owned
                 postponed = due & ~ready
                 owner.next_request_s = torch.where(postponed, previous_elapsed_s + 2 * dt,
                                                    owner.next_request_s)
@@ -339,30 +347,14 @@ class JumpTask:
             estimate = CompletedEstimate(admitted.new_zeros(n), admitted.new_zeros(n, 2),
                 admitted.new_zeros(n), admitted.new_zeros(n), now_s.clone(),
                 torch.zeros(n, dtype=torch.bool, device=device))
-        if packet is None:
-            if (interval_uniform is None or interval_uniform.shape != (n,)
-                    or interval_uniform.device != device or interval_uniform.dtype != torch.float32):
-                raise ValueError('Automatic jump requests require one recorded/prepared uniform draw per row')
-            due = ((task_family == int(TaskFamily.REQUEST)) & ~blocked_by_stair
-                   & (elapsed_s >= owner.next_request_s) & (protocol.active_id < 0))
-            request_id = torch.where(due, owner.next_id, -1)
-            owner.next_id = owner.next_id + due.long()
-            owner.next_request_s = torch.where(due, elapsed_s + (3 + 5 * interval_uniform),
-                                               owner.next_request_s)
-            requested_height = owner.rise
-            cancel_id = torch.full_like(request_id, -1)
-            safety_abort = torch.zeros(n, dtype=torch.bool, device=device)
-            allowed = task_family == int(TaskFamily.REQUEST)
-        else:
-            packet.validate(n, device)
-            request_id, requested_height = packet.request_id, packet.height_m
-            cancel_id = (torch.full_like(request_id, -1) if packet.cancel_id is None else packet.cancel_id)
-            safety_abort = (torch.zeros(n, dtype=torch.bool, device=device)
-                            if packet.safety_abort is None else packet.safety_abort)
-            allowed = base_mode != int(CommandMode.RECOVERY)
-        condition = protocol.step(now_s=now_s, estimate=estimate, request_id=request_id,
-            requested_height_m=requested_height, cancel_id=cancel_id,
-            allow_new=allowed & ~blocked_by_stair, safety_abort=safety_abort)
+        selected = select_jump_request(task_family=task_family, base_mode=base_mode,
+            blocked_by_stair=blocked_by_stair, elapsed_s=elapsed_s, active_id=protocol.active_id,
+            next_id=owner.next_id, next_request_s=owner.next_request_s, rise_m=owner.rise,
+            interval_uniform=interval_uniform, packet=packet, packet_owned=packet_owned)
+        owner.next_id, owner.next_request_s = selected.next_id, selected.next_request_s
+        condition = protocol.step(now_s=now_s, estimate=estimate, request_id=selected.request_id,
+            requested_height_m=selected.requested_height_m, cancel_id=selected.cancel_id,
+            allow_new=selected.allow_new, safety_abort=selected.safety_abort)
 
         # This is the LabCourseTasks.step glue surrounding the shared protocol:
         # an estimated completion does not close unverified physical evidence.
