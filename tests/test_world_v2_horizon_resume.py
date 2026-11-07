@@ -55,7 +55,7 @@ def test_horizon_change_is_explicit_without_mutating_saved_configuration(before,
 
 
 @pytest.mark.parametrize('field,value', [
-    ('bootstrap_gradient', True), ('anchor_coefficient', .1), ('gamma', .8),
+    ('bootstrap_gradient', True), ('gamma', .8),
     ('actor_learning_rate', .01), ('critic_learning_rate', .01), ('model_learning_rate', .01),
     ('estimator_learning_rate', .01), ('critic_epochs', 3),
 ])
@@ -103,11 +103,14 @@ def assert_retained(actual, expected):
         assert actual == expected
 
 
-@pytest.mark.parametrize('before_horizon,after_horizon,before_microbatch,after_microbatch', [
-    (16, 32, 512, 512), (16, 32, 4096, 2048), (32, 32, 4096, 2048),
+@pytest.mark.parametrize('before_horizon,after_horizon,before_microbatch,after_microbatch,before_anchor,after_anchor', [
+    (16, 32, 512, 512, .1, .1), (16, 32, 4096, 2048, .1, .1), (32, 32, 4096, 2048, .1, .1),
+    (32, 32, 2048, 2048, .1, .0025), (32, 32, 2048, 2048, .1, 0.),
+    (32, 32, 2048, 2048, 0., .0025), (16, 32, 4096, 2048, .1, .0025),
 ])
 def test_complete_online_restore_preserves_adam_replay_rng_and_records_recipe_once(
-        tmp_path, monkeypatch, before_horizon, after_horizon, before_microbatch, after_microbatch):
+        tmp_path, monkeypatch, before_horizon, after_horizon, before_microbatch, after_microbatch,
+        before_anchor, after_anchor):
     # Reuse genuine compact data and a small genuine dynamics model. Only the
     # native snapshot adapter and asset-backed constructor are replaced: the
     # online restore, learner, four Adams, replay and RNG restoration are real.
@@ -119,7 +122,7 @@ def test_complete_online_restore_preserves_adam_replay_rng_and_records_recipe_on
         model_batch_size=4, validation_fraction=.5, guard_drop_fraction=.1, guard_mode='report',
         initial_actor='existing-initialization.pt', initial_actor_sha256='a' * 64,
         learning=LearningConfig(imagination_horizon=before_horizon, bootstrap_gradient=False,
-                                actor_learning_rate=5e-5, anchor_coefficient=.1,
+                                actor_learning_rate=5e-5, anchor_coefficient=before_anchor,
                                 model_fit_precision='bfloat16'))
 
     def build(schema, runtime, config, **kwargs):
@@ -177,7 +180,8 @@ def test_complete_online_restore_preserves_adam_replay_rng_and_records_recipe_on
                         lambda schema: SimpleNamespace(record_disturbances=False))
     monkeypatch.setattr(torch.cuda, 'is_available', lambda: False)
     requested = replace(previous, imagination_microbatch_size=after_microbatch,
-                        learning=replace(previous.learning, imagination_horizon=after_horizon))
+                        learning=replace(previous.learning, imagination_horizon=after_horizon,
+                                         anchor_coefficient=after_anchor))
     output = tmp_path / 'resumed'
     trainer = OnlineTrainer(Environment(), lambda: None, requested, output,
         runtime={}, linkage_path=None, asset_directory=None, identified_bundle=None,
@@ -191,7 +195,7 @@ def test_complete_online_restore_preserves_adam_replay_rng_and_records_recipe_on
     assert trainer.config.imagination_batch_size == 4096
     assert trainer.config.actor_updates == 24
     assert trainer.learner.imagination.bootstrap_gradient is False
-    assert trainer.learner.config.anchor_coefficient == .1
+    assert trainer.learner.config.anchor_coefficient == after_anchor
     assert trainer.cycle == 78 and trainer.collector.steps == 1872
     assert trainer.seed_source == saved['seed_source']
     assert trainer.teacher_source == source
@@ -208,6 +212,8 @@ def test_complete_online_restore_preserves_adam_replay_rng_and_records_recipe_on
     if before_microbatch != after_microbatch:
         expected_changes['imagination_microbatch_size'] = {
             'before': before_microbatch, 'after': after_microbatch}
+    if before_anchor != after_anchor:
+        expected_changes['anchor_coefficient'] = {'before': before_anchor, 'after': after_anchor}
     assert trainer.resume_migrations[:len(saved['resume_migrations'])] == saved['resume_migrations']
     assert len(receipts) == len(expected_changes)
     for field, change in expected_changes.items():
@@ -227,6 +233,7 @@ def test_complete_online_restore_preserves_adam_replay_rng_and_records_recipe_on
     pointer = json.loads((output / 'resume.json').read_text())
     target = torch.load(output / pointer['checkpoint'], weights_only=True)
     assert target['config']['learning']['imagination_horizon'] == after_horizon
+    assert target['config']['learning']['anchor_coefficient'] == after_anchor
     assert target['config']['imagination_microbatch_size'] == after_microbatch
     torch.testing.assert_close(target['learner'], saved['learner'], atol=0, rtol=0)
     assert_retained(torch.load(output / pointer['replay_file'], weights_only=True)['replay'], dataset_before)
@@ -236,6 +243,7 @@ def test_complete_online_restore_preserves_adam_replay_rng_and_records_recipe_on
     assert restored.resume_migrations == trainer.resume_migrations
     assert restored.imagination_horizon_changed is None
     assert restored.imagination_microbatch_changed is None
+    assert restored.anchor_coefficient_changed is None
     torch.testing.assert_close(restored.learner.state_dict(), trainer.learner.state_dict(), atol=0, rtol=0)
     expected = trainer.collector.replay.sample_windows(2, 2, env_ids=trainer.train_ids,
                                                      generator=trainer.generator)

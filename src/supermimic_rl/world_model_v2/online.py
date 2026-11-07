@@ -367,6 +367,12 @@ class OnlineTrainer:
                 'additional_warmup_cycles': 0,
                 'scope': 'Policy imagination and critic return horizon only; model fitting, '
                          'networks, optimizer state, sampling and task/reward contracts preserved'})
+        if getattr(self, 'anchor_coefficient_changed', None):
+            self.resume_migrations.append({'anchor_coefficient': self.anchor_coefficient_changed,
+                'resumed_cycle': self.cycle, 'learner_replay_rng_preserved': True,
+                'additional_warmup_cycles': 0,
+                'scope': 'Actor teacher-anchor objective weight only; saved anchor and its action std, '
+                         'networks, optimizer state, learning rates, replay and task/reward contracts preserved'})
         if getattr(self, 'imagination_microbatch_changed', None):
             self.resume_migrations.append({
                 'imagination_microbatch_size': self.imagination_microbatch_changed,
@@ -479,6 +485,14 @@ class OnlineTrainer:
         before = configuration['learning'].pop('imagination_horizon')
         after = requested['learning'].pop('imagination_horizon')
         self.imagination_horizon_changed = None if before == after else {'before': before, 'after': after}
+        before = configuration['learning'].pop('anchor_coefficient')
+        after = requested['learning'].pop('anchor_coefficient')
+        self.anchor_coefficient_changed = None if before == after else {'before': before, 'after': after}
+        if (self.anchor_coefficient_changed and after > 0
+                and saved.get('learner', {}).get('anchor') is None):
+            # Resume must use the original saved teacher, never initialize an
+            # anchor from the current student or silently reload a new teacher.
+            raise ValueError('Changing to a nonzero anchor coefficient requires a saved teacher anchor')
         # The full start batch and its random realization are drawn before
         # partitioning; only the graph held during gradient accumulation changes.
         before = configuration.pop('imagination_microbatch_size')
