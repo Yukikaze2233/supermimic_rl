@@ -13,6 +13,7 @@ _PROOF_KEYS = {
     HINT_FORMAT: 'stair_hint',
     'stair-timeout-retry-v1': 'stair_timeout_retry',
     'recovery-roll-bridge-sampling-v1': 'recovery_roll_bridge_sampling',
+    'settling-reward-continuity-v1': 'settling_reward_continuity',
 }
 
 
@@ -39,6 +40,10 @@ def verify_source_proof(proof):
             checked = verify_saved_proof(proof)
         elif kind == 'recovery-roll-bridge-sampling-v1':
             from .recovery_bridge import verify_saved_proof
+
+            checked = verify_saved_proof(proof)
+        elif kind == 'settling-reward-continuity-v1':
+            from .settling import verify_saved_proof
 
             checked = verify_saved_proof(proof)
         else:
