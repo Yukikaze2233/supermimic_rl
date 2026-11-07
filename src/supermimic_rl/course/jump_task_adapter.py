@@ -9,6 +9,7 @@ from types import MethodType
 
 import torch
 
+from .command_override import override_command_height, validate_height_override
 from .jump_physics import observe_jump_physics
 from .request_selection import select_jump_request, validate_packet_owned
 
@@ -23,9 +24,12 @@ class NativeJumpTaskAdapter:
             raise ValueError('Install shared jump physics before the native first-flight observer')
         self.tasks = tasks
         self._packet_owned = None
+        self._height_override = self._height_override_mask = None
         self._native_step = tasks.step
+        self._native_stream_step = tasks.stream.step
         tasks._select_request = MethodType(self._select_request, tasks)
         tasks.step = self.step
+        tasks.stream.step = self._admit_target
         # Platform callers retain the optional returned history. Ordinary native
         # calls need no new state; the outer flight-latch observer still runs once.
         tasks.observe_physics = MethodType(observe_jump_physics, tasks)
@@ -46,11 +50,19 @@ class NativeJumpTaskAdapter:
         return (selected.request_id, selected.requested_height_m, selected.cancel_id,
                 selected.safety_abort, selected.allow_new, external)
 
-    def step(self, now, estimate, ground, *, command=None, packet_owned=None, **kwargs):
+    def _admit_target(self, target):
+        requested = override_command_height(target, self._height_override, self._height_override_mask)
+        return self._native_stream_step(requested)
+
+    def step(self, now, estimate, ground, *, command=None, packet_owned=None,
+             height_override=None, height_override_mask=None, **kwargs):
         validate_packet_owned(packet_owned, packet=command,
                               count=self.tasks.num_envs, device=self.tasks.device)
+        validate_height_override(self.tasks.stream.current, height_override, height_override_mask)
+        previous = self._packet_owned, self._height_override, self._height_override_mask
         self._packet_owned = packet_owned
+        self._height_override, self._height_override_mask = height_override, height_override_mask
         try:
             return self._native_step(now, estimate, ground, command=command, **kwargs)
         finally:
-            self._packet_owned = None
+            self._packet_owned, self._height_override, self._height_override_mask = previous

@@ -13,6 +13,7 @@ import math
 import torch
 from torch import Tensor
 
+from ..course.command_override import override_command_height
 from ..formal_observation import _delayed
 from . import so3
 
@@ -100,8 +101,13 @@ class MotionTask:
         limited = self.current + delta * fraction[..., None]
         return torch.where((self.rates[..., 0] > .5)[..., None], limited, projected)
 
-    def advance_admission(self, queues, readout, policy_dt_s):
-        """Advance the ordinary command before requests alter its next condition."""
+    def advance_admission(self, queues, readout, policy_dt_s, *,
+                          height_override=None, height_override_mask=None):
+        """Admit the ordinary/caller target before requests latch its height.
+
+        Caller height replaces only the requested target; the existing coupled
+        wheel projection and slew limiter still determine the admitted command.
+        """
         elapsed = self.timing[..., 0] + policy_dt_s
         segment_clock = self.timing[..., 1] + policy_dt_s
         target = self._trajectory(segment_clock)
@@ -116,6 +122,7 @@ class MotionTask:
         yaw = (self.heading[..., 4] * wrap(heading_target - heading_yaw)).clamp(
             -self.heading[..., 5], self.heading[..., 5])
         target = torch.cat((target[..., :2], torch.where(enabled, yaw, target[..., 2])[..., None], target[..., 3:]), -1)
+        target = override_command_height(target, height_override, height_override_mask)
         admitted = self._admit(target, policy_dt_s)
         heading = torch.cat((self.heading[..., :1], (valid | initialize).to(admitted.dtype)[..., None],
                               heading_target[..., None], self.heading[..., 3:]), -1)
