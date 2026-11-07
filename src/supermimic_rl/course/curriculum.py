@@ -68,6 +68,9 @@ class CourseCurriculumConfig:
     foundation_terrain_kinds: tuple[str, ...] = (
         "FLAT", "SLOPE", "ROUGH", "STEP_UP", "STEP_DOWN", "MATERIAL",
     )
+    # Positive integer quotas in one deterministic terrain-family cycle.
+    # Empty retains the original one-slot-per-kind order and source identity.
+    foundation_terrain_kind_weights: dict[str, int] = field(default_factory=dict)
     full_terrain_kinds: tuple[str, ...] = tuple(kind.name for kind in TerrainKind)
     mixture_blend_fraction: float = .25
     jump_standing_fraction_of_stage: float = .25
@@ -134,6 +137,12 @@ class CourseCurriculumConfig:
                     or not set(required) <= set(values)):
                 raise ValueError("Missing or invalid named course coverage: " + name)
             object.__setattr__(self, name, values)
+        terrain_weights = self.foundation_terrain_kind_weights
+        if (not isinstance(terrain_weights, dict)
+                or (terrain_weights and set(terrain_weights) != set(self.foundation_terrain_kinds))
+                or any(type(value) is not int or value < 1 for value in terrain_weights.values())):
+            raise ValueError('Foundation terrain weights must give every named kind a positive integer quota')
+        object.__setattr__(self, 'foundation_terrain_kind_weights', dict(terrain_weights))
         for name in ("mixture_blend_fraction", "jump_standing_fraction_of_stage",
                      "jump_full_motion_fraction_of_stage", "moving_jump_min_fraction"):
             value = getattr(self, name)
@@ -185,6 +194,8 @@ class CourseCurriculumConfig:
     def to_dict(self):
         result = json.loads(json.dumps(asdict(self)))
         # A disabled opt-in must preserve old checkpoint configuration identity.
+        if not self.foundation_terrain_kind_weights:
+            result.pop('foundation_terrain_kind_weights')
         if not self.foundation_authored_rehearsal:
             result.pop("foundation_authored_rehearsal")
         # Existing enabled sources also omit the original fixed period.
@@ -267,6 +278,17 @@ class SuperMimicCurriculum(FormalTaskCurriculum):
         self._foundation_authored_rows = (torch.zeros(num_envs, dtype=torch.bool, device=device)
                                          if config.foundation_authored_rehearsal else None)
         self._pending_foundation_authored = None
+        quotas = config.foundation_terrain_kind_weights
+        # Round-robin quota slots spread repeated kinds across the cycle.
+        # The unchanged terrain-family ordinal makes partial reset batches
+        # and resumed samplers use the same sequence without random draws.
+        cycle = [int(TerrainKind[name])
+                 for slot in range(max(quotas.values(), default=1))
+                 for name in config.foundation_terrain_kinds if slot < quotas.get(name, 1)]
+        self._foundation_terrain_pool = torch.tensor(cycle, dtype=torch.long, device=device)
+        step_up = self._foundation_terrain_pool == int(TerrainKind.STEP_UP)
+        self._foundation_step_up_count = cycle.count(int(TerrainKind.STEP_UP))
+        self._foundation_step_up_ordinal = step_up.to(torch.long).cumsum(0) - 1
 
     def set_progress(self, real_transitions, actor_updates):
         for name, value in (("real_transitions", real_transitions), ("actor_updates", actor_updates)):
@@ -364,10 +386,9 @@ class SuperMimicCurriculum(FormalTaskCurriculum):
                     posture[rows], variants[rows] = select_variants(ordinal, posture[rows], names)
                 nominal[rows], trajectory[rows] = False, 0
             elif family == TaskFamily.TERRAIN:
-                names = (self.config.foundation_terrain_kinds
-                         if self.stage < self.stage_names.index('authored_steps')
-                         else self.config.full_terrain_kinds)
-                pool = terrain.new_tensor([int(TerrainKind[name]) for name in names])
+                foundation = self.stage < self.stage_names.index('authored_steps')
+                pool = (self._foundation_terrain_pool if foundation else terrain.new_tensor(
+                    [int(TerrainKind[name]) for name in self.config.full_terrain_kinds]))
                 terrain[rows] = pool[ordinal % len(pool)]
                 # Half the stair cycles request the declared endpoint exactly.
                 # The terrain router must still place the actual authored mesh.
@@ -382,7 +403,10 @@ class SuperMimicCurriculum(FormalTaskCurriculum):
                     # Select a periodic share of the existing STEP_UP slots.
                     # Divide by the same period to alternate the two assets
                     # across batches and restores without extra random draws.
-                    cycle = ordinal // len(pool)
+                    # Count STEP_UP slots, not complete mixed-terrain cycles:
+                    # weighted cycles may contain several slots of this kind.
+                    cycle = ((ordinal // len(pool)) * self._foundation_step_up_count
+                             + self._foundation_step_up_ordinal[ordinal % len(pool)])
                     every = self.config.foundation_authored_rehearsal_every
                     selected = ((terrain[rows] == int(TerrainKind.STEP_UP)) & (cycle % every == 0))
                     chosen = rows[selected]
@@ -459,7 +483,7 @@ class SuperMimicCurriculum(FormalTaskCurriculum):
     def foundation_authored_rehearsal_receipt(self):
         if not self.config.foundation_authored_rehearsal:
             return None
-        return {
+        result = {
             "contract": "foundation_authored_birth_rehearsal_v1",
             "stage": self.stage_names.index('terrain_foundation'),
             "source_slots": "STEP_UP in the configured foundation terrain cycle",
@@ -470,6 +494,10 @@ class SuperMimicCurriculum(FormalTaskCurriculum):
             "other_routes": "native routing and its 20-percent ceiling exploration unchanged",
             "cap_scope": "selected authored births only; ordinary level and step caps unchanged",
         }
+        if self.config.foundation_terrain_kind_weights:
+            result['terrain_kind_weights'] = dict(self.config.foundation_terrain_kind_weights)
+            result['selection'] = 'persisted terrain-family ordinal with STEP_UP-local cadence; no extra random draws'
+        return result
 
     def foundation_authored_rehearsal_rows(self, ids):
         """Rows certified by their latest birth draw before synchronous routing."""
