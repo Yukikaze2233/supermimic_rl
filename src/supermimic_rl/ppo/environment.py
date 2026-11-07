@@ -168,6 +168,11 @@ class CourseEnvironment:
 
         return course_progress(self.env, self.adapter.curriculum)
 
+    def recovery_birth_samples(self) -> dict[str, int] | None:
+        """Read the host sampling ledger without native queries or RNG draws."""
+        read = getattr(self.adapter.curriculum, "recovery_birth_samples", None)
+        return read() if callable(read) else None
+
     def termination_reasons(self) -> dict:
         latch = getattr(self.env, "_failure_latch", None)
         return {} if latch is None else latch.metrics()

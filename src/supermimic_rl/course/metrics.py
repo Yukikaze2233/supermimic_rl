@@ -86,6 +86,12 @@ def course_progress(native, curriculum):
                          for asset, count in coverage.get(source, {}).items()})
     counters.update({f"course/recovery/{name}": value
                      for name, value in metrics["recovery"]["counts"].items()})
+    recovery_samples = getattr(curriculum, "recovery_birth_samples", None)
+    if callable(recovery_samples):
+        # The sampler already counted actual reset draws on the host. Bridge
+        # labels must not be merged into their reused native 90-degree IDs.
+        counters.update({f"course/recovery/birth_samples/{name}": count
+                         for name, count in recovery_samples().items()})
     counters.update({f"course/births/{name}": value
                      for name, value in metrics["episode_birth_family_counts"].items()})
     levels = metrics["level_histogram"]

@@ -439,6 +439,15 @@ class SuperMimicCurriculum(FormalTaskCurriculum):
             raise ValueError('A recovery birth must have a current sampler label')
         return labels.clone()
 
+    def recovery_birth_samples(self):
+        """Named cumulative reset draws, not measured placements or successes."""
+        names = RECOVERY_NAMES
+        if self.config.recovery_roll_bridge:
+            from .recovery_bridge import RECOVERY_VARIANTS
+
+            names = RECOVERY_VARIANTS
+        return dict(zip(names, self.sample_counts['recovery_posture'], strict=True))
+
     def foundation_authored_rehearsal_receipt(self):
         if not self.config.foundation_authored_rehearsal:
             return None

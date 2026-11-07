@@ -341,9 +341,6 @@ class PPOTrainer:
                                    config.curriculum_transition_cap, mode=config.course_gate_mode)
                        if config.course_gates else None)
         self._apply_opened_gates()
-        # Native skill counters are cumulative since the cold physical setup.
-        self._course_counters = (environment.course_progress()[0]
-                                 if hasattr(environment, "course_progress") else None)
         self._normalization_samples = None
         self.statistics = EpisodeStatistics(environment.num_envs, self.device)
         if resume is None and self.course is not None and self.course.mode == "report":
@@ -357,8 +354,13 @@ class PPOTrainer:
             # otherwise every gate audit would silently restart flat births.
             environment.set_progress(self.curriculum_transitions, self.updates)
             self.observation = environment.reset()
-            self._course_counters = (environment.course_progress()[0]
-                                     if hasattr(environment, "course_progress") else None)
+        # Exclude every setup reset, including dimension discovery and the
+        # final report-mode/resume reset, from per-update birth exposure.
+        self._course_counters = (environment.course_progress()[0]
+                                 if hasattr(environment, "course_progress") else None)
+        read_births = getattr(environment, "recovery_birth_samples", None)
+        initial_births = read_births() if callable(read_births) else None
+        self._recovery_birth_baseline = None if initial_births is None else dict(initial_births)
         self.output.mkdir(parents=True, exist_ok=True)
 
     def _read_actor_artifact(self, path: Path, expected_sha256: str) -> tuple[TeacherActor, dict]:
@@ -688,6 +690,21 @@ class PPOTrainer:
         torch.save(self.state_dict(), buffer)
         return buffer.getvalue()
 
+    def _recovery_sampling_telemetry(self) -> dict | None:
+        """Diagnostic counters only; cold resume never restores this sampler."""
+        read = getattr(getattr(self, "environment", None), "recovery_birth_samples", None)
+        current = read() if callable(read) else None
+        if current is None:
+            return None
+        baseline = getattr(self, "_recovery_birth_baseline", None)
+        return {"format": "recovery-reset-sampling-telemetry-v1",
+                "scope": "current native setup; reset draws, not placement readback or skill success",
+                "restored_on_resume": False,
+                "cumulative": dict(current),
+                "setup_baseline": None if baseline is None else dict(baseline),
+                "after_setup": (None if baseline is None else
+                                {name: count - baseline.get(name, 0) for name, count in current.items()})}
+
     def state_dict(self, *, light: bool = False) -> dict:
         payload = {"format": CHECKPOINT_FORMAT, "config": asdict(self.config), "actor": self.actor.state_dict(),
                    "critic": self.critic.state_dict(), "updates": self.updates, "transitions": self.transitions,
@@ -695,6 +712,11 @@ class PPOTrainer:
                    "resume_migrations": self.resume_migrations,
                    "course_gates": None if self.course is None else self.course.state_dict(),
                    "stage_action_std_applied": list(self.stage_action_std_applied)}
+        # Read current host counters instead of _course_counters: an immutable
+        # completed-update snapshot is taken before the metric delta is logged.
+        telemetry = self._recovery_sampling_telemetry()
+        if telemetry is not None:
+            payload["recovery_sampling_telemetry"] = telemetry
         if not light:
             payload.update(optimizer=self.optimizer.state_dict(),
                            estimator_optimizer=self.estimator_optimizer.state_dict(),
