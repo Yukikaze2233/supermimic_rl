@@ -9,7 +9,7 @@ from types import MethodType
 
 import torch
 from transformer_rl.formal.tasks.reward import PhysicalRewardComposer, RewardPhysics, RewardReference
-from ..reward_kernel import (NATIVE_SOURCE_SHA256, JumpProgress, RewardExtensions, RewardHistory,
+from ..reward_kernel import (NATIVE_SOURCE_SHA256, JumpPhysicalReference, JumpProgress, RewardExtensions, RewardHistory,
                              RewardParameters, advance_flight_latch, jump_tracking_targets,
                              physical_reward_densities)
 
@@ -57,11 +57,19 @@ class SharedRewardComposer(PhysicalRewardComposer):
                                     (tasks.physical_id >= 0).clone(), platform_bound, platform_target,
                                     flight_geometry=(None if self.supermimic_jump_geometry is None
                                                      else self.supermimic_jump_geometry(sample)))
+        physical_reference = None
+        if self.supermimic_jump_physical_reference is not None:
+            curve = window.get('jump_tracking_curve')
+            if curve is None:
+                curve = self.supermimic_jump_tasks.jump_reference()
+                window['jump_tracking_curve'] = curve
+            physical_reference = self.supermimic_jump_physical_reference.sample(sample, reference, curve)
         densities = physical_reward_densities(
             sample, reference,
             RewardHistory(window['dq'], window['action_cost'], window['action2_cost'], self._action_count),
             RewardParameters.from_composer(self), jump_progress=progress,
-            stair_base_net_upward_n=getattr(self, 'supermimic_stair_base_net_upward_n', None))
+            stair_base_net_upward_n=getattr(self, 'supermimic_stair_base_net_upward_n', None),
+            jump_physical_reference=physical_reference)
         if (invalid | densities.invalid).any():
             raise ValueError('reward input, PRE-reset identity, timing, phase or finite density bound differs')
         positive, cost = densities.positive, densities.cost
@@ -105,6 +113,74 @@ class SharedRewardComposer(PhysicalRewardComposer):
         window['owned'] &= sample.policy_owned
         window['dq'], window['steps'] = dq.detach().clone(), window['steps'] + 1
         window['last_timestamp'] = sample.timestamp_s.detach().clone()
+
+
+class NativeJumpPhysicalReference:
+    """Reward tracking follows the first real flight, without changing commands.
+
+    Each observed latch endpoint is the zero-time initial condition. The
+    origin velocity matches RewardPhysics' root-position coordinate; it is
+    not whole-robot COM velocity. The ballistic curve is only a tracking
+    reference. Peak completion and qualification still use the original
+    requested rise and measured request-wide peak.
+    """
+
+    def __init__(self, tasks):
+        self.tasks = tasks
+        self.request = tasks.physical_id.clone()
+        self.episode = torch.full_like(self.request, -1)
+        self.anchored = torch.zeros_like(self.request, dtype=torch.bool)
+        self.start_s = torch.zeros_like(self.request, dtype=torch.float64)
+        self.start_z = torch.zeros_like(self.request, dtype=torch.float32)
+        self.start_vz = torch.zeros_like(self.start_z)
+        self.gravity = float(tasks.reference.config.gravity_m_s2)
+
+    @torch.no_grad()
+    def sample(self, sample, reference, curve):
+        from transformer_rl.formal.control.observation import CommandMode
+        from transformer_rl.formal.tasks.reward import RewardPhase
+
+        tasks, latch = self.tasks, self.tasks.supermimic_flight_latch
+        changed = (tasks.physical_id != self.request) | (sample.episode_id != self.episode)
+        self.anchored &= ~changed
+        self.request.copy_(tasks.physical_id)
+        self.episode.copy_(sample.episode_id)
+        jump = reference.mode == int(CommandMode.JUMP)
+        first = (jump & (tasks.physical_id >= 0) & tasks.ascent_seen & latch.lifted
+                 & ~latch.closed & ~self.anchored)
+        self.start_s = torch.where(first, sample.timestamp_s, self.start_s)
+        self.start_z = torch.where(first, sample.root_world_z_m, self.start_z)
+        self.start_vz = torch.where(first, sample.velocity_origin_world_m_s[:, 2], self.start_vz)
+        self.anchored |= first
+        flight = (jump & self.anchored & tasks.ascent_seen & latch.lifted & ~latch.closed
+                  & (reference.phase == int(RewardPhase.FLIGHT)))
+        elapsed = (sample.timestamp_s - self.start_s).clamp_min(0).to(self.start_z)
+        # The planned release already incorporates extension displacement;
+        # sqrt(2*g*requested_rise) would incorrectly demand the entire rise
+        # from flight alone when the supported push raised the root first.
+        launch_v = curve.launch_velocity_m_s.to(self.start_z)
+        release_z = curve.target_apex_world_z_m - launch_v.square() / (2 * self.gravity)
+        late = (jump & (tasks.physical_id >= 0) & ~latch.lifted & ~latch.closed
+                & (tasks.request_clock.double() >= curve.expected_launch_time_s))
+        height = torch.where(late, release_z, reference.jump_height_world_z_m)
+        velocity = torch.where(late, launch_v, reference.jump_velocity_world_z_m_s)
+        height = torch.where(flight,
+            self.start_z + self.start_vz * elapsed - .5 * self.gravity * elapsed.square(), height)
+        velocity = torch.where(flight, self.start_vz - self.gravity * elapsed, velocity)
+        return JumpPhysicalReference(height, velocity, launch_v, late, flight)
+
+    def receipt(self):
+        return {'format': 'native-jump-physical-reference-v1',
+                'implementation_sha256': hashlib.sha256(Path(__file__).read_bytes()).hexdigest(),
+                'release': 'existing_request_apex_minus_planned_launch_velocity_squared_over_two_g',
+                'push_fraction': 'actual_root_origin_vz_over_existing_planned_launch_velocity',
+                'first_flight': 'same_episode_request_ascent_first_flight_latch_endpoint',
+                'flight_tracking': 'measured_root_origin_z_and_vz_plus_elapsed_gravity_ballistic_reference',
+                'initial_elapsed_s': 0., 'gravity_m_s2': self.gravity,
+                'qualification': 'original_requested_apex_peak_completion_and_native_success_unchanged',
+                'actor_clock': 'original_visible_planned_reference_unchanged',
+                'resume': 'cold_physical_episode_reset_repopulates_reward_event_memory',
+                'compact_world_model': 'unsupported_without_explicit_event_memory_producer'}
 
 
 class FirstFlightLatch:
@@ -232,6 +308,8 @@ def install_shared_reward(composer, *, verify_native=False, extensions: RewardEx
     composer.supermimic_platform_landing = platform_landing
     if extensions.needs_jump_progress:
         install_flight_latch(jump_tasks)
+    composer.supermimic_jump_physical_reference = (
+        NativeJumpPhysicalReference(jump_tasks) if extensions.jump_physical_reference else None)
     if extensions.success_event is not None:
         composer.tuning = replace(composer.tuning, success_event=float(extensions.success_event))
     if verify_native:
@@ -246,6 +324,8 @@ def install_shared_reward(composer, *, verify_native=False, extensions: RewardEx
                "kernel_sha256": hashlib.sha256(Path(inspect.getfile(physical_reward_densities)).read_bytes()).hexdigest()}
     if flight_geometry is not None:
         receipt['jump_flight_geometry'] = flight_geometry.receipt
+    if composer.supermimic_jump_physical_reference is not None:
+        receipt['jump_physical_reference'] = composer.supermimic_jump_physical_reference.receipt()
     if extensions.active:
         receipt["extensions"] = extensions.receipt()
     return receipt

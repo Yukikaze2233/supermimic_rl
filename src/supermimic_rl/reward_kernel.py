@@ -117,6 +117,13 @@ class RewardExtensions:
     faster than 0.15 m/s, it pays the mean normalized virtual-leg extension
     toward the same source's maximum, so the push uses the full leg stroke.
 
+    ``jump_physical_reference`` stops an already elapsed launch clock from
+    asking a late real takeoff to descend. Supported targets retain the
+    planned release height/velocity; flight tracking is anchored at the
+    first actual flight endpoint. The actor still receives the original
+    planned command cue, and measured peak debt/success never use the
+    re-anchored curve. Its event memory needs an explicit native producer.
+
     ``stair_support_transfer`` keeps velocity tracking available during a
     permitted ordinary STAIR request. Once the base has upward net contact
     force, its extension target is an upper bound, allowing the legs to lift
@@ -143,14 +150,17 @@ class RewardExtensions:
     jump_tuck: float = 0.  # per second at the source's minimum virtual leg length, only in real flight
     stair_support_transfer: bool = False  # permit supported ordinary STAIR leg retraction
     jump_takeoff_extension: float = 0.  # per second at the source's maximum virtual leg length while pushing up
+    jump_physical_reference: bool = False  # retain release targets until actual takeoff; re-anchor flight tracking
 
     # Opt-ins added after the first extension receipts. Their disabled values
     # are omitted, so sources recorded before each opt-in keep their identity.
     _RECEIPT_OPT_INS = ('jump_flight_clearance', 'jump_tuck', 'jump_peak_completion', 'stationary_quiet',
                         'jump_physical_tail', 'jump_extension_height_floor', 'stair_support_transfer',
-                        'jump_takeoff_extension')
+                        'jump_takeoff_extension', 'jump_physical_reference')
 
     def __post_init__(self):
+        if type(self.jump_physical_reference) is not bool:
+            raise ValueError('Physical jump reference requires a boolean flag')
         if type(self.stair_support_transfer) is not bool:
             raise ValueError('Stair support transfer requires a boolean flag')
         if (type(self.jump_flight_clearance) is not bool
@@ -176,13 +186,13 @@ class RewardExtensions:
                     or self.jump_landing_rate or self.recovery_quiet or self.success_event is not None
                     or self.ordinary_leg_acceleration is not None or self.stationary_quiet
                     or self.jump_extension_height_floor or self.jump_tuck or self.stair_support_transfer
-                    or self.jump_takeoff_extension)
+                    or self.jump_takeoff_extension or self.jump_physical_reference)
 
     @property
     def needs_jump_progress(self) -> bool:
         return bool(self.jump_flight or self.jump_lift or self.jump_push or self.jump_missed or self.jump_settle
                     or self.jump_landing_rate or self.stationary_quiet or self.jump_extension_height_floor
-                    or self.jump_tuck or self.jump_takeoff_extension)
+                    or self.jump_tuck or self.jump_takeoff_extension or self.jump_physical_reference)
 
     @property
     def needs_flight_geometry(self) -> bool:
@@ -196,6 +206,31 @@ class RewardExtensions:
             if not receipt[name]:
                 receipt.pop(name)
         return receipt
+
+
+@dataclass(frozen=True)
+class JumpPhysicalReference:
+    """Reward-only event-aligned targets, separate from visible task commands.
+
+    Flight starts from the measured root origin's position and velocity at
+    the first native flight latch. This is tracking, not a whole-robot COM
+    prediction or a replacement for the unchanged requested apex criterion.
+    """
+
+    height_world_z_m: Tensor
+    velocity_world_z_m_s: Tensor
+    launch_velocity_m_s: Tensor
+    late_supported: Tensor
+    flight: Tensor
+
+    def validate(self, prototype: Tensor) -> None:
+        values = (self.height_world_z_m, self.velocity_world_z_m_s, self.launch_velocity_m_s)
+        flags = (self.late_supported, self.flight)
+        if (any(value.shape != prototype.shape or value.device != prototype.device
+                or not value.is_floating_point() for value in values)
+                or any(flag.shape != prototype.shape or flag.device != prototype.device
+                       or flag.dtype != torch.bool for flag in flags)):
+            raise ValueError('Physical jump reference requires matching float targets and bool phase rows')
 
 
 @dataclass(frozen=True)
@@ -457,11 +492,28 @@ def gimbal_tracking_densities(reference, velocity_world):
 def physical_reward_densities(sample: RewardPhysics, reference: RewardReference,
                              history: RewardHistory, parameters: RewardParameters, *,
                              jump_progress: JumpProgress | None = None,
-                             stair_base_net_upward_n: Tensor | None = None) -> RewardDensities:
+                             stair_base_net_upward_n: Tensor | None = None,
+                             jump_physical_reference: JumpPhysicalReference | None = None) -> RewardDensities:
     """Pure densities; integrate with the physical dt exactly once outside."""
     invalid = torch.zeros_like(reference.mode, dtype=torch.bool)
     failure_scale = torch.ones_like(sample.height_above_ground_m)
     jump = reference.mode == int(CommandMode.JUMP)
+    target_jump_height = reference.jump_height_world_z_m
+    target_jump_velocity = reference.jump_velocity_world_z_m_s
+    late_supported = event_flight = torch.zeros_like(jump)
+    if parameters.extensions.jump_physical_reference:
+        if jump_physical_reference is None:
+            if jump.any():
+                raise ValueError('Physical jump reference requires the native first-flight event producer')
+        else:
+            jump_physical_reference.validate(reference.mode)
+            event = jump_physical_reference
+            invalid |= jump & (~torch.isfinite(torch.stack((event.height_world_z_m,
+                event.velocity_world_z_m_s, event.launch_velocity_m_s))).all(0)
+                | (event.launch_velocity_m_s <= 0))
+            late_supported, event_flight = jump & event.late_supported, jump & event.flight
+            target_jump_height = torch.where(jump, event.height_world_z_m, target_jump_height)
+            target_jump_velocity = torch.where(jump, event.velocity_world_z_m_s, target_jump_velocity)
     recovery = reference.mode == int(CommandMode.RECOVERY)
     ordinary = ~jump & ~recovery
     gimbal_active = (torch.zeros_like(ordinary) if reference.gimbal is None
@@ -538,7 +590,7 @@ def physical_reward_densities(sample: RewardPhysics, reference: RewardReference,
         velocity_gate = torch.where(ordinary,
             ((zero - ordinary_eh.abs()) / (zero - full)).clamp(0, 1), velocity_gate)
     velocity_gate = torch.where(stair_transfer, 1., velocity_gate)
-    jump_eh = sample.root_world_z_m - reference.jump_height_world_z_m
+    jump_eh = sample.root_world_z_m - target_jump_height
     eh = torch.where(jump, jump_eh, ordinary_eh)
     if parameters.extensions.jump_extension_height_floor:
         from transformer_rl.formal.tasks.jump import ReferenceStage
@@ -550,11 +602,12 @@ def physical_reward_densities(sample: RewardPhysics, reference: RewardReference,
             jump_progress.validate(reference.mode)
             extension = (jump & (jump_progress.reference_stage == int(ReferenceStage.EXTENSION))
                          & ~jump_progress.flight_closed)
+            extension = (extension | late_supported) & ~event_flight
             invalid |= extension & ~torch.isfinite(jump_eh)
             # Preserve the signed physical error in telemetry; only the height
             # objective stops pulling down an already above-reference extension.
             eh = torch.where(extension, eh.clamp_max(0), eh)
-    evz = sample.velocity_origin_world_m_s[:, 2] - reference.jump_velocity_world_z_m_s
+    evz = sample.velocity_origin_world_m_s[:, 2] - target_jump_velocity
     pose = sample.roll_pitch_rad - reference.target_roll_pitch_rad
     upright = (-sample.gravity_body[:, 2]).clamp(-1, 1)
     height_gate = torch.where(recovery, upright.clamp_min(0), torch.ones_like(upright))
@@ -848,7 +901,7 @@ def physical_reward_densities(sample: RewardPhysics, reference: RewardReference,
         # Supported (not airborne) while the reference demands upward speed,
         # i.e. in its extension/ballistic push. Native TAKEOFF alone is not
         # enough: early wheel unloading moves the native phase to LANDING.
-        push_target = reference.jump_velocity_world_z_m_s
+        push_target = target_jump_velocity
         pushing = (jump & (phase != int(RewardPhase.FLIGHT)) & (push_target > JUMP_PUSH_MIN_REFERENCE_M_S))
         if closed is None:
             if jump.any():
@@ -856,6 +909,10 @@ def physical_reward_densities(sample: RewardPhysics, reference: RewardReference,
         else:
             pushing = pushing & ~closed   # no second push after the first real flight landed
     if extensions.jump_push:
+        if extensions.jump_physical_reference and jump_physical_reference is not None:
+            # The achieved fraction is relative to the requested release
+            # velocity, never a dwindling post-release clock velocity.
+            push_target = torch.where(jump, jump_physical_reference.launch_velocity_m_s, push_target)
         achieved = (sample.velocity_origin_world_m_s[:, 2]
                     / push_target.clamp_min(JUMP_PUSH_MIN_REFERENCE_M_S)).clamp(0, 1)
         positive['jump_push'] = extensions.jump_push * pushing.to(v_up.dtype) * achieved
@@ -948,6 +1005,14 @@ def physical_reward_densities(sample: RewardPhysics, reference: RewardReference,
               'jump_world_height_m': jump_eh, 'jump_world_vertical_m_s': evz,
               'roll_rad': pose[:, 0], 'pitch_rad': pose[:, 1],
               'stationary_world_xy_speed_m_s': horizontal.norm(dim=-1), 'leg_fork_m': fork}
+    if extensions.jump_physical_reference:
+        gates['jump_late_supported_reference'] = late_supported
+        gates['jump_event_flight_reference'] = event_flight
+        errors['jump_clock_world_height_m'] = sample.root_world_z_m - reference.jump_height_world_z_m
+        errors['jump_clock_world_vertical_m_s'] = (sample.velocity_origin_world_m_s[:, 2]
+                                                  - reference.jump_velocity_world_z_m_s)
+        errors['jump_reference_height_world_z_m'] = torch.where(jump, target_jump_height, 0.)
+        errors['jump_reference_velocity_world_z_m_s'] = torch.where(jump, target_jump_velocity, 0.)
     if extensions.jump_flight_clearance or extensions.jump_tuck:
         gates['jump_flight_geometry_available'] = flight_geometry_available
         errors['jump_common_clearance_m'] = common_clearance
