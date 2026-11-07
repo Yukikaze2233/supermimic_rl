@@ -373,7 +373,7 @@ def test_collector_aborts_partial_record_on_step_failure_without_rolling_back_na
     assert live.landing.phase.eq(int(PlatformLandingPhase.MISSED)).all()
 
 
-def test_diagnostic_nan_height_does_not_enter_motion_fit_or_current_critic():
+def test_diagnostic_nan_height_does_not_enter_motion_fit_or_legacy_critic():
     from copy import deepcopy
     from support.world_v2.jump_imagination import fixture
     from supermimic_rl.world_model_v2.records import decode_memory, decode_physical
@@ -382,10 +382,10 @@ def test_diagnostic_nan_height_does_not_enter_motion_fit_or_current_critic():
     start['end_physical'] = start['physical'].clone()
     windows = {name: value[:, None] for name, value in start.items() if isinstance(value, torch.Tensor)}
     windows['valid'] = torch.ones(2, 1, dtype=torch.bool)
-    extra = {**platform_state().record(),
-        'contact_valid_ticks': torch.ones(2, 4, 1, dtype=torch.bool),
+    extra = {'contact_valid_ticks': torch.ones(2, 4, 1, dtype=torch.bool),
         **encode_platform_interval(platform_interval(), count=2, device='cpu')}
-    recorded = {**windows, **{name: value[:, None] for name, value in extra.items()}}
+    recorded = {**windows, **{name: value[:, None]
+                             for name, value in {**platform_state().record(), **extra}.items()}}
     assert torch.isnan(recorded['platform_landing_world_height_ticks']).any()
     expected_fit, actual_fit = deepcopy(learner.fit), learner.fit
     expected_fit.observe(windows)
@@ -416,3 +416,18 @@ def test_diagnostic_nan_height_does_not_enter_motion_fit_or_current_critic():
     learner.critic.norm.update(extended)
     for name, value in expected_norm.state_dict().items():
         torch.testing.assert_close(learner.critic.norm.state_dict()[name], value, rtol=0, atol=0)
+
+
+def test_complete_platform_state_requires_platform_aware_critic():
+    from support.world_v2.jump_imagination import fixture
+    from supermimic_rl.world_model_v2.records import decode_memory, decode_physical
+
+    learner, start, _ = fixture()
+    start.update(platform_state().record())
+    with pytest.raises(ValueError, match='cannot be silently ignored by a legacy critic'):
+        learner.imagination.critic_features(
+            decode_physical(start['physical']), start['height'], start['scan'],
+            decode_memory(start['memory']), start['goal'], start['sim_context'],
+            start['failure_memory'], start['failure_conditions'],
+            torch.cat((start['reward_memory'], start['support_memory']), -1), start['motion_task'],
+            **learner.imagination.task_features(start))

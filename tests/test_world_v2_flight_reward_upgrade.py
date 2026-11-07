@@ -2,7 +2,6 @@
 from copy import deepcopy
 from dataclasses import replace
 import hashlib
-import inspect
 import json
 from pathlib import Path
 
@@ -11,7 +10,6 @@ import torch
 
 from supermimic_rl.cli import _native_schema_source
 from supermimic_rl.course.gimbal_arbitration import arbitration_receipt
-from supermimic_rl.reward_kernel import physical_reward_densities
 from supermimic_rl.world_model_v2.migrations import extension_height, flight_reward, reward_continuity
 from supermimic_rl.world_model_v2.migrations.source_lineage import source_lineage_from_saved
 from test_world_v2_extension_height_upgrade import candidate as extension_fixture
@@ -109,8 +107,22 @@ def test_only_incompatible_old_actor_starts_are_excluded(candidate):
     assert all(result[name] is value for name, value in storage.items() if name != 'task_record_valid')
 
 
-def test_target_is_the_integrated_reward_implementation():
-    actual = hashlib.sha256(Path(inspect.getfile(physical_reward_densities)).read_bytes()).hexdigest()
-    assert flight_reward.TARGET_KERNEL_SHA256 == actual
+def test_reviewed_historical_boundary_remains_valid_after_newer_rewards():
+    # This minimal receipt fixes the reviewed geometry/arbitration and kernel
+    # boundary. It needs neither current HEAD equality nor a full git history.
+    proof = json.loads((Path(__file__).parent / 'fixtures/reviewed_flight_reward_proof.json').read_text())
+    assert flight_reward.TARGET_KERNEL_SHA256 == (
+        '8480365bebf37c79e4c9035e05d52557442f0dd5e799d0263bd6a472514c71e9')
     assert flight_reward.SOURCE_KERNEL_SHA256 == extension_height.TARGET_KERNEL_SHA256
-    assert len(flight_reward.GEOMETRY_RECEIPT_SHA256) == 64
+    assert flight_reward.verify_saved_proof(proof) == proof
+
+
+@pytest.mark.parametrize('unreviewed_target', [
+    '05997d9f5a071873f0b91067943a69d53afd004997c9f9a1b58079ac1000ad83',
+    'b' * 64,
+])
+def test_historical_migration_does_not_admit_later_unreviewed_targets(unreviewed_target):
+    proof = json.loads((Path(__file__).parent / 'fixtures/reviewed_flight_reward_proof.json').read_text())
+    proof['after']['reward_kernel']['kernel_sha256'] = unreviewed_target
+    with pytest.raises(ValueError, match='cannot change'):
+        flight_reward.verify_saved_proof(proof)

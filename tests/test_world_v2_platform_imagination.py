@@ -124,7 +124,8 @@ def test_legacy_critic_shape_keys_and_strict_restore_remain_unchanged():
         Critic(old_size, platforms=True)
 
 
-def test_rollout_starts_from_recorded_context_advances_and_never_reads_future_labels():
+@pytest.mark.parametrize('diagnostic_height', [-999., float('nan')])
+def test_rollout_starts_from_recorded_context_advances_and_never_reads_future_labels(diagnostic_height):
     learner, imagined, start, frames, contact = fixture()
     original = {name: value.clone() for name, value in start.items()}
     platform = PlatformRecordState.decode(start)
@@ -144,7 +145,7 @@ def test_rollout_starts_from_recorded_context_advances_and_never_reads_future_la
         # These are deliberately contradictory future labels from a record. They
         # must neither qualify imagined landing nor influence its scalar return.
         poison = {**start, 'platform_evidence_ticks': torch.ones(2, 4, 9, dtype=torch.bool),
-            'platform_landing_world_height_ticks': torch.full((2, 4, 1), -999.),
+            'platform_landing_world_height_ticks': torch.full((2, 4, 1), diagnostic_height),
             'platform_landing_state_ticks': torch.full((2, 4, 3), 999, dtype=torch.long),
             'contact_valid_ticks': torch.zeros(2, 4, 1, dtype=torch.bool)}
         repeated = imagined.rollout(poison, frames, 12)
