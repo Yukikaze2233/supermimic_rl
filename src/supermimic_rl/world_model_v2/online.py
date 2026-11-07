@@ -182,6 +182,9 @@ class OnlineConfig:
                 raise ValueError('Course progression requires the full task producer and matching initial coordinate')
         if (self.initial_actor is None) != (self.initial_actor_sha256 is None):
             raise ValueError('initial_actor and initial_actor_sha256 must be given together')
+        if (self.learning.learning_rate_decay is not None and self.guard_drop_fraction
+                and self.guard_mode == 'restore'):
+            raise ValueError('A scheduled learning rate cannot share the actor rate with a restoring guard')
         validate_guard_settings(drop_fraction=self.guard_drop_fraction, patience=self.guard_patience,
                                 window=self.guard_window, mode=self.guard_mode,
                                 min_rate_fraction=self.guard_min_rate_fraction,

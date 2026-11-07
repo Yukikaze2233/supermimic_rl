@@ -24,6 +24,28 @@ from .termination import PoseContactTermination
 
 
 @dataclass(frozen=True)
+class LearningRateDecay:
+    """Cosine decay of every learner rate over actor updates, then constant.
+
+    SuperMimic (Table A.5) decays to 0.03x over 250k of 320k iterations, with
+    one policy update per iteration; the actor-update count is that clock here.
+    Model updates before policy learning starts therefore keep the full rate.
+    """
+    updates: int
+    final_fraction: float = .03
+
+    def __post_init__(self):
+        if type(self.updates) is not int or self.updates < 1:
+            raise ValueError('Learning-rate decay needs a positive integer number of actor updates')
+        if not 0 < self.final_fraction <= 1:
+            raise ValueError('Learning-rate decay final fraction must be in (0, 1]')
+
+    def factor(self, actor_updates: int) -> float:
+        progress = min(actor_updates / self.updates, 1.)
+        return self.final_fraction + (1 - self.final_fraction) * .5 * (1 + math.cos(math.pi * progress))
+
+
+@dataclass(frozen=True)
 class LearningConfig:
     model_learning_rate: float = 2e-4
     actor_learning_rate: float = 2e-4
@@ -47,8 +69,14 @@ class LearningConfig:
     anchor_coefficient: float = 0.
     # CUDA motion-MLP fitting only; policy imagination and CPU remain FP32.
     model_fit_precision: str = 'float32'
+    # None keeps every rate constant (legacy).
+    learning_rate_decay: LearningRateDecay | None = None
 
     def __post_init__(self):
+        if isinstance(self.learning_rate_decay, dict):
+            object.__setattr__(self, 'learning_rate_decay', LearningRateDecay(**self.learning_rate_decay))
+        if self.learning_rate_decay is not None and not isinstance(self.learning_rate_decay, LearningRateDecay):
+            raise ValueError('Learning-rate decay must be a LearningRateDecay or its dictionary')
         if type(self.imagination_horizon) is not int or self.imagination_horizon < 1:
             raise ValueError('Imagination horizon must be a positive integer')
         if not math.isfinite(self.anchor_coefficient) or self.anchor_coefficient < 0:
@@ -113,6 +141,9 @@ class Learner:
         if platform_contact is not None:
             self.optimizers['platform_contact'] = torch.optim.Adam(
                 platform_contact.parameters(), lr=config.model_learning_rate)
+        # Every optimizer's configured rate, including optional heads, is its schedule base.
+        self.base_learning_rates = {name: optimizer.param_groups[0]['lr']
+                                    for name, optimizer in self.optimizers.items()}
         self.updates = {name: 0 for name in self.optimizers}
         self.skipped = {name: 0 for name in self.optimizers}
         self.anchor = None   # (frozen teacher actor, teacher action std [6])
@@ -130,6 +161,19 @@ class Learner:
             target = teacher(frames)
         return .5 * ((self.actor(frames) - target) / std).square().mean()
 
+    def learning_rate_factor(self) -> float:
+        decay = self.config.learning_rate_decay
+        return 1. if decay is None else decay.factor(self.updates['actor'])
+
+    def _schedule(self, name: str) -> None:
+        # Rates follow the schedule only when it is enabled; otherwise any
+        # externally managed rate (resume reset, guard) is left untouched.
+        if self.config.learning_rate_decay is None:
+            return
+        rate = self.base_learning_rates[name] * self.learning_rate_factor()
+        for group in self.optimizers[name].param_groups:
+            group['lr'] = rate
+
     def _step(self, name: str, loss: Tensor) -> bool:
         optimizer = self.optimizers[name]
         optimizer.zero_grad(set_to_none=True)
@@ -140,6 +184,7 @@ class Learner:
             norm = nn.utils.clip_grad_norm_(parameters, self.config.gradient_clip)
             finite = bool(torch.isfinite(norm))
         if finite:
+            self._schedule(name)
             optimizer.step()
             self.updates[name] += 1
         else:
@@ -327,6 +372,7 @@ class Learner:
             norm = nn.utils.clip_grad_norm_(self.actor.decoder.parameters(), config.gradient_clip)
             finite = bool(torch.isfinite(norm))
         if finite and train_actor:
+            self._schedule('actor')
             optimizer.step()
             self.updates['actor'] += 1
         elif train_actor:
@@ -345,6 +391,7 @@ class Learner:
                     total_loss += float(loss.detach())
                     batches += 1
         return {"actor/updated": finite and train_actor, "actor/loss": actor_loss if accepted else float('nan'),
+                "learning_rate/factor": self.learning_rate_factor(),
                 "actor/anchor_kl": anchor,
                 "actor/skipped": self.skipped["actor"], "critic/loss": total_loss / max(batches, 1),
                 "critic/skipped": self.skipped["critic"],
