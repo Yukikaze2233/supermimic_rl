@@ -14,6 +14,7 @@ import torch
 from ..compact_state import named_field
 from .jump_evaluation import JumpEvaluation
 from .recovery_evaluation import RecoveryEvaluation
+from .stair_evaluation import StairRequestEvaluation
 
 # Radiant 0bf3456 clips before MAE. Keep these secondary summaries separate
 # from raw error and document our native coordinates/sample-weighted reduction.
@@ -362,6 +363,7 @@ class CourseEvaluation:
         self.recovery_phase_buckets = {}
         self.recovery_evidence = None
         self.jump_evidence = None
+        self.stair_request_evidence = None
         self._hook_restore = []
         self._authored_pending = None
         self._active = False
@@ -377,6 +379,12 @@ class CourseEvaluation:
             self.phase_buckets = {}
             self.recovery_phase_buckets = {}
             self._install_authored_evidence()
+            course = self.adapter.env._terrain_course
+            if (getattr(course, 'stair_requests', None) is not None
+                    and hasattr(course, '_tof_command')
+                    and hasattr(getattr(course, 'tof_trigger', None), 'last_riser_xy')):
+                self.stair_request_evidence = StairRequestEvaluation(self.adapter.env, self.plan.row_names)
+                self.stair_request_evidence.install()
             if getattr(self.adapter.env._terrain_course, 'recovery', None) is not None:
                 options = ({'qualification_commands': self.plan.qualification_commands,
                             'qualification_clock': self.plan.qualification_clock}
@@ -444,6 +452,8 @@ class CourseEvaluation:
 
     def close(self):
         """Restore only evaluation wrappers, also when a rollout raises."""
+        if self.stair_request_evidence is not None:
+            self.stair_request_evidence.close()
         if self.jump_evidence is not None:
             self.jump_evidence.close()
         if self.recovery_evidence is not None:
@@ -696,6 +706,8 @@ class CourseEvaluation:
                 'Phase totals partition observed samples, not certified skill successes.')
         if self.jump_evidence is not None:
             report['jump_diagnostics'] = self.jump_evidence.summary()
+        if self.stair_request_evidence is not None:
+            report['stair_request_diagnostics'] = self.stair_request_evidence.summary()
         if self.config.recovery_qualification:
             report['command_phase_semantics'] += (
                 ' With recovery_qualification enabled, scheduled_segment also includes the fixed '

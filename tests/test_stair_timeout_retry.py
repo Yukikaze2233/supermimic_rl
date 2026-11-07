@@ -245,3 +245,67 @@ def test_new_semantics_cannot_be_hidden_in_the_legacy_scenario_format():
         StairScenario.from_dict({**old, 'timeout_retry': True})
     with pytest.raises(ValueError, match='scenario format'):
         StairScenario.from_dict({**old, 'format': 'supermimic-native-stair-source-timeout-retry-v1'})
+
+
+def test_evaluation_links_raw_timeout_retries_without_changing_native_states_or_rng():
+    from supermimic_rl.course.stair_evaluation import StairRequestEvaluation
+
+    plain, *_ = timeline(retry=True)
+    observed, *_ = timeline(retry=True)
+    for native in (plain, observed):
+        native._episode_id = torch.zeros(native.num_envs, dtype=torch.long)
+    course = observed._terrain_course
+    original = (course._tof_command, course._record_stair_end, course.stair_requests.step)
+    evidence = StairRequestEvaluation(observed, ['timeout', 'cancel', 'complete', 'abort'])
+    evidence.install()
+    for step in range(55):
+        for native in (plain, observed):
+            owner = native._terrain_course
+            previous = native.time.clone()
+            native.time = torch.full((native.num_envs,), (step + 1) * .02, dtype=torch.float64)
+            native._completed_estimate = estimate_at(previous, native.num_envs)
+            packet = StairPacket.empty(native.num_envs, 'cpu')
+            if step == 6:
+                packet.cancel_id[1] = owner.stair_requests.active_id[1]
+                packet.completed_id[2] = owner.stair_requests.active_id[2]
+                packet.safety_abort[3] = True
+            owner._pending_requests['stair'] = RequestCommand(packet.request_id, packet.height_m,
+                packet.cancel_id, packet.safety_abort, completed_id=packet.completed_id)
+            owner.advance_skill()
+        for capture in (StairTaskState.capture, StairSourceState.capture):
+            left, right = capture(plain).record(), capture(observed).record()
+            for key in left:
+                torch.testing.assert_close(left[key], right[key], rtol=0, atol=0)
+        assert torch.equal(plain._terrain_course.tof_trigger.generator.get_state(),
+                           course.tof_trigger.generator.get_state())
+        torch.testing.assert_close(plain._terrain_course.stair_outcomes, course.stair_outcomes)
+    result = evidence.summary()
+    retry = [r for r in result['requests'] if r['env_id'] == 0]
+    assert len(retry) >= 3
+    assert retry[0]['retry_of_timed_out_request_id'] is None
+    assert all(r['retry_of_timed_out_request_id'] == old['request_id']
+               for old, r in zip(retry, retry[1:]))
+    assert all(r['previous_riser_distance_m'] == 0 for r in retry[1:])
+    for row, reason in enumerate(('cancelled', 'estimated_complete', 'safety_abort'), start=1):
+        records = [r for r in result['requests'] if r['env_id'] == row]
+        assert len(records) == 1 and records[0]['end_reason'] == reason
+        assert records[0]['retry_of_timed_out_request_id'] is None
+    assert result == evidence.summary()
+    # Native reset accounting precedes the episode counter increment. Even
+    # identical geometry in the next episode must not inherit a retry link.
+    ended = torch.ones(observed.num_envs, dtype=torch.bool)
+    course._record_stair_end(ended, torch.full((observed.num_envs,), int(RequestEnd.RESET)))
+    course.stair_requests.reset(torch.arange(observed.num_envs), observed.time)
+    observed._episode_id.add_(1)
+    observed.time += .02
+    course._completed_estimate = estimate_at(observed.time - .02, observed.num_envs)
+    evidence.fired.fill_(True)
+    course.stair_requests.step(now_s=observed.time,
+        request_id=course.stair_requests.max_seen_id + 1,
+        height_m=torch.full((observed.num_envs,), .1),
+        cancel_id=torch.full((observed.num_envs,), -1),
+        jump_active=torch.zeros(observed.num_envs, dtype=torch.bool))
+    newborn = evidence.summary()['requests'][-observed.num_envs:]
+    assert all(r['episode_id'] == 1 and r['retry_of_timed_out_request_id'] is None for r in newborn)
+    evidence.close()
+    assert (course._tof_command, course._record_stair_end, course.stair_requests.step) == original
