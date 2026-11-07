@@ -4,7 +4,6 @@ import json
 import os
 from pathlib import Path
 import sys
-from types import SimpleNamespace
 
 import pytest
 import torch
@@ -107,13 +106,18 @@ def test_request_heading_wrapper_preserves_other_native_commands_rng_and_handoff
     for left_value, right_value in zip(native.handoff(32, left_rng, 'cpu'),
                                        modified.handoff(32, right_rng, 'cpu')):
         assert torch.equal(left_value, right_value)
-    tasks = SimpleNamespace(command_pool=native)
+    from transformer_rl.formal.lab_env.course_tasks import LabCourseTasks
+    from transformer_rl.formal.tasks.trajectory import DriveEnvelope
+
+    tasks = LabCourseTasks(2, DriveEnvelope(.06, .34), command_pool=native,
+                          command_context=course.command_context, policy_dt_s=.02)
     assert install_jump_first_command_pool(tasks, SuperMimicCurriculum(2)) is None
     assert tasks.command_pool is native
     receipt = install_jump_first_command_pool(tasks, course)
     assert isinstance(tasks.command_pool, JumpFirstCommandPool)
     assert tasks.command_pool.config == native.config
     assert receipt['request_heading_override'] is False
+    assert receipt['request_motion'] == 'birth_forward_held_v1'
 
 
 def test_native_task_step_does_not_restore_rotation_to_a_standing_jump():

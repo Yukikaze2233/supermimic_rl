@@ -9,7 +9,7 @@ from dataclasses import replace
 from types import SimpleNamespace
 
 import torch
-from transformer_rl.formal.tasks.command_pool import CommandPool
+from transformer_rl.formal.tasks.command_pool import CommandPool, SegmentKind
 from transformer_rl.formal.tasks.curriculum import TaskFamily, interpolate_domain
 
 from .curriculum import CourseCurriculumConfig, STAGE_NAMES, SuperMimicCurriculum, _TransitionBudget
@@ -36,6 +36,37 @@ class JumpFirstCommandPool(CommandPool):
         command[:, 2] = torch.where(request, 0., command[:, 2])
         return replace(draw, command=command, heading_enabled=draw.heading_enabled & ~request)
 
+    def bind_episode_targets(self, tasks):
+        """Use the curriculum's standing/moving draw throughout each REQUEST birth.
+
+        The native pool otherwise discards ``task.command`` at both the first
+        and later segment draws. Reuse that existing draw rather than adding
+        another random stream or replacing the ordinary/terrain command pool.
+        This cache belongs to physical episodes: a cold physics reset
+        repopulates it from the next actual birth, under the caller's existing
+        sampler restoration semantics.
+        """
+        forward = torch.zeros_like(tasks.stream.current[:, 0])
+        begin_episode, draw_segments = tasks._begin_episode_segments, tasks._draw_segments
+
+        def begin(ids, task):
+            forward[ids] = task.command[:, 0]
+            return begin_episode(ids, task)
+
+        def draw(rows):
+            segment = draw_segments(rows)
+            request = tasks.family[rows] == int(TaskFamily.REQUEST)
+            vx = forward[rows]
+            command = segment.command.clone()
+            command[:, 0] = torch.where(request, vx, command[:, 0])
+            # Native _apply_segment clears translation for STAND. Assign the
+            # kind from this task's target, not the discarded random target.
+            kind = torch.where(vx == 0, int(SegmentKind.STAND), int(SegmentKind.NORMAL))
+            return replace(segment, command=command, kind=torch.where(request, kind, segment.kind))
+
+        tasks._begin_episode_segments = begin
+        tasks._draw_segments = draw
+
 
 def install_jump_first_command_pool(tasks, curriculum):
     """Preserve the native pool configuration; affect only the opt-in course."""
@@ -44,8 +75,11 @@ def install_jump_first_command_pool(tasks, curriculum):
     if not isinstance(tasks.command_pool, CommandPool):
         raise ValueError('Jump-first course requires the native command pool')
     tasks.command_pool = JumpFirstCommandPool(tasks.command_pool.config)
+    tasks.command_pool.bind_episode_targets(tasks)
     return {'schedule': SCHEDULE, 'request_heading_override': False,
             'native_handoff_preserved': True, 'request_yaw_rate': 0.,
+            'request_motion': 'birth_forward_held_v1',
+            'request_motion_resume': 'cold_physics_reset_repopulates_cache',
             'early_jump_domain': list(curriculum.initial_domain.jump_m)}
 
 
