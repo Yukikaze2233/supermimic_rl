@@ -25,6 +25,7 @@ def stationary():
     begin(composer, reference, torch.zeros(2, 6))
     physics = replace(sample(composer, 1), height_above_ground_m=command[:, 3].clone(),
         gravity_body=torch.tensor([[0., 0., -1.]]).repeat(2, 1),
+        velocity_origin_body_m_s=torch.zeros(2, 3), velocity_origin_world_m_s=torch.zeros(2, 3),
         angular_velocity_body_rad_s=torch.zeros(2, 3),
         body_normal_load_n=torch.tensor([[0., 5., 5., 0., 0.]]).repeat(2, 1))
     history = RewardHistory(composer._window['dq'], torch.zeros(2), torch.zeros(2), torch.ones(2))
@@ -131,6 +132,38 @@ def test_activity_proof_is_required_and_batched_with_every_physical_tick():
     assert JumpProgress.cat((replace(progress, physical_active=None),) * 2).physical_active is None
 
 
+def test_quiet_penalizes_translation_without_changing_existing_drift_cost():
+    _, reference, physics, history, parameters, progress = stationary()
+    velocity = torch.tensor([[.025, 0., 0.], [.025, -.05, 0.]])
+    measured = replace(physics, velocity_origin_body_m_s=velocity, velocity_origin_world_m_s=velocity)
+    result = reward(reference, measured, history, parameters, progress)
+    baseline = reward(reference, measured, history,
+                      replace(parameters, extensions=RewardExtensions()), progress)
+    torch.testing.assert_close(result.cost['stand_world_xy'], baseline.cost['stand_world_xy'], rtol=0, atol=0)
+    expected = torch.exp(-baseline.cost['stand_world_xy'])
+    torch.testing.assert_close(result.positive['stationary_quiet'], expected)
+    assert 0 < expected[1] < expected[0] < 1
+    for name, value in baseline.components.items():
+        torch.testing.assert_close(result.components[name], value, rtol=0, atol=0)
+
+
+def test_quiet_translation_gradient_reduces_signed_drift_and_matches_finite_difference():
+    _, reference, physics, history, parameters, progress = stationary()
+    velocity = torch.tensor([[.025, -.05, .3], [-.1, .03, -.2]], dtype=torch.float64, requires_grad=True)
+
+    def score(value):
+        measured = replace(physics, velocity_origin_body_m_s=value, velocity_origin_world_m_s=value)
+        return reward(reference, measured, history, parameters, progress).positive['stationary_quiet'].sum()
+
+    gradient, = torch.autograd.grad(score(velocity), velocity)
+    assert (gradient[:, :2] * velocity[:, :2] < 0).all()
+    assert not gradient[:, 2].any()
+    direction = torch.tensor([[.2, -.1, .5], [-.3, .2, .4]], dtype=torch.float64)
+    epsilon = 1e-6
+    numeric = (score(velocity + epsilon * direction) - score(velocity - epsilon * direction)) / (2 * epsilon)
+    torch.testing.assert_close((gradient * direction).sum(), numeric, rtol=1e-7, atol=1e-7)
+
+
 def test_default_and_explicit_zero_keep_old_values_receipt_and_require_no_new_state():
     for case in ('ordinary', 'gimbal', 'terrain', 'recovery', 'jump_takeoff', 'jump_landing', 'air_landing'):
         composer, reference = setup(case)
@@ -205,6 +238,7 @@ def test_native_and_imagined_activity_agree_across_success_and_reset():
                               angular_speed_rad_s=torch.zeros(2), dt=.005)
         expected.append((tasks.physical_id >= 0).clone())
         physics = replace(sample(composer, tick), height_above_ground_m=torch.full((2,), .32),
+            velocity_origin_body_m_s=torch.zeros(2, 3), velocity_origin_world_m_s=torch.zeros(2, 3),
             gravity_body=torch.tensor([[0., 0., -1.]]).repeat(2, 1), angular_velocity_body_rad_s=torch.zeros(2, 3),
             body_normal_load_n=torch.tensor([[0., 5., 5., 0., 0.]]).repeat(2, 1))
         composer.observe(physics, reference)

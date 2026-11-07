@@ -91,8 +91,10 @@ class RewardExtensions:
     supplies a settling signal without damping the whole flip or changing the
     recovery handoff. It is not physical success or contact certification.
 
-    ``stationary_quiet`` uses the same soft objective after an explicit NORMAL
-    zero command, with both wheels supported and no harmful body contact.
+    ``stationary_quiet`` rewards low angular speed and low horizontal motion
+    after an explicit NORMAL zero command, with both wheels supported and no
+    harmful body contact. Its translation factor reuses the existing stand
+    drift cost; it introduces no additional speed threshold or gain.
     Terrain/flight windows, special gimbal commands and still-live physical
     jump requests are excluded. It adds no mode lock or motion restriction.
 
@@ -818,7 +820,8 @@ def physical_reward_densities(sample: RewardPhysics, reference: RewardReference,
                       & ~jump_progress.physical_active)
         angular_square = sample.angular_velocity_body_rad_s.square().sum(-1)
         positive['stationary_quiet'] = (extensions.stationary_quiet * stationary * positive['height']
-                                       * upright.clamp_min(0) * torch.exp(-angular_square / .25))
+                                       * upright.clamp_min(0) * torch.exp(-angular_square / .25)
+                                       * torch.exp(-cost['stand_world_xy']))
     p, c = torch.stack(tuple(positive.values())).sum(0), torch.stack(tuple(cost.values())).sum(0)
     components = {**{'positive.' + key: value for key, value in positive.items()},
                   **{'cost.' + key: -value for key, value in cost.items()}}
