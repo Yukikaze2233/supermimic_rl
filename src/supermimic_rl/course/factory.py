@@ -47,6 +47,14 @@ def create_course(configuration):
     importlib.invalidate_caches()
     _, runtime = _read_pinned(configuration["runtime_json"], configuration["runtime_sha256"])
     _, course_configuration = _read_pinned(configuration["course_json"], configuration["course_sha256"])
+    platform_plan = None
+    if configuration.get('platform_task') is not None:
+        from .platform_course import PlatformCoursePlan
+
+        platform_plan = PlatformCoursePlan.read(configuration['platform_task'],
+            num_envs=configuration['num_envs'], atlas_sha256=runtime['terrain_atlas_pin']['sha256'],
+            record_substeps=configuration.get('record_substeps', False),
+            jump_takeoff=configuration.get('jump_takeoff'))
     asset_directory = Path(configuration["asset_directory"]).resolve(strict=True)
     _read_pinned(asset_directory / "manifest.json", configuration["asset_manifest_sha256"])
     log = Path(configuration["native_log_directory"])
@@ -70,6 +78,8 @@ def create_course(configuration):
 
     backend = PhysicsBackendConfig.from_dict(runtime["physics_backend"])
     strategy = select_course_backend(backend, runtime, configuration)
+    if platform_plan is not None and strategy.name != 'physx':
+        raise ValueError('Native platform patch collection currently requires the PhysX contact interface')
     asset = load_asset_description(str(asset_directory),
                                   expected_manifest_sha256=configuration["asset_manifest_sha256"])
     atlas = verify_pin(runtime["terrain_atlas_pin"])
@@ -133,6 +143,14 @@ def create_course(configuration):
 
         recovery_bridge_receipt = install_recovery_roll_bridge(
             native, curriculum, log, evaluation=configuration.get('evaluation') is not None)
+        platform_owner = None
+        if platform_plan is not None:
+            from .platform_course import NativePlatformCourse
+
+            # Bind the final router before any actual-body clearance provider.
+            install_authored_routing(native, rehearsal_curriculum=(
+                curriculum if curriculum.config.foundation_authored_rehearsal else None))
+            platform_owner = NativePlatformCourse(native, platform_plan).install_physics()
         # The native sampler installation creates LabTerrainCourse and its
         # jump task owner; the environment constructor leaves it unset.
         reward_kernel_receipt = install_shared_reward(
@@ -155,6 +173,10 @@ def create_course(configuration):
         from .stair_retry import install_stair_timeout_retry
 
         stair_retry_receipt = install_stair_timeout_retry(native, enabled=stair_timeout_retry)
+        if platform_owner is not None:
+            # Caller reservation is outermost; ToF measurement/end/retry owners
+            # continue running underneath, as does the original take-off gate.
+            platform_owner.install_caller()
         jump_assist_receipt = None
         if configuration.get("jump_assist") is not None:
             if configuration.get("evaluation") is not None:
@@ -162,8 +184,9 @@ def create_course(configuration):
             from .jump_assist import install_jump_assist
 
             jump_assist_receipt = install_jump_assist(native, curriculum, configuration["jump_assist"]).receipt()
-        install_authored_routing(native, rehearsal_curriculum=(
-            curriculum if curriculum.config.foundation_authored_rehearsal else None))
+        if platform_owner is None:
+            install_authored_routing(native, rehearsal_curriculum=(
+                curriculum if curriculum.config.foundation_authored_rehearsal else None))
         provenance = {
             "upstream_commit": commit, "runtime_sha256": configuration["runtime_sha256"],
             "course_sha256": configuration["course_sha256"],
@@ -195,6 +218,8 @@ def create_course(configuration):
             provenance['stair_timeout_retry'] = stair_retry_receipt
         if recovery_bridge_receipt is not None:
             provenance['recovery_roll_bridge'] = recovery_bridge_receipt
+        if platform_owner is not None:
+            provenance['platform_task'] = platform_owner.receipt()
         (log / "course-provenance.json").write_text(json.dumps(provenance, indent=2) + "\n")
         setup = {"action_contract": action_contract,
                  "materials": getattr(native._wheel_materials, "receipt", None),
