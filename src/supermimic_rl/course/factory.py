@@ -156,7 +156,8 @@ def create_course(configuration):
         reward_kernel_receipt = install_shared_reward(
             native._formal_reward.composer, verify_native=configuration.get("audit_reward_kernel", False),
             extensions=RewardExtensions(**configuration.get("reward_extensions", {})),
-            jump_tasks=native._terrain_course.tasks)
+            jump_tasks=native._terrain_course.tasks,
+            **({} if platform_owner is None else {'platform_landing': platform_owner.landing}))
         course_schedule_receipt = install_jump_first_command_pool(native._terrain_course.tasks, curriculum)
         jump_takeoff_receipt = stair_label_receipt = None
         if configuration.get("jump_takeoff") is not None:

@@ -510,7 +510,7 @@ class Imagination:
                 # Only this interval's prediction and causal task state reach the
                 # producer. Recorded future contact labels are never passed in.
                 evidence = self.platform_contact(ticks, intent=platform_intent, jump_state=jump,
-                    command_height=goal[:, 3] / 5., terrain_tile=start['terrain_tile'][:, 0])
+                    command_height=goal[:, 3] / 5., terrain_tile=start['terrain_tile'][:, 0].long())
                 platform_inputs = {'platform_state': platform_landing, 'platform_evidence': evidence}
             physical = reward_context.integrate(state, prediction, action, reward_memory, memory, goal, step,
                 **({} if jump is None else {'jump_state': jump, 'base_mode': task.route[:, 3].long()}),

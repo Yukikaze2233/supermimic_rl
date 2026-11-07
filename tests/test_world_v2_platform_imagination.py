@@ -37,6 +37,7 @@ class PredictedContactFixture:
         self.calls = []
 
     def __call__(self, ticks, *, intent, jump_state, command_height, terrain_tile):
+        assert terrain_tile.dtype == torch.long
         self.calls.append((intent.target_index.clone(), intent.phase.clone(), jump_state.physical_id.clone()))
         selected = ((intent.bound_request_id >= 0) & (intent.bound_request_id == jump_state.physical_id))
         selected = selected[:, None].expand(-1, 4)
