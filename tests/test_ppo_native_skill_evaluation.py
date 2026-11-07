@@ -186,6 +186,53 @@ def test_native_failure_restores_evaluation_hooks_without_advancing_training():
     assert env.adapter.events[-1] == "end" and not env.adapter.seen
 
 
+@pytest.mark.parametrize("mixed", [False, True])
+def test_platform_report_keeps_actual_owner_and_distinguishes_flat_anchor_outcomes(mixed):
+    env, policy, _ = fixture(new_domain=True)
+    platform = SimpleNamespace(platform_rows=torch.tensor([False, True]),
+        summary=lambda: {"phase": [0, 3], "success_rate": None})
+    if mixed:
+        platform.plan = SimpleNamespace(sampler=object())
+    env.adapter.env.supermimic_platform_course = platform
+    original_begin = env.adapter.evaluation_begin
+
+    def begin(schema):
+        original_begin(schema)
+        platform.platform_rows = torch.tensor([True, False])
+
+    original_step = env.adapter.evaluation_step
+
+    def step(*args):
+        original_step(*args)
+        if mixed:
+            platform.platform_rows = torch.tensor([False, True])
+
+    suite = {"jump_diagnostics": {"totals": {"success": 0}}, "success_semantics": "Native pulses"}
+    env.adapter.evaluation_begin, env.adapter.evaluation_step = begin, step
+    env.adapter.evaluation_summary = lambda: suite
+    result = evaluate_native_policy(env, policy, 2)
+    assert result["platform_diagnostics"] == platform.summary()
+    scope = result["platform_evaluation_scope"]
+    assert scope["planned_env_ids"] == [0] and scope["recorded_physics_ticks"] is False
+    assert "jump_diagnostics" in suite and "jump_diagnostics" not in result["task_suite"]
+    diagnostic = result["task_suite"]["flat_anchor_jump_diagnostics"]
+    assert diagnostic["totals"] == suite["jump_diagnostics"]["totals"]
+    if mixed:
+        assert "initial episode" in scope["planned_env_ids_scope"]
+        assert diagnostic["platform_interpretation"]["includes_platform_rows"] is None
+        assert "not a full-run" in diagnostic["platform_interpretation"]["planned_env_ids_scope"]
+    else:
+        assert diagnostic["platform_interpretation"]["includes_platform_rows"] is True
+
+
+def test_platform_without_summary_does_not_fabricate_capability():
+    env, policy, _ = fixture(new_domain=True)
+    env.adapter.env.supermimic_platform_course = SimpleNamespace(platform_rows=torch.tensor([True, False]))
+    report = evaluate_native_policy(env, policy, 1)
+    assert report["platform_diagnostics"]["status"] == "unknown"
+    assert "final snapshots are not a success rate" in report["platform_evaluation_scope"]["capability_source"]
+
+
 @pytest.mark.parametrize("steps", [0, -1, True, 1.5])
 def test_invalid_exposure_rejected_before_native_work(steps):
     env, policy, _ = fixture()

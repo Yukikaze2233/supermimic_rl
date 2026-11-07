@@ -14,6 +14,7 @@ from torch.nn import functional as F
 
 from ..compact_state import named_field, _inverse_rotate
 from ..evaluation import native_tracking_sample, terminal_failure_masks
+from ..evaluation_reporting import PlatformEvaluationReport
 from .trainer import EpisodeStatistics
 
 
@@ -35,6 +36,8 @@ def evaluate_native_policy(environment, policy, steps, *, on_progress=None):
         if fixed_suite:
             owner.evaluation_begin(environment.schema)
             environment.current = environment._pack(owner.current)
+        platform_reporting = PlatformEvaluationReport(
+            getattr(owner.env, "supermimic_platform_course", None), environment.num_envs)
         bounds = environment.current.state.new_tensor(environment.schema.action_bounds)
         for index in range(steps):
             before = environment.current
@@ -82,4 +85,5 @@ def evaluate_native_policy(environment, policy, steps, *, on_progress=None):
                        "action sampling follows the caller"}
     if fixed_suite:
         report["task_suite"] = owner.evaluation_summary()
+    platform_reporting.apply(report, recorded_physics_ticks=False)
     return report
