@@ -15,6 +15,7 @@ from ..compact_state import named_field
 from .jump_evaluation import JumpEvaluation
 from .recovery_evaluation import RecoveryEvaluation
 from .stair_evaluation import StairRequestEvaluation
+from .stationary_evaluation import StationaryEvaluation
 
 # Radiant 0bf3456 clips before MAE. Keep these secondary summaries separate
 # from raw error and document our native coordinates/sample-weighted reduction.
@@ -416,6 +417,7 @@ class CourseEvaluation:
         self.recovery_evidence = None
         self.jump_evidence = None
         self.stair_request_evidence = None
+        self.stationary_evidence = None
         self._hook_restore = []
         self._authored_pending = None
         self._active = False
@@ -431,6 +433,11 @@ class CourseEvaluation:
             self.phase_buckets = {}
             self.recovery_phase_buckets = {}
             self._install_authored_evidence()
+            if (set(StationaryEvaluation.FIELDS) <= {field.name for field in schema.state_fields}
+                    and hasattr(self.adapter.env, '_commands')):
+                from transformer_rl.formal.control.observation import CommandMode
+                self.stationary_evidence = StationaryEvaluation(
+                    schema, self.plan.row_names, normal_mode=int(CommandMode.NORMAL))
             course = self.adapter.env._terrain_course
             if (getattr(course, 'stair_requests', None) is not None
                     and hasattr(course, '_tof_command')
@@ -463,6 +470,8 @@ class CourseEvaluation:
                 'routed_step_height_m': router.step_table[tile].detach().clone(),
                 'routed_slope_rad': router.slope_table[tile].detach().clone(),
                 'routed_roughness_m': router.roughness_table[tile].detach().clone()}
+        if self.stationary_evidence is not None:
+            result['stationary_admitted_command'] = self.adapter.env._commands().admitted_body_command.detach().clone()
         if self.recovery_evidence is not None:
             result.update(self.recovery_evidence.sample())
         return result
@@ -602,6 +611,8 @@ class CourseEvaluation:
             for value in context.values():
                 finite &= torch.isfinite(value).reshape(len(reward), -1).all(-1)
         valid = transition.valid.detach().cpu() & finite
+        if self.stationary_evidence is not None:
+            self.stationary_evidence.observe_transition(transition, tracking, valid)
         if self.recovery_evidence is not None:
             self.recovery_evidence.observe_transition(transition, valid)
         if self.jump_evidence is not None:
@@ -646,7 +657,7 @@ class CourseEvaluation:
                 if context is not None:
                     terrain = bucket.setdefault('routed_terrain_ranges', {})
                     for key, value in context.items():
-                        if key not in ('command_source', 'recovery_active', 'recovery_after_handoff'):
+                        if key not in ('command_source', 'recovery_active', 'recovery_after_handoff', 'stationary_admitted_command'):
                             self._record_range(terrain, key, value[row])
                 bucket["reward_sum"] += float(reward[row])
                 bucket["terminated"] += int(terminated[row])
@@ -770,6 +781,8 @@ class CourseEvaluation:
                 'Phase totals partition observed samples, not certified skill successes.')
         if self.jump_evidence is not None:
             report['jump_diagnostics'] = self.jump_evidence.summary()
+        if self.stationary_evidence is not None:
+            report['stationary_diagnostics'] = self.stationary_evidence.summary()
         if self.stair_request_evidence is not None:
             report['stair_request_diagnostics'] = self.stair_request_evidence.summary()
         if self._authored_pending is not None:
