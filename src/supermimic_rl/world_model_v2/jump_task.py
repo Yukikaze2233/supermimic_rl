@@ -81,7 +81,7 @@ class JumpTaskConfig:
 
         return cls(RequestProtocolConfig(**value['request']), JumpReferenceConfig(**value['reference']),
                    value['physics_dt_s'],
-                   None if value.get('trigger') is None else JumpTakeoffConfig(**value['trigger']),
+                   None if value.get('trigger') is None else JumpTakeoffConfig.from_dict(value['trigger']),
                    value.get('trigger_record_version', JUMP_TRIGGER_RECORD_VERSION),
                    value.get('flight_latch', False))
 
@@ -322,27 +322,33 @@ class JumpTask:
         n, device = len(state.ids), state.ids.device
         validate_packet_owned(packet_owned, packet=packet, count=n, device=device)
         automatic = packet is None or packet_owned is not None
+        pending_admission = getattr(self.config.trigger, 'automatic_pending_admission', False)
         postponed = torch.zeros(n, dtype=torch.bool, device=device)
         trigger = None
         if self.config.trigger is not None:
             last_end, was_active = state._trigger_state()
             trigger = (last_end[:, None], state.trigger_flags)
             if automatic:
-                if (previous_command_height is None or previous_elapsed_s is None
-                        or previous_command_height.shape != (n,) or previous_elapsed_s.shape != (n,)):
+                if (not pending_admission and (previous_command_height is None or previous_elapsed_s is None
+                        or previous_command_height.shape != (n,) or previous_elapsed_s.shape != (n,))):
                     raise ValueError('Gated jumps need the command height and episode clock before admission')
                 gate, dt = self.config.trigger, self.config.request.policy_dt_s
+                height = admitted[:, 3] if pending_admission else previous_command_height
+                elapsed = elapsed_s if pending_admission else previous_elapsed_s + dt
                 ready = (owner._last_supported
-                         & (owner._last_world_height - ground_z - previous_command_height).abs().le(
+                         & (owner._last_world_height - ground_z - height).abs().le(
                              gate.height_tolerance_m)
-                         & (previous_elapsed_s + dt >= gate.min_episode_s)
+                         & (elapsed >= gate.min_episode_s)
                          & (now_s - last_end >= gate.cooldown_s))
                 due = ((task_family == int(TaskFamily.REQUEST))
-                       & (previous_elapsed_s + dt >= owner.next_request_s) & (protocol.active_id < 0))
+                       & (elapsed >= owner.next_request_s) & (protocol.active_id < 0))
+                if pending_admission:
+                    due = due & ~blocked_by_stair
                 if packet_owned is not None:
                     due = due & ~packet_owned
                 postponed = due & ~ready
-                owner.next_request_s = torch.where(postponed, previous_elapsed_s + 2 * dt,
+                next_tick = elapsed_s + dt if pending_admission else previous_elapsed_s + 2 * dt
+                owner.next_request_s = torch.where(postponed, next_tick,
                                                    owner.next_request_s)
         owner.success_id.fill_(-1)
         if estimate is None:
@@ -357,6 +363,12 @@ class JumpTask:
         condition = protocol.step(now_s=now_s, estimate=estimate, request_id=selected.request_id,
             requested_height_m=selected.requested_height_m, cancel_id=selected.cancel_id,
             allow_new=selected.allow_new, safety_abort=selected.safety_abort)
+        if pending_admission:
+            from supermimic_rl.course.jump_takeoff import retry_pending_automatic
+
+            owner.next_request_s = retry_pending_automatic(
+                owner.next_request_s, elapsed_s, condition.response,
+                selected.automatic_due, self.config.request.policy_dt_s)
 
         # This is the LabCourseTasks.step glue surrounding the shared protocol:
         # an estimated completion does not close unverified physical evidence.

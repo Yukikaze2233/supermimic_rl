@@ -73,6 +73,23 @@ def course_progress(native, curriculum):
     metrics = native._terrain_course.metrics()
     counters = {f"course/jump/{name}": value
                 for name, value in metrics["physical_request_outcomes"].items()}
+    if 'request_responses' in metrics:
+        from transformer_rl.formal.tasks.protocol import RequestResponse
+
+        # Already materialized by native.metrics(); these count protocol
+        # responses, not independently successful physical jumps.
+        for field, prefix in (('request_responses', 'request_response'),
+                              ('external_request_responses', 'external_request_response')):
+            if field in metrics:
+                counters.update({f'course/jump/{prefix}/{response.name.lower()}': metrics[field][int(response)]
+                                 for response in RequestResponse})
+    counters.update({f'course/jump/request_end/{name}': value
+                     for name, value in metrics.get('request_end_counts', {}).items()})
+    gate = getattr(native, 'supermimic_jump_trigger', None)
+    if gate is not None:
+        # One cumulative scalar at the existing progress/log boundary. A row
+        # waiting for several ticks contributes repeatedly; it is not a request.
+        counters['course/jump/gate_deferred_row_ticks'] = int(gate.deferred)
     counters.update({f"course/stair/{name}": value for name, value in metrics["stair_closed_loop"].items()})
     authored = metrics["authored_stair_completion"]
     for name in ("ended", "ended_complete"):
