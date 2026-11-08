@@ -111,6 +111,10 @@ class RewardExtensions:
     rise normalizes distance; it is not a new clearance success threshold.
     ``jump_tuck`` rewards shortening each virtual leg toward the source's
     closed-chain minimum, normalized by that same source's reachable span.
+    ``jump_tuck_endpoint_normalized`` removes the half-budget reward at
+    maximum extension while preserving the minimum-length reward budget.
+    Its endpoint-normalized score doubles the existing in-range gradient;
+    it does not prescribe a leg trajectory or relax jump qualification.
     Both use the first real flight window, never the supported push. Geometry
     remains reward-only and does not change observations or physical success.
     ``jump_takeoff_extension`` is the supported counterpart (Fudan's
@@ -159,16 +163,21 @@ class RewardExtensions:
     jump_takeoff_extension: float = 0.  # per second at the source's maximum virtual leg length while pushing up
     jump_physical_reference: bool = False  # retain release targets until actual takeoff; re-anchor flight tracking
     coaxial_action_smoothing: bool = False  # common-period leg target differences; unchanged wheel speed costs
+    jump_tuck_endpoint_normalized: bool = False  # zero tuck reward at full source extension, same maximum budget
 
     # Opt-ins added after the first extension receipts. Their disabled values
     # are omitted, so sources recorded before each opt-in keep their identity.
     _RECEIPT_OPT_INS = ('jump_flight_clearance', 'jump_tuck', 'jump_peak_completion', 'stationary_quiet',
                         'jump_physical_tail', 'jump_extension_height_floor', 'stair_support_transfer',
-                        'jump_takeoff_extension', 'jump_physical_reference', 'coaxial_action_smoothing')
+                        'jump_takeoff_extension', 'jump_physical_reference', 'coaxial_action_smoothing',
+                        'jump_tuck_endpoint_normalized')
 
     def __post_init__(self):
         if type(self.coaxial_action_smoothing) is not bool:
             raise ValueError('Coaxial action smoothing requires a boolean flag')
+        if (type(self.jump_tuck_endpoint_normalized) is not bool
+                or self.jump_tuck_endpoint_normalized and self.jump_tuck <= 0):
+            raise ValueError('Endpoint-normalized tuck requires a boolean flag and positive jump_tuck weight')
         if type(self.jump_physical_reference) is not bool:
             raise ValueError('Physical jump reference requires a boolean flag')
         if type(self.stair_support_transfer) is not bool:
@@ -216,6 +225,20 @@ class RewardExtensions:
             if not receipt[name]:
                 receipt.pop(name)
         return receipt
+
+    def tuck_objective_receipt(self) -> dict | None:
+        """Describe the opt-in shaping without adding non-config keys to receipt()."""
+        if not self.jump_tuck_endpoint_normalized:
+            return None
+        return {
+            'format': 'jump-tuck-endpoint-normalized-v1',
+            'score': 'mean_legs(max(2 / (1 + x^2) - 1, 0))',
+            'x': 'max(leg_length_m - minimum_leg_length_m, 0) / leg_length_range_m',
+            'geometry_source': 'reward_kernel.jump_flight_geometry',
+            'maximum_density_per_s': self.jump_tuck,
+            'scope': 'existing first real flight, after ascent and before first touchdown',
+            'qualification': 'original requested peak and native physical success unchanged',
+        }
 
 
 @dataclass(frozen=True)
@@ -915,7 +938,13 @@ def physical_reward_densities(sample: RewardPhysics, reference: RewardReference,
                     length, minimum, span = geometry.selected_legs(flight_geometry_available)
                     shortfall = (length - minimum).clamp_min(0)
                     tuck_shortfall = shortfall.mean(-1)
-                    tuck_score = (1 + (shortfall / span).square()).reciprocal().mean(-1)
+                    tuck_per_leg = (1 + (shortfall / span).square()).reciprocal()
+                    if extensions.jump_tuck_endpoint_normalized:
+                        # The old kernel pays half its budget at full extension.
+                        # Normalize those same physical endpoints, retaining the
+                        # original finite, differentiable interior and budget.
+                        tuck_per_leg = (2 * tuck_per_leg - 1).clamp_min(0)
+                    tuck_score = tuck_per_leg.mean(-1)
                     positive['jump_tuck'] = (extensions.jump_tuck * flight_geometry_available * tuck_score)
         flying = flying.to(v_up.dtype)
         rise = sample.velocity_origin_world_m_s[:, 2].clamp(0, extensions.jump_lift_cap_m_s)

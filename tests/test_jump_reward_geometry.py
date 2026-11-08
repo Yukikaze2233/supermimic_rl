@@ -213,7 +213,8 @@ def test_four_tick_imagination_produces_geometry_without_peak_completion():
     assert (result.components['positive.jump_tuck'] > 0).all()
 
 
-def test_four_tick_native_reward_matches_world_assembly_and_stops_tuck_on_touchdown():
+@pytest.mark.parametrize('normalized', [False, True])
+def test_four_tick_native_reward_matches_world_assembly_and_stops_tuck_on_touchdown(normalized):
     from transformer_rl.formal.control.observation import CommandMode
     from transformer_rl.formal.tasks.jump import ReferenceStage
     from transformer_rl.formal.tasks.reward import RewardPhase, RewardReference
@@ -224,7 +225,8 @@ def test_four_tick_native_reward_matches_world_assembly_and_stops_tuck_on_touchd
 
     native, assembly, geometry, state, legs, memory = setup('legacy')
     helper = JumpRewardGeometry(geometry)
-    extension = RewardExtensions(jump_flight=4., jump_flight_clearance=True, jump_tuck=1.7)
+    extension = RewardExtensions(jump_flight=4., jump_flight_clearance=True, jump_tuck=1.7,
+                                 jump_tuck_endpoint_normalized=normalized)
     stage = torch.full((2,), int(ReferenceStage.BALLISTIC))
     owner = SimpleNamespace(jump_reference=lambda: SimpleNamespace(clock_stage=stage),
         ascent_seen=torch.ones(2, dtype=torch.bool), physical_id=torch.zeros(2, dtype=torch.long),
@@ -236,6 +238,10 @@ def test_four_tick_native_reward_matches_world_assembly_and_stops_tuck_on_touchd
     receipt = install_shared_reward(native, extensions=extension, jump_tasks=owner,
                                     flight_geometry=NativeJumpRewardGeometry(helper, course))
     assert receipt['jump_flight_geometry'] == helper.receipt
+    if normalized:
+        assert receipt['jump_tuck_objective'] == extension.tuck_objective_receipt()
+    else:
+        assert 'jump_tuck_objective' not in receipt
     assembly.parameters = replace(assembly.parameters, extensions=extension)
     ids, owned = torch.zeros(2, dtype=torch.long), torch.ones(2, dtype=torch.bool)
     mode = torch.full_like(ids, int(CommandMode.JUMP))

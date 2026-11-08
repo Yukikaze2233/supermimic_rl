@@ -361,6 +361,8 @@ def install_shared_reward(composer, *, verify_native=False, extensions: RewardEx
             'history': 'original raw issued actions and native action_count; no new state',
             'ownership_source_sha256': ownership_sha,
         }
+    if extensions.jump_tuck_endpoint_normalized:
+        receipt['jump_tuck_objective'] = extensions.tuck_objective_receipt()
     return receipt
 
 
