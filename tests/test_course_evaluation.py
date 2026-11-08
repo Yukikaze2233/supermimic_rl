@@ -655,9 +655,10 @@ def test_native_jump_request_reaches_course_report_and_hooks_restore(monkeypatch
     env = native_jumps()
     env._episode_id = torch.zeros(1, dtype=torch.long)
     env._interval_policy_owned = torch.ones(1, dtype=torch.bool)
-    counters = {'physical_request_outcomes': {}, 'request_end_counts': {},
-                'recovery': {'counts': {}}, 'authored_stair_completion': {}}
-    env._terrain_course.metrics = lambda: counters
+    env._terrain_course.metrics = lambda: {
+        'physical_request_outcomes': {'verified_success': int(
+            env._terrain_course.tasks.physical_outcome_counts[0])},
+        'request_end_counts': {}, 'recovery': {'counts': {}}, 'authored_stair_completion': {}}
     evaluator = CourseEvaluation(SimpleNamespace(env=env, reset=lambda: None))
     monkeypatch.setattr(evaluation, 'FixedCourseScenarios', Plan)
     evaluator.begin(StateSchema((Field('unused', ()),), ()))
@@ -676,13 +677,42 @@ def test_native_jump_request_reaches_course_report_and_hooks_restore(monkeypatch
         assert request['request_id'] == 7 and request['observed_intervals'] == 1
         assert request['physical_end_reason'] == 'active_at_evaluation_end'
         assert not request['native_verified_physical_success']
+        for _ in range(2):
+            tasks.observe_physics(torch.zeros(1, 2), torch.tensor([.4]), torch.zeros(1),
+                torch.tensor([.38]), angular_speed_rad_s=torch.zeros(1))
+        for _ in range(399):
+            tasks.observe_physics(torch.full((1, 2), 20.), torch.zeros(1), torch.zeros(1),
+                torch.tensor([.32]), angular_speed_rad_s=torch.zeros(1))
+        assert tasks.physical_outcome_counts[0] == 0
+        # The final policy interval certifies at a physics substep. Native
+        # command advancement then clears success_id before snapshot packing.
+        for _ in range(4):
+            tasks.observe_physics(torch.full((1, 2), 20.), torch.zeros(1), torch.zeros(1),
+                torch.tensor([.32]), angular_speed_rad_s=torch.zeros(1))
+        tasks.step(now + .02, estimate, torch.zeros(1))
+        assert tasks.success_id.item() == -1
+        completed = Transition(snapshot, torch.zeros(1, 6), snapshot, torch.ones(1),
+            torch.zeros(1, dtype=torch.bool), torch.zeros(1, dtype=torch.bool), torch.ones(1, dtype=torch.bool))
+        tracking = NativeTrackingSample(torch.zeros(1, 3), torch.zeros(1, 3), course={
+            'command_source': torch.tensor([2]), 'recovery_active': torch.tensor([False]),
+            'recovery_after_handoff': torch.tensor([False])})
+        evaluator.step(completed, tracking)
+        evaluator.step(completed, tracking)  # No new physical event: never pay it twice.
+        report = evaluator.summary()
+        bucket = report['buckets']['jump_fixture']
+        assert bucket['jump_physical_success_events'] == bucket['jump_physical_success_events_raw'] == 1
+        assert bucket['jump_physical_success_events_excluded'] == bucket['jump_endpoint_success_samples'] == 0
+        assert bucket['command_phases']['native_handoff']['jump_physical_success_events'] == 1
+        assert bucket['recovery_phases']['other']['jump_physical_success_events'] == 1
+        assert report['jump_diagnostics']['by_scenario']['jump_fixture']['validated_verified_successes'] == 1
+        assert report['physical_counter_deltas_after_initial_reset']['physical_request_outcomes']['verified_success'] == 1
     finally:
         evaluator.close()
     assert all(name not in tasks.__dict__ for name in ('step', 'observe_physics', 'reset'))
     assert 'step' not in tasks.protocol.__dict__
 
 
-def test_course_metrics_use_transition_endpoint_and_subtract_old_training_counters():
+def test_course_metrics_label_endpoint_flags_separately_from_physical_events():
     schema = StateSchema(tuple(Field(name, ()) for name in (
         "course.tasks.family", "course.tasks.terrain_kind", "course.terrain_tile", "course.gimbal.mode",
         "course.tasks.success_id.valid", "course.recovery._verified")), ())
@@ -714,8 +744,11 @@ def test_course_metrics_use_transition_endpoint_and_subtract_old_training_counte
             "translation_target_m_s": torch.tensor([[0., 1.], [0., 0.]]),
             "translation_active": torch.tensor([True, False])}))
     report = evaluator.summary()
-    assert report["buckets"]["jump"]["jump_physical_success_events"] == 1
-    assert report["buckets"]["righting"]["recovery_physical_success_events"] == 1
+    assert report["buckets"]["jump"]["jump_endpoint_success_samples"] == 1
+    assert report["buckets"]["righting"]["recovery_endpoint_verified_rises"] == 1
+    assert report["buckets"]["jump"]["jump_physical_success_events"] == 0
+    assert report["buckets"]["righting"]["recovery_physical_success_events"] == 0
+    assert report['physical_event_observers'] == {'jump': False, 'recovery': False}
     assert report["buckets"]["jump"]["actual"]["tile"] == {"8": 1}
     assert report["buckets"]["righting"]["policy_owned_samples"] == 0
     assert report["buckets"]["jump"]["tracking"]["rmse"] == [1., 2., 3.]
@@ -726,6 +759,54 @@ def test_course_metrics_use_transition_endpoint_and_subtract_old_training_counte
     delta = report["physical_counter_deltas_after_initial_reset"]
     assert delta["physical_request_outcomes"]["verified_success"] == 1
     assert delta["authored_stair_completion"]["ended_complete_by_tile"] == [1, 0]
+
+
+def test_physical_event_attribution_preserves_raw_counts_and_valid_denominators():
+    from supermimic_rl.course.physical_events import PhysicalSuccessEvents
+
+    n = 6
+    schema = StateSchema((Field('unused', ()),), ())
+    start = Snapshot(torch.zeros(n, 1), torch.zeros(n, 35), torch.zeros(n, 11), torch.empty(n, 0),
+        torch.zeros(n, dtype=torch.long), torch.zeros(n, dtype=torch.long), torch.ones(n, dtype=torch.bool))
+    end = replace(start, episode_id=torch.tensor([0, 0, 0, 0, 1, 0]))
+    transition = Transition(start, torch.zeros(n, 6), end, torch.ones(n),
+        torch.zeros(n, dtype=torch.bool), torch.zeros(n, dtype=torch.bool),
+        torch.tensor([True, False, True, True, True, True]))
+    counters = {'physical_request_outcomes': {}, 'request_end_counts': {},
+                'recovery': {'counts': {}}, 'authored_stair_completion': {}}
+    evaluator = CourseEvaluation(SimpleNamespace(env=SimpleNamespace(
+        _terrain_course=SimpleNamespace(metrics=lambda: counters))))
+    evaluator.schema, evaluator.before = schema, counters
+    evaluator.plan = SimpleNamespace(names=('jump',), row_names=('jump',) * n,
+                                     description=lambda: {})
+    events = PhysicalSuccessEvents(evaluator.plan.row_names)
+    for row in range(n):
+        events.record(row, 99 if row == 5 else 0, request=7,
+                      prior_invalid=row == 2, nonfinite_physical_ticks=int(row == 3))
+    events.record(0, 0, request=7)  # The same native identity cannot create a second event.
+    evaluator.jump_evidence = SimpleNamespace(observe_transition=events.observe_transition,
+        summary=lambda: {'physical_success_events': events.summary()})
+    tracking = NativeTrackingSample(torch.zeros(n, 3), torch.zeros(n, 3), course={
+        'command_source': torch.ones(n, dtype=torch.long),
+        'recovery_active': torch.ones(n, dtype=torch.bool),
+        'recovery_after_handoff': torch.zeros(n, dtype=torch.bool)})
+    evaluator.step(transition, tracking)
+    report = evaluator.summary()
+    bucket = report['buckets']['jump']
+    assert (bucket['samples'], bucket['valid_samples'], bucket['invalid_count']) == (6, 5, 1)
+    assert bucket['jump_physical_success_events_raw'] == 6
+    assert bucket['jump_physical_success_events'] == 1
+    assert bucket['jump_physical_success_events_excluded'] == 5
+    assert bucket['command_phases']['scheduled_segment']['jump_physical_success_events_raw'] == 5
+    assert bucket['command_phases']['scheduled_segment']['jump_physical_success_events'] == 1
+    unmatched = bucket['command_phases']['unattributed_physical_events']
+    assert unmatched['samples'] == unmatched['valid_samples'] == 0
+    assert unmatched['jump_physical_success_events_raw'] == unmatched['jump_physical_success_events_excluded'] == 1
+    assert bucket['recovery_phases']['recovery']['jump_physical_success_events'] == 1
+    assert bucket['recovery_phases']['unattributed_physical_events']['samples'] == 0
+    assert bucket['tracking']['samples'] == 5
+    evaluator.step(transition, tracking)
+    assert evaluator.summary()['buckets']['jump']['jump_physical_success_events_raw'] == 6
 
 
 def test_gimbal_ranges_and_tracking_only_count_active_rows():
@@ -787,7 +868,8 @@ def test_invalid_course_rows_do_not_become_failures_successes_or_tracking_eviden
     assert bucket['samples'] == 5 and bucket['valid_samples'] == 2 and bucket['invalid_count'] == 3
     assert bucket['nonfinite_measurement_count'] == 2
     assert bucket['terminated'] == 1 and bucket['reward_sum'] == 3.
-    assert bucket['jump_physical_success_events'] == bucket['recovery_physical_success_events'] == 2
+    assert bucket['jump_endpoint_success_samples'] == bucket['recovery_endpoint_verified_rises'] == 2
+    assert bucket['jump_physical_success_events'] == bucket['recovery_physical_success_events'] == 0
     assert bucket['actual']['tile'] == {'0': 2}
     assert bucket['tracking']['samples'] == 2
     assert bucket['tracking']['mae'] == pytest.approx([1.6, 1.05, .16])

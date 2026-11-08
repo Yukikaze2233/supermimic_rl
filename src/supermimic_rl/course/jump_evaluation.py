@@ -4,6 +4,7 @@ from __future__ import annotations
 import torch
 
 from ..reward_kernel import JUMP_PEAK_TOLERANCE_MAX_M, JUMP_PEAK_TOLERANCE_TARGET_FRACTION
+from .physical_events import PhysicalSuccessEvents
 
 
 class JumpEvaluation:
@@ -34,6 +35,7 @@ class JumpEvaluation:
         if len(self.row_names) != n:
             raise ValueError('Jump evaluation needs one scenario name per environment')
         self._restore, self.records, self.pending = [], {}, set()
+        self.success_events = PhysicalSuccessEvents(self.row_names)
         self.keys = [None] * n
         self.request = torch.full((n,), -1, dtype=torch.long, device=device)
         self.counts = torch.zeros(n, 4, dtype=torch.long, device=device)
@@ -206,7 +208,13 @@ class JumpEvaluation:
         self.flags = torch.where(active[:, None], flags, self.flags)
         self.last = torch.where(active[:, None], values, self.last)
         self.last_good = torch.where(active[:, None], good, self.last_good)
-        self.success |= active & (tasks.success_id == self.request) & (tasks.physical_id < 0)
+        certified = active & (tasks.success_id == self.request) & (tasks.physical_id < 0)
+        for row in (certified & ~self.success).nonzero().flatten().cpu().tolist():
+            key = self.keys[row]
+            self.success_events.record(row, key[1], request=key[2],
+                prior_invalid=self.records[key]['invalid_intervals'],
+                nonfinite_physical_ticks=int(self.counts[row, 2]))
+        self.success |= certified
 
     def _observe_unloading(self, valid, owned, force, dt):
         """Report request-scoped physics without changing native success decisions.
@@ -316,6 +324,7 @@ class JumpEvaluation:
             if key in self.pending:
                 record['boundary_valid'] = trusted
                 self.pending.remove(key)
+        return self.success_events.observe_transition(transition, valid)
 
     def summary(self):
         # A success on the final substep is complete even if no next step/reset
@@ -350,6 +359,7 @@ class JumpEvaluation:
                   'actual_assisted_requests' if record['assisted'] else 'actual_unassisted_requests'] += 1
         return {'criteria': dict(self.CRITERIA), 'physical_timeout_s': self.tasks.protocol.config.timeout_s,
             'by_scenario': groups, 'requests': requests,
+            'physical_success_events': self.success_events.summary(),
             'scope': 'Observed native physical requests keyed by environment, episode and request ID. Protocol endings and physical certification are separate; active requests at evaluation end are incomplete, not failed.',
             'condition_units': 'Seconds of finite active physical samples; conditions can overlap. Landing-candidate seconds additionally require supported start, flight, ascent and peak within tolerance. Maxima include every observed substep.',
             'unloading_scope': 'Request-scoped consecutive finite policy-owned physics ticks with both wheel support loads <=2 N. Invalid, unowned or supported ticks break the run. Duration and measured cylinder-bottom clearance are descriptive, not additional success gates. Clearance is the lower of the two wheels above their current terrain columns; missing geometry is null. Neither metric alone rules out other body contacts.',

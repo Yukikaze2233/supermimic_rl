@@ -47,7 +47,7 @@ def estimate(native_types, now, **overrides):
 
 def transition(evidence, start, *, valid=None, end=None):
     start = torch.as_tensor(start, dtype=torch.long)
-    evidence.observe_transition(SimpleNamespace(start=SimpleNamespace(episode_id=start),
+    return evidence.observe_transition(SimpleNamespace(start=SimpleNamespace(episode_id=start),
         end=SimpleNamespace(episode_id=start if end is None else torch.tensor(end))),
         torch.ones(len(start), dtype=torch.bool) if valid is None else torch.tensor(valid))
 
@@ -92,6 +92,48 @@ def test_height_only_miss_keeps_native_handoff_and_distinct_physical_verificatio
         evidence.close()
     for name in ('observe_physics', 'finish_interval', 'reset'):
         assert name not in owner.__dict__
+
+
+@pytest.mark.parametrize('reset_before_boundary', [False, True])
+@pytest.mark.parametrize('prior_invalid', [False, True])
+def test_physical_certificate_is_counted_before_handoff_and_survives_reset(
+        native_types, reset_before_boundary, prior_invalid):
+    env, owner, evidence = setup(native_types)
+    evidence.install()
+    try:
+        for index in range(2):
+            for _ in range(4):
+                owner.observe_physics(**physics())
+            owner.finish_interval(torch.tensor([.02 * (index + 1)], dtype=torch.float64), None,
+                policy_owned=torch.tensor([True]), failed=torch.tensor([False]))
+            if index == 0:
+                assert transition(evidence, [1], valid=[not prior_invalid]) == []
+        # The estimator has not handed control off, but native physics already
+        # certified the recovery exactly once at finish_interval.
+        assert owner.active.item() and owner._verified.item()
+        assert owner.metrics()['counts']['verified_physical_successes'] == 1
+        if reset_before_boundary:
+            owner.reset(torch.tensor([0]), torch.tensor([True]))
+            env._episode_id += 1
+            assert not owner._verified.item()
+        events = transition(evidence, [1])
+        assert len(events) == 1
+        assert events[0]['episode_id'] == 1 and events[0]['request_id'] is None
+        assert events[0]['validated_event'] is not prior_invalid
+        assert transition(evidence, env._episode_id) == []
+        if not reset_before_boundary:
+            for index in (3, 4):
+                for _ in range(4):
+                    owner.observe_physics(**physics())
+                now = torch.tensor([.02 * index], dtype=torch.float64)
+                owner.finish_interval(now, estimate(native_types, now),
+                    policy_owned=torch.tensor([True]), failed=torch.tensor([False]))
+                assert transition(evidence, [1]) == []
+            assert not owner.active.item()
+            assert evidence.summary()['episodes'][0]['outcome'] == 'handoff'
+            assert owner.metrics()['counts']['verified_physical_successes'] == 1
+    finally:
+        evidence.close()
 
 
 def test_timeout_reports_physical_and_estimator_obstructions_and_tick_maximum(native_types):

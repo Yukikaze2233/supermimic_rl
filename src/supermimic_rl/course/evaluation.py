@@ -1,4 +1,4 @@
-"""Fixed native course requests and endpoint-based evaluation accounting.
+"""Fixed native course requests, physical events and transition accounting.
 
 Scenarios select existing task/command interfaces. Physics, command admission,
 reward and physical success criteria remain upstream. Parameter values below
@@ -430,7 +430,7 @@ class FixedCourseScenarios:
 
 
 class CourseEvaluation:
-    """Aggregate actual pre-reset endpoints, distinct from requested coverage."""
+    """Aggregate native events and pre-reset intervals, not requested coverage."""
 
     def __init__(self, adapter, configuration=None):
         self.adapter = adapter
@@ -590,6 +590,9 @@ class CourseEvaluation:
             "valid_samples": 0, "invalid_count": 0, "nonfinite_measurement_count": 0,
             "policy_owned_samples": 0, "jump_physical_success_events": 0,
             "recovery_physical_success_events": 0, "actual": {},
+            "jump_physical_success_events_raw": 0, "jump_physical_success_events_excluded": 0,
+            "recovery_physical_success_events_raw": 0, "recovery_physical_success_events_excluded": 0,
+            "jump_endpoint_success_samples": 0, "recovery_endpoint_verified_rises": 0,
             "tracking_absolute_sum": [0., 0., 0.], "tracking_square_sum": [0., 0., 0.],
             "tracking_clipped_absolute_sum": [0., 0., 0.],
             "tracking_samples": 0, "command_min": None, "command_max": None}
@@ -638,10 +641,13 @@ class CourseEvaluation:
         valid = transition.valid.detach().cpu() & finite
         if self.stationary_evidence is not None:
             self.stationary_evidence.observe_transition(transition, tracking, valid)
+        physical_events = [[] for _ in self.plan.row_names]
         if self.recovery_evidence is not None:
-            self.recovery_evidence.observe_transition(transition, valid)
+            for event in self.recovery_evidence.observe_transition(transition, valid):
+                physical_events[event['env_id']].append(('recovery', event))
         if self.jump_evidence is not None:
-            self.jump_evidence.observe_transition(transition, valid)
+            for event in self.jump_evidence.observe_transition(transition, valid):
+                physical_events[event['env_id']].append(('jump', event))
         for row, name in enumerate(self.plan.row_names):
             total_bucket = self.buckets.setdefault(name, self._empty_bucket())
             if authored is not None:
@@ -670,6 +676,21 @@ class CourseEvaluation:
                     'post_handoff_tracking' if context['recovery_after_handoff'][row] else 'other')
                 recovery_phases = self.recovery_phase_buckets.setdefault(name, {})
                 row_buckets.append(recovery_phases.setdefault(recovery_phase, self._empty_bucket()))
+            for kind, event in physical_events[row]:
+                event_buckets = row_buckets
+                if not event['interval_matches_episode']:
+                    # Preserve raw scenario counts without assigning a stale
+                    # event to this newborn episode's command/recovery phase.
+                    event_buckets = [total_bucket, phases.setdefault(
+                        'unattributed_physical_events', self._empty_bucket())]
+                    if context is not None and 'recovery_active' in context:
+                        event_buckets.append(recovery_phases.setdefault(
+                            'unattributed_physical_events', self._empty_bucket()))
+                field = f'{kind}_physical_success_events'
+                for bucket in event_buckets:
+                    bucket[field + '_raw'] += 1
+                    bucket[field] += int(event['validated_event'])
+                    bucket[field + '_excluded'] += int(not event['validated_event'])
             for bucket in row_buckets:
                 # Preserve the original observed-sample count. Every capability
                 # numerator and error denominator below uses only trusted rows.
@@ -696,9 +717,9 @@ class CourseEvaluation:
                     for key, occurrences in zip(events, authored[row].tolist()):
                         events[key] += occurrences
                 if jump is not None:
-                    bucket["jump_physical_success_events"] += int(jump[row] > .5)
+                    bucket["jump_endpoint_success_samples"] += int(jump[row] > .5)
                 if recovered_end is not None and recovered_start is not None:
-                    bucket["recovery_physical_success_events"] += int((recovered_end[row] > .5) & (recovered_start[row] <= .5))
+                    bucket["recovery_endpoint_verified_rises"] += int((recovered_end[row] > .5) & (recovered_start[row] <= .5))
                 for key, values in actual.items():
                     if key == "tracking":
                         bucket["tracking_samples"] += 1
@@ -795,8 +816,11 @@ class CourseEvaluation:
                 "native_final_metrics": after,
                 "validity_semantics": "samples counts all observed intervals; valid_samples excludes transition.valid=false or nonfinite measured rows; all capability, reward, range and tracking statistics exclude those invalid rows",
                 "native_counter_semantics": "raw upstream aggregate counters, including invalid/reset events; not the validity-filtered per-case capability statistics",
+                "physical_event_observers": {"jump": self.jump_evidence is not None,
+                                             "recovery": self.recovery_evidence is not None},
+                "physical_event_semantics": "Physical success events come only from native certification: jump at its physics substep, recovery at finish_interval using physical evidence. Each episode/request (jump) or episode (recovery) is counted once. Validated events require a matching valid completed interval and no prior invalid interval/nonfinite physical tick through certification. Raw and excluded counts retain uncertified attribution. Phase uses that interval's pre-action producer; unmatched episode events use unattributed_physical_events with no sample denominator. Recovery certification is distinct from later native handoff or independent stationary qualification. Endpoint success samples/verified rises are diagnostic snapshots, never event counts or a fallback when an observer is absent.",
                 "clipped_mae_reference": "Radiant 0bf3456 clip bounds only; native coordinates and sample weighting differ from its first-episode trajectory-weighted evaluation",
-                "success_semantics": "per-case native jump pulse/recovery rising edge/authored observe-finish-reset events; global counters are separate and never apportioned to cases",
+                "success_semantics": "per-case native jump/recovery certification events captured before advancement/reset clears their flags; authored observe-finish-reset events remain separate; global counters are never apportioned to cases",
                 "scope": "observed intervals only; empty buckets and incomplete events are not demonstrated capabilities"}
         if self.recovery_evidence is not None:
             report['recovery_diagnostics'] = self.recovery_evidence.summary()
