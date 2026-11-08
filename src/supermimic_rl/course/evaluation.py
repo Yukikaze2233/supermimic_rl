@@ -230,6 +230,12 @@ class FixedCourseScenarios:
         for direction, sign in (("left", 1), ("right", -1)):
             add(f"rough_turning_{direction}", "TERRAIN",
                 [command(vx, sign * p.approach_yaw_rad_s)], terrain="ROUGH")
+        # Keep the original positive spin case and append its opposite and
+        # upper-speed endpoints from the instantiated command pool.
+        add("in_place_rotation_negative", "ROTATION", [command(yaw=-p.spin_mid_rad_s[0])])
+        for direction, sign in (("positive", 1), ("negative", -1)):
+            add(f"in_place_rotation_high_{direction}", "ROTATION",
+                [command(yaw=sign * p.spin_mid_rad_s[1])])
         return bank
 
     def _selected(self, ids):

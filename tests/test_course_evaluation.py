@@ -72,7 +72,7 @@ def test_fixed_suite_preserves_ids_and_maps_real_request_and_recovery_modes(adap
     resolved = plan.description()["resolved_curriculum"]
     assert resolved["stage"] == 7 and resolved["stage_name"] == "combined_dr"
     assert resolved["source_schedule_coordinate"] == 34999
-    assert len(plan.names) == 37
+    assert len(plan.names) == 40
     assert plan.description()["unassigned_scenarios"] == list(plan.names[adapter.num_envs:])
     assert plan.curriculum.terrain_step_up_cap_m() == pytest.approx(.2)
     for motion in ("standing", "moving"):
@@ -116,8 +116,8 @@ def test_high_speed_turn_cases_append_pool_targets_and_preserve_pressure_corner(
     appended = (
         'forward_turning_left', 'forward_turning_right', 'fast_turning_negative',
         'rough_forward_speed', 'rough_turning_left', 'rough_turning_right')
-    assert plan.names[-6:] == appended
-    assert plan.names[-8:-6] == ('jump_standing_100mm', 'jump_moving_100mm')
+    assert plan.names[-9:-3] == appended
+    assert plan.names[-11:-9] == ('jump_standing_100mm', 'jump_moving_100mm')
     vx, height = plan.domain.forward_m_s[1], plan.domain.nominal_height_m
     for name, yaw in (
         ('fast_turning', 4.), ('fast_turning_negative', -4.),
@@ -147,6 +147,36 @@ def test_high_speed_turn_cases_append_pool_targets_and_preserve_pressure_corner(
             torch.testing.assert_close(admission.admitted, sample.command)
     finally:
         selected.close()
+
+
+def test_signed_spin_endpoints_keep_zero_translation_through_native_segments(adapter):
+    from transformer_rl.formal.tasks.command_pool import CommandPool
+
+    pool = adapter.env._terrain_course.tasks.command_pool
+    adapter.env._terrain_course.tasks.command_pool = CommandPool(replace(
+        pool.config, spin_mid_rad_s=(3.5, 8.)))
+    names = ('in_place_rotation', 'in_place_rotation_negative',
+             'in_place_rotation_high_positive', 'in_place_rotation_high_negative')
+    plan = FixedCourseScenarios(adapter, CourseEvaluationConfig(scenarios=names))
+    plan.install()
+    try:
+        ids = torch.arange(adapter.num_envs)
+        sample = adapter.env._task_sampler(ids)
+        expected = torch.tensor((3.5, -3.5, 8., -8.)).repeat(adapter.num_envs // 4)
+        torch.testing.assert_close(sample.command[:, :2], torch.zeros(adapter.num_envs, 2))
+        torch.testing.assert_close(sample.command[:, 2], expected)
+        tasks = adapter.env._terrain_course.tasks
+        tasks.reset(ids, sample, torch.zeros(adapter.num_envs, dtype=torch.float64),
+                    terrain_kind=sample.terrain_kind, terrain_step_height_m=sample.draw.step_up_m)
+        for time in (.02, 5.02, 10.02):
+            tasks.elapsed.fill_(time)
+            tasks.segment_end_s.zero_()
+            admission = tasks.step(torch.full((adapter.num_envs,), time, dtype=torch.float64),
+                                   None, torch.zeros(adapter.num_envs),
+                                   yaw_rad=torch.zeros(adapter.num_envs))[0]
+            torch.testing.assert_close(admission.admitted, sample.command)
+    finally:
+        plan.close()
 
 
 def test_high_speed_rough_cases_use_existing_rough_tiles_and_native_mode(adapter):
