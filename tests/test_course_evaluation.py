@@ -264,6 +264,51 @@ def test_fixed_bridge_selection_requires_installed_geometry_and_boolean_config(a
     assert plan._restore == []
 
 
+def test_fixed_midpoints_are_explicit_repeatable_and_keep_original_twenty_two(adapter):
+    from supermimic_rl.course.recovery_bridge import MIDPOINT_VARIANTS, RECOVERY_VARIANTS
+    from transformer_rl.formal.tasks.recovery import RECOVERY_NAMES
+
+    with pytest.raises(ValueError, match='Invalid fixed'):
+        CourseEvaluationConfig(recovery_midpoints=1)
+    with pytest.raises(ValueError, match='enabled midpoint birth geometry'):
+        FixedCourseScenarios(adapter, CourseEvaluationConfig(recovery_midpoints=True))
+    adapter.curriculum = type(adapter.curriculum)(adapter.num_envs, config=replace(
+        adapter.curriculum.config, recovery_roll_bridge=True, recovery_midpoint_bridge=True,
+        recovery_postures=RECOVERY_NAMES))
+    bridge = SimpleNamespace(evaluation=False, fixed_variants=None)
+    adapter.env.supermimic_recovery_bridge = bridge
+    # Enabling training midpoints does not opt a fixed evaluation into them.
+    old = FixedCourseScenarios(adapter, CourseEvaluationConfig(family='RECOVERY', recovery_bridges=True))
+    assert old.names == tuple('recovery_' + name for name in RECOVERY_VARIANTS)
+    old.install()
+    assert bridge.fixed_variants.tolist() == (torch.arange(adapter.num_envs) % 22).tolist()
+    old.close()
+    names = tuple('recovery_' + name for name in MIDPOINT_VARIANTS)
+    plan = FixedCourseScenarios(adapter, CourseEvaluationConfig(
+        scenarios=names, recovery_midpoints=True, family='RECOVERY'))
+    rng = adapter.curriculum.sampler.generator.get_state().clone()
+    original = adapter.curriculum
+    plan.install()
+    try:
+        for ids in (torch.arange(adapter.num_envs), torch.tensor([7, 0, 2, 5])):
+            sample = adapter.env._task_sampler(ids)
+            assert sample.draw.recovery_posture.tolist() == [[4, 5, 8, 9][int(i) % 4] for i in ids]
+            assert bridge.fixed_variants[ids].tolist() == (22 + ids % 4).tolist()
+        report = plan.description()
+        assert report['recovery_birth_variants']['row_variant'][:4] == list(MIDPOINT_VARIANTS)
+        assert report['selection']['recovery_midpoints'] is True
+        assert 'recovery_bridges' not in report['selection']
+        assert plan.gimbal_pitch_slots[:8] == (0, 0, 0, 0, 1, 1, 1, 1)
+        assert torch.equal(original.sampler.generator.get_state(), rng)
+    finally:
+        plan.close()
+    assert not bridge.evaluation and bridge.fixed_variants is None
+    assert adapter.curriculum is original
+    ordinary = FixedCourseScenarios(adapter, CourseEvaluationConfig())
+    assert 'recovery_midpoints' not in ordinary.description()['selection']
+    assert not any(name in ordinary.names for name in names)
+
+
 @pytest.mark.parametrize('bridges', [False, True])
 def test_recovery_repetitions_balance_gimbal_endpoints_without_rng_draws(adapter, bridges):
     from transformer_rl.formal.tasks.gimbal_course import GimbalCourse

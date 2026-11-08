@@ -95,6 +95,7 @@ class CourseCurriculumConfig:
     # Six intermediate side-roll births replace alternate easy-pose slots;
     # original difficult-pose and task-family shares remain unchanged.
     recovery_roll_bridge: bool = False
+    recovery_midpoint_bridge: bool = False
 
     def __post_init__(self):
         budgets = tuple(self.stage_transition_budgets)
@@ -175,6 +176,10 @@ class CourseCurriculumConfig:
             raise ValueError("foundation_authored_rehearsal_every must be a positive integer")
         if type(self.recovery_roll_bridge) is not bool:
             raise ValueError("recovery_roll_bridge must be boolean")
+        if type(self.recovery_midpoint_bridge) is not bool:
+            raise ValueError("recovery_midpoint_bridge must be boolean")
+        if self.recovery_midpoint_bridge and not self.recovery_roll_bridge:
+            raise ValueError("recovery_midpoint_bridge requires recovery_roll_bridge")
         if self.jump_standing_fraction_of_stage >= self.jump_full_motion_fraction_of_stage:
             raise ValueError("Jump moving exposure must follow standing exposure")
         object.__setattr__(self, "stage_transition_budgets", budgets)
@@ -203,6 +208,8 @@ class CourseCurriculumConfig:
             result.pop("foundation_authored_rehearsal_every")
         if not self.recovery_roll_bridge:
             result.pop("recovery_roll_bridge")
+        if not self.recovery_midpoint_bridge:
+            result.pop("recovery_midpoint_bridge")
         return result
 
 
@@ -268,9 +275,10 @@ class SuperMimicCurriculum(FormalTaskCurriculum):
         self._recovery_birth_variant = None
         self._pending_recovery_variant = None
         if config.recovery_roll_bridge:
-            from .recovery_bridge import RECOVERY_VARIANTS
+            from .recovery_bridge import variant_names
 
-            self.sample_counts['recovery_posture'] = [0] * len(RECOVERY_VARIANTS)
+            self.sample_counts['recovery_posture'] = [0] * len(
+                variant_names(midpoints=config.recovery_midpoint_bridge))
             self._recovery_birth_variant = torch.full((num_envs,), -1, dtype=torch.long, device=device)
         # A reset samples then routes within the same call. This transient row
         # receipt is never replayed across physical reset/checkpoint restore;
@@ -383,7 +391,8 @@ class SuperMimicCurriculum(FormalTaskCurriculum):
                 if variants is not None:
                     from .recovery_bridge import select_variants
 
-                    posture[rows], variants[rows] = select_variants(ordinal, posture[rows], names)
+                    posture[rows], variants[rows] = select_variants(
+                        ordinal, posture[rows], names, midpoints=self.config.recovery_midpoint_bridge)
                 nominal[rows], trajectory[rows] = False, 0
             elif family == TaskFamily.TERRAIN:
                 foundation = self.stage < self.stage_names.index('authored_steps')
@@ -475,9 +484,9 @@ class SuperMimicCurriculum(FormalTaskCurriculum):
         """Named cumulative reset draws, not measured placements or successes."""
         names = RECOVERY_NAMES
         if self.config.recovery_roll_bridge:
-            from .recovery_bridge import RECOVERY_VARIANTS
+            from .recovery_bridge import variant_names
 
-            names = RECOVERY_VARIANTS
+            names = variant_names(midpoints=self.config.recovery_midpoint_bridge)
         return dict(zip(names, self.sample_counts['recovery_posture'], strict=True))
 
     def foundation_authored_rehearsal_receipt(self):

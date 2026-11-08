@@ -30,11 +30,13 @@ class CourseEvaluationConfig:
     seed: int = 0
     recovery_qualification: bool = False
     recovery_bridges: bool = False
+    recovery_midpoints: bool = False
 
     def __post_init__(self):
         if (not isinstance(self.evaluation_stage, str)
                 or type(self.recovery_qualification) is not bool
                 or type(self.recovery_bridges) is not bool
+                or type(self.recovery_midpoints) is not bool
                 or type(self.seed) is not int or not 0 <= self.seed < 2**63
                 or not isinstance(self.scenarios, (tuple, list))
                 or any(not isinstance(name, str) for name in self.scenarios)
@@ -58,6 +60,8 @@ class FixedCourseScenarios:
         self.posture_names = RECOVERY_NAMES
         if config.recovery_bridges and not getattr(adapter.curriculum.config, 'recovery_roll_bridge', False):
             raise ValueError('Fixed recovery bridges require the enabled birth geometry')
+        if config.recovery_midpoints and not getattr(adapter.curriculum.config, 'recovery_midpoint_bridge', False):
+            raise ValueError('Fixed recovery midpoints require the enabled midpoint birth geometry')
         stage_names = adapter.curriculum.stage_names
         if config.evaluation_stage not in stage_names:
             raise ValueError("Unknown formal evaluation stage")
@@ -93,7 +97,8 @@ class FixedCourseScenarios:
         pitch_slots = []
         for row, name in enumerate(self.row_names):
             recovery = self.scenarios[name]['family'] == 'RECOVERY'
-            balanced = recovery and (config.recovery_qualification or config.recovery_bridges)
+            balanced = recovery and (config.recovery_qualification or config.recovery_bridges
+                                     or config.recovery_midpoints)
             pitch_slots.append(occurrences.get(name, 0) % 2 if balanced else row % 2)
             occurrences[name] = occurrences.get(name, 0) + 1
         self.gimbal_pitch_slots = tuple(pitch_slots)
@@ -175,6 +180,12 @@ class FixedCourseScenarios:
 
             for index, name in enumerate(BRIDGE_VARIANTS):
                 add('recovery_' + name, 'RECOVERY', [command()], posture=self.posture_names[4 + index % 2])
+                bank['recovery_' + name]['recovery_variant'] = name
+        if self.config.recovery_midpoints:
+            from .recovery_bridge import MIDPOINT_BASE_POSTURES, MIDPOINT_VARIANTS
+
+            for name, base in zip(MIDPOINT_VARIANTS, MIDPOINT_BASE_POSTURES, strict=True):
+                add('recovery_' + name, 'RECOVERY', [command()], posture=self.posture_names[base])
                 bank['recovery_' + name]['recovery_variant'] = name
         for direction, sign in (("positive", 1), ("negative", -1)):
             add("spin_translation_" + direction, "MOTION",
@@ -297,17 +308,19 @@ class FixedCourseScenarios:
         # Calling env.set_task_sampler again would replace recovery components.
         tasks = self.env._terrain_course.tasks
         bridge = getattr(self.env, 'supermimic_recovery_bridge', None)
-        if self.config.recovery_bridges and bridge is None:
+        if (self.config.recovery_bridges or self.config.recovery_midpoints) and bridge is None:
             raise ValueError('Fixed recovery bridge geometry has not been installed')
         if bridge is not None:
             # Default fixed plans retain the original endpoints, regardless
             # of the training birth cycle. Additional poses are explicit.
             self._install(bridge, 'evaluation', True)
-            if self.config.recovery_bridges:
-                from .recovery_bridge import RECOVERY_VARIANTS
+            if self.config.recovery_bridges or self.config.recovery_midpoints:
+                from .recovery_bridge import variant_names
+
+                names = variant_names(midpoints=self.curriculum.config.recovery_midpoint_bridge)
 
                 variants = torch.tensor([
-                    RECOVERY_VARIANTS.index(case.get('recovery_variant', case['posture']))
+                    names.index(case.get('recovery_variant', case['posture']))
                     if case['posture'] is not None else 0
                     for case in self._selected(torch.arange(self.adapter.num_envs, device=self.device))
                 ], dtype=torch.int64)
@@ -383,6 +396,8 @@ class FixedCourseScenarios:
             selection.pop('recovery_qualification')
         if not self.config.recovery_bridges:
             selection.pop('recovery_bridges')
+        if not self.config.recovery_midpoints:
+            selection.pop('recovery_midpoints')
         result = {"selection": selection, "scenarios": self.scenarios,
                 "fixed_atlas_tiles": self.fixed_tiles,
                 "resolved_curriculum": {"stage": self.curriculum.stage,
@@ -402,7 +417,7 @@ class FixedCourseScenarios:
                 "parameter_source": "instantiated pinned native contracts; jump low/high=effective domain endpoints, intermediate=initial-domain upper endpoint capped by effective domain; not success thresholds",
                 "placement": "requested terrain kind/height; actual routed tiles and declared collision profiles are reported separately",
                 "randomness": "scheduled command targets and collision tiles fixed; native birth/recovery handoff commands, request timing, birth, dynamics and sensor DR retained; training terrain coverage/proficiency routing excluded"}
-        if self.config.recovery_qualification or self.config.recovery_bridges:
+        if self.config.recovery_qualification or self.config.recovery_bridges or self.config.recovery_midpoints:
             result['recovery_gimbal_assignment'] = {
                 'version': 1,
                 'initial_pitch': 'Alternate existing pitch endpoints by occurrence within each recovery scenario.',
@@ -418,7 +433,7 @@ class FixedCourseScenarios:
                 'budget_clock': 'Policy-owned physical ticks from each recovery birth; successful certification does not release the fixed command early.',
                 'timeout_s': self.qualification_timeout_s,
                 'randomness': 'Native handoff/segment RNG and underlying trajectories remain unchanged; only admitted requests inside the qualification window are overridden.'}
-        if self.config.recovery_bridges:
+        if self.config.recovery_bridges or self.config.recovery_midpoints:
             result['recovery_birth_variants'] = {
                 'scope': 'Original endpoints and explicit 45/60/75-degree side-roll cases are reported separately.',
                 'evaluation_override': 'This opt-in fixed plan supersedes the source receipt description of the default sixteen-pose evaluation; the pinned training birth geometry is unchanged.',
@@ -426,6 +441,10 @@ class FixedCourseScenarios:
                 'row_variant': [self.scenarios[name].get('recovery_variant', self.scenarios[name]['posture'])
                                 for name in self.row_names],
             }
+            if self.config.recovery_midpoints:
+                result['recovery_birth_variants']['scope'] = (
+                    'Original endpoints and explicit bridge/midpoint cases are reported separately; '
+                    'midpoints are side 82.5 and pitch 67.5 degrees, not certified recovery skills.')
         return result
 
 

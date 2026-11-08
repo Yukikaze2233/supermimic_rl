@@ -1,4 +1,4 @@
-"""Opt-in, geometry-placed side-roll births; no actions or success decisions."""
+"""Opt-in, geometry-placed recovery births; no actions or success decisions."""
 from __future__ import annotations
 
 from dataclasses import fields
@@ -17,28 +17,48 @@ RECOVERY_VARIANTS = (*RECOVERY_NAMES, *BRIDGE_VARIANTS)
 SIMPLE_POSTURES = (0, 1, 2, 3, 6, 7)
 BRIDGE_ROLL_RAD = tuple(math.radians(angle) * sign
                         for angle in (45, 60, 75) for sign in (-1, 1))
+MIDPOINT_VARIANTS = ('left_side_82p5', 'right_side_82p5',
+                     'pitch_forward_67p5', 'pitch_backward_67p5')
+MIDPOINT_BASE_POSTURES = (4, 5, 8, 9)
+# Midpoints of the existing evaluated passing/failing birth angles. These are
+# curriculum poses, not new mechanical limits or qualified recovery skills.
+MIDPOINT_ROLL_PITCH_RAD = (
+    (-math.radians((75 + 90) / 2), 0.), (math.radians((75 + 90) / 2), 0.),
+    (0., math.radians((45 + 90) / 2)), (0., -math.radians((45 + 90) / 2)),
+)
 
 
-def select_variants(ordinal, posture, pool):
-    """Replace half the six easy slots only once the full 16-pose pool is open.
+def variant_names(*, midpoints=False):
+    return (*RECOVERY_VARIANTS, *MIDPOINT_VARIANTS) if midpoints else RECOVERY_VARIANTS
 
-    Every two complete cycles retain 20 difficult and six easy births and add
-    six bridge births. The persisted recovery-family ordinal is the only clock.
+
+def select_variants(ordinal, posture, pool, *, midpoints=False):
+    """Replace selected easy slots only once the full 16-pose pool is open.
+
+    The default two-cycle schedule is unchanged. Opt-in midpoint sampling uses
+    three cycles, retaining all difficult slots and substituting four easy
+    slots in the third cycle. The recovery-family ordinal is the only clock.
     """
     variant = posture.clone()
     if set(pool) != set(RECOVERY_NAMES):
         return posture, variant
-    alternate = (ordinal // len(pool)) % 2 == 1
+    cycle = (ordinal // len(pool)) % (3 if midpoints else 2)
+    alternate = cycle == 1
     result = posture.clone()
     for index, source in enumerate(SIMPLE_POSTURES):
         selected = alternate & (posture == source)
         variant[selected] = len(RECOVERY_NAMES) + index
         result[selected] = 4 + index % 2
+    if midpoints:
+        for index, source in enumerate(SIMPLE_POSTURES[:4]):
+            selected = (cycle == 2) & (posture == source)
+            variant[selected] = len(RECOVERY_VARIANTS) + index
+            result[selected] = MIDPOINT_BASE_POSTURES[index]
     return result, variant
 
 
-def receipt():
-    return {
+def receipt(*, midpoints=False):
+    result = {
         'contract': 'recovery_roll_bridge_v1',
         'variants': list(RECOVERY_VARIANTS),
         'bridge_requested_roll_deg': [math.degrees(v) for v in BRIDGE_ROLL_RAD],
@@ -52,6 +72,23 @@ def receipt():
         'labels': 'recovery_posture ledger uses variants; native base IDs are not outcome labels',
         'scope': 'birth distribution only; actor, reward, lifecycle and actions unchanged',
     }
+    if midpoints:
+        result.update({
+            'contract': 'recovery_midpoint_bridge_v1',
+            'variants': list(variant_names(midpoints=True)),
+            'midpoint_requested_roll_pitch_deg': [
+                [math.degrees(roll), math.degrees(pitch)]
+                for roll, pitch in MIDPOINT_ROLL_PITCH_RAD],
+            'midpoint_native_base_posture_ids': list(MIDPOINT_BASE_POSTURES),
+            'angle_source': 'midpoints of existing side 75/90 and pitch 45/90 birth endpoints',
+            'selection': ('three full-16 recovery cycles: native; easy slots 0,1,2,3,6,7 '
+                          'become old bridges; easy slots 0,1,2,3 become midpoints'),
+            'cycle_births': {'bridge': 6, 'midpoint': 4, 'easy': 8, 'original_difficult': 30},
+            'distribution_change': ('original difficult share stays 62.5%; old bridges '
+                                    '18.75% to 12.5%, easy 18.75% to 16.6667%, midpoints 8.3333%'),
+            'cache': 'ten zero-yaw local flat poses; original sixteen endpoints unchanged',
+        })
+    return result
 
 
 class RecoveryRollBridge:
@@ -62,19 +99,24 @@ class RecoveryRollBridge:
         self.reset = native._recovery_reset
         self.original_pose = self.reset.pose
         self.evaluation = evaluation
+        self.midpoints = curriculum.config.recovery_midpoint_bridge
+        self.variants = variant_names(midpoints=self.midpoints)
+        self.base_postures = tuple(4 + i % 2 for i in range(len(BRIDGE_VARIANTS)))
+        if self.midpoints:
+            self.base_postures += MIDPOINT_BASE_POSTURES
         # A fixed evaluation may explicitly name bridge poses. The native
-        # reset still receives its original left/right 90-degree base IDs.
+        # reset still receives its original side/front/back 90-degree base IDs.
         self.fixed_variants = None
         self.trace_path = Path(log_directory) / 'recovery-births.jsonl'
         self.pending = {}
         self.cache = None
         if not evaluation:
-            # These six calls are startup-only. Native num_envs may be one in
+            # These calls are startup-only. Native num_envs may be one in
             # CPU tests; each placement then uses its valid local row zero.
-            parts = [self._compile(torch.tensor([0]), torch.tensor([4 + i % 2]),
+            parts = [self._compile(torch.tensor([0]), torch.tensor([base]),
                                    torch.zeros(1, dtype=torch.float64),
                                    torch.zeros(1, 3, dtype=torch.float64),
-                                   torch.tensor([i])) for i in range(len(BRIDGE_VARIANTS))]
+                                   torch.tensor([i])) for i, base in enumerate(self.base_postures)]
             self.cache = type(parts[0])(*(torch.cat([getattr(p, f.name) for p in parts])
                                           for f in fields(parts[0])))
 
@@ -86,9 +128,17 @@ class RecoveryRollBridge:
         controller = OutputFeedbackController(reset.kinematics.binding.nominal_policy_position_rad,
                                               n, pair_domain=None, device='cpu')
         offset = torch.zeros(n, 2, dtype=torch.float64)
-        requested = torch.tensor(BRIDGE_ROLL_RAD, dtype=torch.float64)[variant]
-        baseline = torch.tensor((-math.pi / 2, math.pi / 2), dtype=torch.float64)[posture - 4]
-        offset[:, 0] = requested - baseline
+        original = variant < len(BRIDGE_VARIANTS)
+        # Keep the original six variants on their unchanged arithmetic path.
+        requested = torch.tensor(BRIDGE_ROLL_RAD, dtype=torch.float64)[variant[original]]
+        baseline = torch.tensor((-math.pi / 2, math.pi / 2), dtype=torch.float64)[posture[original] - 4]
+        offset[original, 0] = requested - baseline
+        if (~original).any():
+            index = variant[~original] - len(BRIDGE_VARIANTS)
+            requested = torch.tensor(MIDPOINT_ROLL_PITCH_RAD, dtype=torch.float64)[index]
+            baseline = torch.tensor(((-math.pi / 2, 0.), (math.pi / 2, 0.),
+                                     (0., math.pi / 2), (0., -math.pi / 2)), dtype=torch.float64)[index]
+            offset[~original] = requested - baseline
         candidate = reset.compiler.compile(posture, yaw, controller, roll_pitch_offset_rad=offset)
         placement = reset.geometry.place(
             candidate.closure.tree_position, candidate.requested_root_orientation_xyzw,
@@ -115,6 +165,11 @@ class RecoveryRollBridge:
         x, y, z, w = quaternion.unbind(-1)
         return torch.atan2(2 * (w * x + y * z), 1 - 2 * (x.square() + y.square()))
 
+    @staticmethod
+    def pitch(quaternion):
+        x, y, z, w = quaternion.unbind(-1)
+        return torch.asin((2 * (w * y - z * x)).clamp(-1, 1))
+
     @torch.no_grad()
     def pose(self, ids, posture_id, yaw_rad, origins_world_m):
         ids = torch.as_tensor(ids, dtype=torch.long, device='cpu')
@@ -132,7 +187,7 @@ class RecoveryRollBridge:
         else:
             variant = (posture.clone() if self.evaluation else
                        self.curriculum.recovery_birth_variants(ids.to(self.curriculum.device)).cpu())
-        if ((variant < 0) | (variant >= len(RECOVERY_VARIANTS))).any():
+        if ((variant < 0) | (variant >= len(self.variants))).any():
             raise ValueError('Unknown fixed recovery birth variant')
         bridge = variant >= len(RECOVERY_NAMES)
         selected = bridge.nonzero().flatten()
@@ -143,7 +198,7 @@ class RecoveryRollBridge:
                                                       yaw[ordinary], origins[ordinary])))
         if len(selected):
             index = variant[selected] - len(RECOVERY_NAMES)
-            if not torch.equal(posture[selected], 4 + index % 2):
+            if not torch.equal(posture[selected], torch.tensor(self.base_postures)[index]):
                 raise ValueError('Side-roll birth variant and native posture differ')
             if (self.cache is not None and yaw[selected].eq(0).all()
                     and origins[selected, 2].eq(0).all()):
@@ -167,11 +222,23 @@ class RecoveryRollBridge:
         for row, pid, label, angle, z, origin_z in zip(
                 ids.tolist(), posture.tolist(), variant.tolist(), placed_roll, placed_z, origins[:, 2].tolist()):
             self.pending[row] = {'env_id': row, 'native_base_posture_id': pid,
-                                 'variant_id': label, 'variant': RECOVERY_VARIANTS[label],
-                                 'requested_roll_rad': (BRIDGE_ROLL_RAD[label - 16] if label >= 16
+                                 'variant_id': label, 'variant': self.variants[label],
+                                 'requested_roll_rad': (BRIDGE_ROLL_RAD[label - 16] if 16 <= label < 22
                                                         else native_roll.get(pid, 0.)),
                                  'placed_roll_rad': angle, 'placed_root_world_z_m': z,
                                  'origin_world_z_m': origin_z}
+        if self.midpoints:
+            placed_pitch = self.pitch(result.root_pose_xyzw[:, 3:]).cpu().tolist()
+            native_pitch = {6: math.pi / 4, 7: -math.pi / 4, 8: math.pi / 2,
+                            9: -math.pi / 2, 10: math.pi / 2, 11: math.pi / 2,
+                            12: -math.pi / 2, 13: -math.pi / 2}
+            for row, pid, label, angle in zip(ids.tolist(), posture.tolist(), variant.tolist(), placed_pitch):
+                record = self.pending[row]
+                record['requested_pitch_rad'] = native_pitch.get(pid, 0.)
+                record['placed_pitch_rad'] = angle
+                if label >= len(RECOVERY_VARIANTS):
+                    roll, pitch = MIDPOINT_ROLL_PITCH_RAD[label - len(RECOVERY_VARIANTS)]
+                    record.update(requested_roll_rad=roll, requested_pitch_rad=pitch)
         return result
 
     def record_births(self, episode_ids, timestamp, root_pose, base_com_world_z):
@@ -183,12 +250,16 @@ class RecoveryRollBridge:
         root_z = root_pose[ids, 2].detach().cpu().tolist()
         com_z = base_com_world_z[ids].detach().cpu().tolist()
         episodes, clocks = episode_ids[ids].cpu().tolist(), timestamp[ids].cpu().tolist()
+        pitch = (dict(zip(ids, self.pitch(root_pose[ids, 3:]).detach().cpu().tolist()))
+                 if self.midpoints else None)
         self.trace_path.parent.mkdir(parents=True, exist_ok=True)
         with self.trace_path.open('a') as stream:
             for row, episode, clock, angle, z, com in zip(ids, episodes, clocks, angles, root_z, com_z):
                 record = {**self.pending[row], 'episode_id': episode,
                           'first_snapshot_time_s': clock, 'actual_birth_roll_rad': angle,
                           'actual_root_world_z_m': z, 'actual_base_com_world_z_m': com}
+                if pitch is not None:
+                    record['actual_birth_pitch_rad'] = pitch[row]
                 stream.write(json.dumps(record, allow_nan=False) + '\n')
         self.pending.clear()
 
@@ -199,4 +270,4 @@ def install_recovery_roll_bridge(native, curriculum, log_directory, *, evaluatio
     bridge = RecoveryRollBridge(native, curriculum, log_directory, evaluation=evaluation)
     native._recovery_reset.pose = bridge.pose
     native.supermimic_recovery_bridge = bridge
-    return receipt()
+    return receipt(midpoints=curriculum.config.recovery_midpoint_bridge)
