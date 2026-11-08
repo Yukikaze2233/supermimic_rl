@@ -198,6 +198,7 @@ def create_course(configuration):
             native._formal_reward.composer, verify_native=configuration.get("audit_reward_kernel", False),
             extensions=extensions, flight_geometry=jump_geometry,
             jump_tasks=native._terrain_course.tasks,
+            joint_speed_turn_initial_forward_m_s=curriculum.initial_domain.forward_m_s,
             **({} if platform_owner is None else {'platform_landing': platform_owner.landing}))
         if extensions.stair_support_transfer:
             reward_kernel_receipt['stair_support_transfer'] = install_stair_support_reference(native)

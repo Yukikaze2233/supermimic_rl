@@ -58,6 +58,12 @@ class CourseEnvironment:
         self.chassis_command_contract = contract
 
     @property
+    def joint_speed_turn_exposure(self) -> dict | None:
+        """Native telemetry definition, including its actual policy clock."""
+        composer = self.env._formal_reward.composer
+        return getattr(composer, 'supermimic_joint_speed_turn_exposure', None)
+
+    @property
     def action_bounds(self) -> tuple[float, ...]:
         """Native execution clip; the actor's bounds must match it exactly."""
         return tuple(self.env._action_bounds.tolist())

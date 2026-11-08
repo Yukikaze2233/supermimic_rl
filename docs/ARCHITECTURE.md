@@ -80,6 +80,10 @@ tests/               无 Isaac 的单元/合同测试；共享构造器在 tests
 
 能力判定以命名固定场景评价（`scripts/evaluate_ppo_skills.py`）为准，不以训练奖励为准。报告记录实际场景、每场景行数和物理配置；普通起身、困难恢复，以及起飞、净空、落地稳定分别判断。默认 PPO 评价不依赖世界模型的布局或 replay，录制世界模型数据时另行检查其合同。
 
+训练指标 `joint_speed_turn_exposure` 按每个真实物理子步统计高速与转弯的联合时间：实际 admitted 前向指令超出当前课程的 **initial** forward 域（v10 为 ±1 m/s），且 yaw 严格非零；按前后、左右四种符号组合分别记录。仅计 ordinary、非云台特殊平移、该物理子步由策略接管的样本；PPO 再剔除无效、数值异常或非有限跟踪区间，保留有效终止区间的 PRE-reset 归属。台阶/rough 属于 ordinary，跳跃/恢复阶段不计入。四个组合始终存在，零曝光的误差/比例为 `null`。
+
+原生 scoped counts 是物理子步积分除以 policy_dt 的等效策略区间；乘同一生产者的 policy_dt 才得到秒数，所有环境的时间相加。`fraction_of_ordinary_policy_time` 分母是同一有效样本集的 ordinary 策略接管时间；`far_forward_error_fraction` 分母是对应联合时间，阈值为既有前向正奖励 clip 边界 `|error| >= 1 m/s`；`velocity_height_gate_mean` 也只在这段联合时间求均值。误差保持原生 heading 投影的 signed mean/RMS，不将未激活行的零填充算作跟踪成功。该统计不改奖励、Actor、随机采样或课程推进，也不能从曝光推断能力已掌握；native reward parity audit 保留原始指标集合。
+
 ## SuperMimic 世界模型 V2 `supermimic_rl.world_model_v2`
 
 数据流：原生采集（教师/学生混合，`collection`、`mixing`）→ 紧凑回放（`records`、`layout`、`replay`）→ 多步拟合（`model`、`fitting`、`validation`）→ 想象 rollout（`imagination`，奖励 `imagined_reward`/`reward_assembly`，终止 `termination`）→ actor/critic 更新（`learning`）→ 新的原生采集（`online`）。

@@ -185,9 +185,10 @@ class EpisodeStatistics:
     # not a claim to reproduce its first-episode, trajectory-weighted evaluation.
     CLIPPED_MAE_LIMITS = {'forward_error_m_s': 1., 'yaw_rate_error_rad_s': .8, 'height_error_m': .15}
 
-    def __init__(self, num_envs: int, device):
+    def __init__(self, num_envs: int, device, *, joint_speed_turn_exposure: dict | None = None):
         self.returns = torch.zeros(num_envs, device=device)
         self.lengths = torch.zeros(num_envs, device=device)
+        self.joint_speed_turn_exposure = joint_speed_turn_exposure
         self.reset_window()
 
     def reset_window(self):
@@ -289,6 +290,8 @@ class EpisodeStatistics:
                     "native physical-substep error moments divided by their own task exposure; "
                     "equivalent_policy_intervals sums active substep fractions over valid intervals, "
                     "including terminal intervals; zero exposure has no error estimate")
+            if self.joint_speed_turn_exposure is not None:
+                result['joint_speed_turn_exposure'] = self._joint_speed_turn_summary(totals, scopes)
             result["tracking_diagnostic_timing"] = (
                 "physical endpoint before reset versus command held during that interval; "
                 "velocity_height_gate is the native four-substep mean")
@@ -299,6 +302,40 @@ class EpisodeStatistics:
                     "reward_gate": "native physical-substep mean gate occupancy or multiplier",
                     "reward_step": "native completed-interval reward amount"}
         return result
+
+    def _joint_speed_turn_summary(self, totals, scopes) -> dict:
+        definition = self.joint_speed_turn_exposure
+        dt = definition['policy_dt_s']
+        ordinary = totals['reward_gate/joint_speed_turn/ordinary_policy_owned'][0]
+        quadrants = {}
+        for forward_sign in ('positive', 'negative'):
+            for yaw_sign in ('positive', 'negative'):
+                name = f'forward_{forward_sign}_yaw_{yaw_sign}'
+                scope = 'joint_speed_turn/' + name
+                forward = scopes[scope + '/forward_m_s']
+                yaw = scopes[scope + '/yaw_rad_s']
+                exposure = forward['equivalent_policy_intervals']
+                quadrants[name] = {
+                    'active_seconds': exposure * dt,
+                    'fraction_of_ordinary_policy_time': exposure / ordinary if ordinary > 0 else None,
+                    'forward_mean_error_m_s': forward['mean_error'],
+                    'forward_rms_error_m_s': forward['rms_error'],
+                    'yaw_mean_error_rad_s': yaw['mean_error'],
+                    'yaw_rms_error_rad_s': yaw['rms_error'],
+                    'far_forward_error_fraction': (
+                        totals['reward_gate/' + scope + '/far_forward_error'][0] / exposure
+                        if exposure > 0 else None),
+                    'velocity_height_gate_mean': (
+                        totals['reward_gate/' + scope + '/height_gate'][0] / exposure
+                        if exposure > 0 else None),
+                }
+        return {
+            'definition': dict(definition),
+            'valid_interval_seconds': self.count * dt,
+            'ordinary_policy_owned_seconds': ordinary * dt,
+            'joint_active_seconds': sum(value['active_seconds'] for value in quadrants.values()),
+            'by_command_sign': quadrants,
+        }
 
 
 class PPOTrainer:
@@ -342,7 +379,8 @@ class PPOTrainer:
                        if config.course_gates else None)
         self._apply_opened_gates()
         self._normalization_samples = None
-        self.statistics = EpisodeStatistics(environment.num_envs, self.device)
+        self.statistics = EpisodeStatistics(environment.num_envs, self.device,
+            joint_speed_turn_exposure=getattr(environment, 'joint_speed_turn_exposure', None))
         if resume is None and self.course is not None and self.course.mode == "report":
             # The discovery reset sampled births before the opened gates were applied.
             self.observation = environment.reset()

@@ -4,6 +4,7 @@ from __future__ import annotations
 from dataclasses import replace
 import hashlib
 import inspect
+import math
 from pathlib import Path
 from types import MethodType
 
@@ -99,6 +100,26 @@ class SharedRewardComposer(PhysicalRewardComposer):
             heading_valid = (gimbal_active & (reference.gimbal.speed_m_s > .1)
                              & sample.velocity_origin_world_m_s[:, :2].square().sum(-1).gt(0.))
             scopes['gimbal_heading_tracking'] = (heading_valid, ('gimbal_heading_rad',))
+        exposure = self.supermimic_joint_speed_turn_exposure
+        if exposure is not None:
+            # These are measurements of the admitted command during this
+            # physical tick, not birth draws or a post-reset command snapshot.
+            eligible = ordinary & ~gimbal_active & sample.policy_owned
+            command = reference.admitted_body_command
+            low, high = exposure['initial_forward_m_s']
+            gates = dict(gates)
+            gates['joint_speed_turn/ordinary_policy_owned'] = eligible
+            far_error = errors['forward_m_s'].abs() >= exposure['far_forward_error_m_s']
+            for forward_sign, forward_mask in (('positive', command[:, 0] > max(high, 0.)),
+                                               ('negative', command[:, 0] < min(low, 0.))):
+                for yaw_sign, yaw_mask in (('positive', command[:, 2] > 0),
+                                           ('negative', command[:, 2] < 0)):
+                    scope = f'joint_speed_turn/forward_{forward_sign}_yaw_{yaw_sign}'
+                    mask = eligible & forward_mask & yaw_mask
+                    # Always publish every quadrant, including zero exposure.
+                    scopes[scope] = (mask, ('forward_m_s', 'yaw_rad_s'))
+                    gates[scope + '/far_forward_error'] = mask & far_error
+                    gates[scope + '/height_gate'] = torch.where(mask, gates['velocity_height_gate'], 0.)
         for scope, (mask, names) in scopes.items():
             for name in names:
                 key = scope + '/' + name
@@ -289,7 +310,8 @@ def install_stair_support_reference(native) -> dict:
 
 
 def install_shared_reward(composer, *, verify_native=False, extensions: RewardExtensions = RewardExtensions(),
-                          jump_tasks=None, platform_landing=None, flight_geometry=None):
+                          jump_tasks=None, platform_landing=None, flight_geometry=None,
+                          joint_speed_turn_initial_forward_m_s=None):
     """Instance-local installation; the frozen native source stays untouched.
 
     Extensions add opt-in terms (and may replace the success event); they are
@@ -297,6 +319,8 @@ def install_shared_reward(composer, *, verify_native=False, extensions: RewardEx
     original source identity. The native audit compares unextended rewards.
     Optional ``platform_landing`` is the already installed physics observer;
     its same-tick request binding extends physical tails onto selected terrain.
+    ``joint_speed_turn_initial_forward_m_s`` adds measurement-only exposure
+    from the caller's actual curriculum. Native parity audits omit it.
     """
     source = Path(inspect.getfile(PhysicalRewardComposer))
     actual = hashlib.sha256(source.read_bytes()).hexdigest()
@@ -312,6 +336,20 @@ def install_shared_reward(composer, *, verify_native=False, extensions: RewardEx
         raise ValueError('Platform reward evidence must share the native jump task owner')
     if extensions.needs_flight_geometry != (flight_geometry is not None):
         raise ValueError('Jump geometry producer must match the enabled geometry reward extensions')
+    exposure = None
+    if joint_speed_turn_initial_forward_m_s is not None and not verify_native:
+        low, high = map(float, joint_speed_turn_initial_forward_m_s)
+        if not (math.isfinite(low) and math.isfinite(high) and low <= high):
+            raise ValueError('Joint speed/turn exposure requires ordered finite initial forward bounds')
+        exposure = {
+            'version': 1, 'initial_forward_m_s': [low, high],
+            'policy_dt_s': composer.tuning.policy_dt_s,
+            'far_forward_error_m_s': 1.,  # Existing forward positive-reward clip boundary.
+            'scope': 'ordinary & not special gimbal & physical sample policy_owned',
+            'command': 'admitted vx outside initial forward domain and strictly nonzero yaw',
+            'timing': 'pre-reset physical substeps; only valid completed intervals enter PPO statistics',
+        }
+    composer.supermimic_joint_speed_turn_exposure = exposure
     composer.supermimic_jump_geometry = flight_geometry
     composer.supermimic_reward_extensions = extensions
     composer.supermimic_jump_tasks = jump_tasks
@@ -332,6 +370,8 @@ def install_shared_reward(composer, *, verify_native=False, extensions: RewardEx
                                   else "shared_physical_reward_densities"), "physics_dt_s": composer.physics_dt_s,
                "native_source_sha256": actual,
                "kernel_sha256": hashlib.sha256(Path(inspect.getfile(physical_reward_densities)).read_bytes()).hexdigest()}
+    if exposure is not None:
+        receipt['joint_speed_turn_exposure'] = dict(exposure)
     if flight_geometry is not None:
         receipt['jump_flight_geometry'] = flight_geometry.receipt
     if composer.supermimic_jump_physical_reference is not None:
