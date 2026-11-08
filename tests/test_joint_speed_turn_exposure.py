@@ -6,11 +6,12 @@ from types import SimpleNamespace
 import pytest
 import torch
 
+pytest.importorskip('transformer_rl.formal.tasks.reward')
 from supermimic_rl.course.reward import install_shared_reward
 from supermimic_rl.ppo.environment import CourseEnvironment
 from supermimic_rl.ppo.trainer import EpisodeStatistics
-from test_ppo_environment import NativeCommandBoundary
-from test_reward_kernel import begin, finish, sample, setup
+from support.ppo import NativeCommandBoundary
+from support.reward_kernel import begin, finish, sample, setup
 
 
 PREFIX = 'joint_speed_turn/'
