@@ -16,7 +16,7 @@ import torch
 from ..contracts import Field
 
 
-def substep_fields(body_names, joint_names, *, audit=False) -> tuple[Field, ...]:
+def substep_fields(body_names, joint_names, *, audit=False, disturbances=False) -> tuple[Field, ...]:
     """Measurement superset for M0; the model consumes a validated subset.
 
     ``audit`` adds every body's link pose and the backend-reported body velocity,
@@ -30,7 +30,9 @@ def substep_fields(body_names, joint_names, *, audit=False) -> tuple[Field, ...]
         Field("body_com_velocity_reported_world", (body_count, 6), "m/s,rad/s",
               "backend body_com_vel_w as returned, linear then angular; world; " + body_order),
     ) if audit else ()
-    return audit_fields + (
+    from .disturbances import DISTURBANCE_FIELDS
+
+    return (DISTURBANCE_FIELDS if disturbances else ()) + audit_fields + (
         Field("root_link_position_world_m", (3,), "m", "base_link origin; world"),
         Field("root_link_orientation_xyzw", (4,), "1", "base_link orientation in world; quaternion xyzw"),
         Field("root_origin_velocity_body_m_s", (3,), "m/s", "base_link origin; base_link axes"),
@@ -70,14 +72,20 @@ def substep_fields(body_names, joint_names, *, audit=False) -> tuple[Field, ...]
 class SubstepRecorder:
     """Copy every physics tick of an adapter-owned step into preallocated rows."""
 
-    def __init__(self, env, *, audit=False):
+    def __init__(self, env, *, audit=False, disturbances=False):
         self.env, self.audit = env, audit
+        if type(disturbances) is not bool:
+            raise ValueError("disturbances must be boolean")
+        from .disturbances import DisturbanceRecorder
+
+        self.disturbances = DisturbanceRecorder(env) if disturbances else None
         self.count = int(env.cfg.decimation)
         if self.count < 1:
             raise ValueError("Substep recording requires a positive decimation")
         self.num_envs, self.device = env.num_envs, torch.device(env.device)
         self.fields = substep_fields(tuple(env._binding.native_body_names),
-                                     tuple(env._binding.native_joint_names), audit=audit)
+                                     tuple(env._binding.native_joint_names), audit=audit,
+                                     disturbances=disturbances)
         self._values = {field.name: torch.zeros(self.num_envs, self.count, *field.shape,
                                                 dtype=torch.float32, device=self.device)
                         for field in self.fields}
@@ -91,6 +99,8 @@ class SubstepRecorder:
         env = self.env
         if self._installed or getattr(env, "_supermimic_substep_recorder", None) is not None:
             raise RuntimeError("The native environment already has a substep recorder")
+        if self.disturbances is not None:
+            self.disturbances.install()
         original = env._observe_substep
         self._original = original
         self._had_instance_method = "_observe_substep" in vars(env)
@@ -110,6 +120,8 @@ class SubstepRecorder:
         if not self._installed:
             raise RuntimeError("Install the substep recorder before stepping")
         self._index = 0
+        if self.disturbances is not None:
+            self.disturbances.begin()
 
     def abort(self):
         self._index = None
@@ -163,6 +175,8 @@ class SubstepRecorder:
         if self.audit:
             rows["body_link_pose_world_xyzw"] = env._as_torch(env.robot.data.body_link_pose_w)
             rows["body_com_velocity_reported_world"] = env._as_torch(env.robot.data.body_com_vel_w)
+        if self.disturbances is not None:
+            rows.update(self.disturbances.tick())
         k = self._index
         for field in self.fields:
             value = rows[field.name]
@@ -191,4 +205,6 @@ class SubstepRecorder:
         else:
             del env.__dict__["_observe_substep"]
         del env.__dict__["_supermimic_substep_recorder"]
+        if self.disturbances is not None:
+            self.disturbances.close()
         self._installed = False

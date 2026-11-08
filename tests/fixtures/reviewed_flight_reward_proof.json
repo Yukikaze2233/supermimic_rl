@@ -1,0 +1,84 @@
+{
+  "format": "jump-flight-geometry-and-rest-v1",
+  "before": {
+    "reward_kernel": {
+      "implementation": "shared_physical_reward_densities",
+      "kernel_sha256": "459439a4f56c19d3115ed55ad415386129db7a5325a603849fdc0ae8094b3b61",
+      "extensions": {
+        "jump_flight": 4.0,
+        "jump_push": 2.0,
+        "stationary_quiet": 1.0,
+        "jump_peak_completion": true,
+        "jump_physical_tail": true,
+        "jump_extension_height_floor": true
+      }
+    },
+    "course_schedule": {
+      "schedule": "jump_first_v1",
+      "request_motion": "birth_forward_held_v1",
+      "request_motion_resume": "cold_physics_reset_repopulates_cache"
+    }
+  },
+  "after": {
+    "reward_kernel": {
+      "implementation": "shared_physical_reward_densities",
+      "kernel_sha256": "8480365bebf37c79e4c9035e05d52557442f0dd5e799d0263bd6a472514c71e9",
+      "extensions": {
+        "jump_flight": 4.0,
+        "jump_push": 2.0,
+        "stationary_quiet": 1.0,
+        "jump_peak_completion": true,
+        "jump_physical_tail": true,
+        "jump_extension_height_floor": true,
+        "jump_flight_clearance": true,
+        "jump_tuck": 1.7
+      },
+      "jump_flight_geometry": {
+        "format": "jump-flight-geometry-v1",
+        "asset_manifest_sha256": "08bf7e001db99f21ee1e91133bf32fd7567b1db8c75fc31c908608ae85dcc1f8",
+        "linkage_data_sha256": "59b9e38ba5716790d0eb409ece3b53910dc0783344110056e4714df3fb512e42",
+        "implementation_sha256": "5c5b255d9397e2267aca267d8b6c16c00f610ce84a958c839ff46e5d96a6c46a",
+        "side_order": [
+          "left",
+          "right"
+        ],
+        "hip_pivot_base_m": [
+          [
+            0.0,
+            0.1838,
+            -0.00083697
+          ],
+          [
+            0.0,
+            -0.1828,
+            0.00083241
+          ]
+        ],
+        "minimum_leg_length_m": [
+          0.16246321590392263,
+          0.16246321576606737
+        ],
+        "leg_length_range_m": [
+          0.20836716883088832,
+          0.20836716893950263
+        ],
+        "length_definition": "norm(wheel_link_origin_in_base - primary_hip_pivot_in_base)",
+        "length_bounds": "min/max of the two assembled linkage-table endpoints; no extra mechanical margin",
+        "clearance_definition": "wheel_cylinder_bottom_world_z minus terrain column at collision centre",
+        "scope": "reward shaping only; not full-cylinder collision clearance or skill qualification"
+      }
+    },
+    "course_schedule": {
+      "schedule": "jump_first_v1",
+      "request_motion": "birth_forward_held_v1",
+      "request_motion_resume": "cold_physics_reset_repopulates_cache",
+      "spin_motion": "zero_forward_spin_segments_v1"
+    },
+    "request_gimbal_exclusion": {
+      "implementation": "request_owned_gimbal_exclusion_v1",
+      "implementation_sha256": "c41c356df17f4c863db6b1992e8634cf21c83d089478f69d31167925fdac7cb1",
+      "ownership": "task_family == REQUEST or physical_request_id >= 0",
+      "scope": "exclude chassis spin-translation; independent gimbal servo remains active"
+    }
+  }
+}

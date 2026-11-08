@@ -9,6 +9,7 @@ import json
 import os
 from pathlib import Path
 import sys
+import time
 import traceback
 
 import torch
@@ -29,8 +30,16 @@ def native_logs(directory: Path):
     sys.stdout.flush()
     sys.stderr.flush()
     try:
-        with (directory / "native.stdout.log").open("ab", buffering=0) as stdout, \
-                (directory / "native.stderr.log").open("ab", buffering=0) as stderr:
+        # The native health reader starts at byte zero. Previous workers'
+        # output must stay available without becoming this worker's physics
+        # evidence or exceeding its per-boundary read budget on resume.
+        generation = f"{time.time_ns()}-{os.getpid()}"
+        for stream in ("stdout", "stderr"):
+            previous = directory / f"native.{stream}.log"
+            if previous.exists():
+                previous.rename(directory / f"native.{stream}.previous-{generation}.log")
+        with (directory / "native.stdout.log").open("xb", buffering=0) as stdout, \
+                (directory / "native.stderr.log").open("xb", buffering=0) as stderr:
             os.dup2(stdout.fileno(), 1)
             os.dup2(stderr.fileno(), 2)
             yield
@@ -68,6 +77,8 @@ def _native_schema_source(provenance):
         provenance = {key: value for key, value in provenance.items() if key != "numerical_isolation"}
     if provenance.get("course_schedule", False) is None:
         provenance = {key: value for key, value in provenance.items() if key != "course_schedule"}
+    # Staggered first time limits schedule resets; they do not change the dynamics of recorded data.
+    provenance = {key: value for key, value in provenance.items() if key != "desynchronize_episodes"}
     # The legacy bound is already implied by every earlier runtime pin; only a
     # changed action contract becomes part of the identity.
     if provenance.get("action_bounds") == list(ACTION_BOUNDS):

@@ -90,7 +90,13 @@ class CourseAdapter(IsaacAdapter):
 
     def __init__(self, env, launcher, health, curriculum, provenance, log_directory, *,
                  mechanics_backend="newton", evaluation_configuration=None, record_substeps=False, substep_audit=False,
-                 profile_steps=False):
+                 record_disturbances=False, profile_steps=False, desynchronize_episodes=False, seed=0):
+        if type(desynchronize_episodes) is not bool:
+            raise ValueError("desynchronize_episodes must be boolean")
+        if desynchronize_episodes and evaluation_configuration is not None:
+            raise ValueError("Fixed evaluation keeps its scripted episode clocks")
+        self._desynchronize = desynchronize_episodes
+        self._desync_generator = torch.Generator(device="cpu").manual_seed(seed)
         self.env, self._launcher, self._health = env, launcher, health
         self.curriculum, self.provenance = curriculum, provenance
         self._native_log_directory = Path(log_directory)
@@ -118,11 +124,14 @@ class CourseAdapter(IsaacAdapter):
             raise ValueError("record_substeps and substep_audit must be boolean")
         if substep_audit and not record_substeps:
             raise ValueError("substep_audit extends recorded substeps; enable record_substeps")
+        if type(record_disturbances) is not bool or record_disturbances and not record_substeps:
+            raise ValueError("record_disturbances must be boolean and requires record_substeps")
         self._substeps = None
         self.substep_fields, self.substeps_per_step = (), 0
         if record_substeps:
             from ..adapters.substeps import SubstepRecorder
-            self._substeps = SubstepRecorder(env, audit=substep_audit).install()
+            self._substeps = SubstepRecorder(env, audit=substep_audit,
+                                             disturbances=record_disturbances).install()
             self.substep_fields = self._substeps.fields
             self.substeps_per_step = self._substeps.count
         if type(profile_steps) is not bool:
@@ -169,6 +178,23 @@ class CourseAdapter(IsaacAdapter):
                     (self, "_capture_snapshot", "adapter.capture_snapshot")):
                 if owner is not None and callable(getattr(owner, method, None)):
                     self._profiler.wrap(owner, method, label)
+
+    @torch.no_grad()
+    def reset(self):
+        """Cold reset; optionally spread the first episodes' time limits uniformly.
+
+        All rows are born together, so with equal episode lengths every row
+        times out and is reborn in the same interval. Like RSL-RL's
+        init_at_random_ep_len, the first episode of each row is truncated at a
+        uniform point of its length, after which episodes stay staggered.
+        Only the time-limit counter moves; task clocks are untouched.
+        """
+        snapshot = super().reset()
+        if self._desynchronize:
+            limit = int(self.env.max_episode_length)
+            offset = torch.randint(0, limit, (self.num_envs,), generator=self._desync_generator)
+            self.env.episode_length_buf.copy_(offset.to(self.env.episode_length_buf))
+        return snapshot
 
     def evaluation_begin(self, schema):
         from .evaluation import CourseEvaluation
@@ -294,6 +320,10 @@ class CourseAdapter(IsaacAdapter):
         if randomization is not None:
             for name, value in randomization.context_parameters().items():
                 context["requested." + name] = value.clone()
+        recorder = getattr(self, "_substeps", None)
+        if recorder is not None and recorder.disturbances is not None:
+            for name, value in recorder.disturbances.snapshot().items():
+                state[name] = value.clone()
         if hasattr(env._sensor_model, "noise_distribution"):
             context["sensor.noise_distribution"] = clock.new_full(
                 (self.num_envs, 1), env._sensor_model.noise_distribution).float()
@@ -342,6 +372,11 @@ class CourseAdapter(IsaacAdapter):
         state["gimbal.velocity_rad_s"] = state["joint_velocity_native"][:, indices].clone()
         state["gimbal.yaw_sin_cos"] = self._gimbal_sensors.instantaneous()[:, :2]
         self._capture_course(state, context, clock)
+        bridge = getattr(env, 'supermimic_recovery_bridge', None)
+        if bridge is not None and not terminal:
+            base = self.body_names.index('base_link')
+            bridge.record_births(self._episode_id, clock, state['body_link_pose_world_xyzw'][:, base],
+                                 state['body_com_pose_world_xyzw'][:, base, 2])
         owned = state["target.control_source"].eq(0)
         if env._recovery_preparation is not None:
             owned &= ~env._recovery_preparation.active
@@ -415,16 +450,25 @@ class CourseAdapter(IsaacAdapter):
         self.curriculum.set_progress(real_transitions=real_transitions, actor_updates=actor_updates)
 
     def training_state_dict(self):
-        return {"format": "supermimic_course_v1", "curriculum": self.curriculum.state_dict(),
-                "course": self.env._terrain_course.state_dict(),
-                "control_timing": self.env.control_timing_state_dict(),
-                "sensors": self.env._sensor_model.checkpoint_state_dict()}
+        state = {"format": "supermimic_course_v1", "curriculum": self.curriculum.state_dict(),
+                 "course": self.env._terrain_course.state_dict(),
+                 "control_timing": self.env.control_timing_state_dict(),
+                 "sensors": self.env._sensor_model.checkpoint_state_dict()}
+        platform = getattr(self.env, 'supermimic_platform_course', None)
+        if platform is not None:
+            state['platform_course'] = platform.state_dict()
+        return state
 
     def load_training_state_dict(self, state):
         if state["format"] != "supermimic_course_v1":
             raise ValueError("Course checkpoint format differs")
+        platform = getattr(self.env, 'supermimic_platform_course', None)
+        if (platform is None) != ('platform_course' not in state):
+            raise ValueError('Platform course checkpoint requires an explicit source migration')
         self.curriculum.load_state_dict(state["curriculum"])
         self.env._terrain_course.restore_after_physical_reset(state["course"])
+        if platform is not None:
+            platform.restore_after_physical_reset(state['platform_course'])
         self.env.restore_control_timing(state["control_timing"])
         sensor = self.env._sensor_model
         sensor.initialized.zero_()

@@ -24,6 +24,7 @@ def environment():
         def _reset_idx(self, ids):
             self.resets.append(ids.clone())
             self.robot.data.joint_pos[ids] = 0.
+            self.robot.data.joint_vel[ids] = 0.
             self._joint_coordinates.reset_rows(ids.long(), self.robot.data.joint_pos[ids])
             self._terminated[ids] = False
 
@@ -47,7 +48,28 @@ def environment():
     instance.num_envs, instance._device = 3, torch.device('cpu')
     instance._identified_execution = execution
     instance._as_torch = lambda value: value
-    instance.robot = SimpleNamespace(data=SimpleNamespace(joint_pos=initial.clone(), joint_vel=torch.zeros_like(initial)))
+    pose = torch.zeros(3, 7)
+    pose[:, 2], pose[:, 6] = .3, 1.
+    data = SimpleNamespace(joint_pos=initial.clone(), joint_vel=torch.zeros_like(initial),
+                           root_pose=pose, root_velocity=torch.zeros(3, 6))
+    writes = []
+
+    def write(field, value, ids):
+        writes.append((field, ids.clone()))
+        getattr(data, field)[ids] = value
+
+    instance.robot = SimpleNamespace(data=data,
+        write_root_link_pose_to_sim_index=lambda root_pose, env_ids: write('root_pose', root_pose, env_ids),
+        write_root_com_velocity_to_sim_index=lambda root_velocity, env_ids: write('root_velocity', root_velocity, env_ids),
+        write_joint_position_to_sim_index=lambda position, env_ids: write('joint_pos', position, env_ids),
+        write_joint_velocity_to_sim_index=lambda velocity, env_ids: write('joint_vel', velocity, env_ids))
+    instance._root_link_position = lambda: data.root_pose[:, :3]
+    instance._root_link_quat = lambda: data.root_pose[:, 3:]
+    instance.scene = SimpleNamespace(write_data_to_sim=lambda: None, update=lambda dt: None)
+    instance.sim = SimpleNamespace(forward=lambda: None)
+    instance.physics_writes = writes
+    instance._numerical_start_pose = pose.clone()
+    instance._numerical_start_position = initial.clone()
     instance._binding = SimpleNamespace(native_joint_names=('wheel', 'bounded'))
     instance._joint_coordinates = ContinuousJointCoordinates(initial, ('wheel', 'bounded'), ('wheel',), .005)
     instance._physical_tick = 0
@@ -70,7 +92,7 @@ def test_bad_row_resets_at_interval_end_healthy_native_four_pi_wraps_stay_exact(
     expected = healthy.read(env.next_position[1:], env.robot.data.joint_vel[1:], 1)
     _, _, terminated, _, extras = env.step(None)
     torch.testing.assert_close(env.endpoint[1:], expected, rtol=0, atol=0)
-    assert env.endpoint[0, 0] == env.next_position[0, 0]  # No delta clipping or native state rewrite.
+    assert env.endpoint[0, 0] == 0.  # Park immediately; reset the episode at the boundary.
     assert env._joint_coordinates._turns[:, 0].tolist() == [0, 1, -1]
     assert terminated.tolist() == [True, False, False]
     assert [rows.tolist() for rows in env.resets] == [[0]]
@@ -87,17 +109,19 @@ def test_bad_row_resets_at_interval_end_healthy_native_four_pi_wraps_stay_exact(
     assert extras['numerical_rejected_intervals_total'] == 1
 
 
-def test_reader_reseed_does_not_modify_physics_and_counts_a_repeated_row_once():
+def test_parking_modifies_only_rejected_rows_and_counts_a_repeated_row_once():
     env = environment()
     env._numerical_interval_active = True
-    for tick, value in ((1, 3.7), (2, 0.)):
+    for tick, value in ((1, 3.7), (2, 3.7)):
         env._physical_tick = tick
         env.robot.data.joint_pos[0, 0] = value
         before = env.robot.data.joint_pos.clone()
         env._joint_positions()
-        assert torch.equal(env.robot.data.joint_pos, before)
+        assert torch.equal(env.robot.data.joint_pos[1:], before[1:])
+        assert env.robot.data.joint_pos[0, 0] == 0.
     assert env._numerical_invalid_total == 1
-    assert not env.resets  # Normal end-of-step reset remains the sole physical reset owner.
+    assert not env.resets  # Task/episode reset still belongs to the policy boundary.
+    assert all(rows.tolist() == [0] for _, rows in env.physics_writes)
 
 
 @pytest.mark.parametrize('failure', ['nan_position', 'nan_velocity', 'lost_tick', 'outside_step'])
@@ -123,7 +147,7 @@ def test_nonfinite_missing_samples_and_unhandled_sampling_failures_still_raise(f
             'field': failure.removeprefix('nan_'), 'row': 1, 'joint': 'wheel', 'value': 'nan'}]
 
 
-def test_finite_speed_isolation_never_changes_native_velocity_or_healthy_coordinates():
+def test_finite_speed_isolation_preserves_healthy_coordinates_and_parks_invalid_rows():
     env = environment()
     env._numerical_interval_active = True
     healthy = ContinuousJointCoordinates(env.robot.data.joint_pos[2:].clone(),
@@ -140,8 +164,9 @@ def test_finite_speed_isolation_never_changes_native_velocity_or_healthy_coordin
         original_velocity = env.robot.data.joint_vel.clone()
         expected = healthy.read(original_position[2:], original_velocity[2:], tick)
         actual = env._joint_positions()
-        assert torch.equal(env.robot.data.joint_pos, original_position)
-        assert torch.equal(env.robot.data.joint_vel, original_velocity)
+        assert torch.equal(env.robot.data.joint_pos[2:], original_position[2:])
+        assert torch.equal(env.robot.data.joint_vel[2:], original_velocity[2:])
+        assert not env.robot.data.joint_vel[env._numerical_invalid].any()
         torch.testing.assert_close(actual[2:], expected, rtol=0, atol=0)
         assert env._numerical_invalid.tolist() == [True, tick == 2, False]
         assert env._numerical_invalid_total == tick
@@ -161,4 +186,25 @@ def test_speed_failure_marks_whole_interval_invalid_and_uses_normal_row_reset():
     assert extras['numerical_invalid'].tolist() == [True, False, False]
     assert extras['interval_observation_valid'].tolist() == [False, True, True]
     assert extras['termination_counts'][0] == 0
-    assert torch.equal(env.robot.data.joint_vel, native_velocity)
+    assert torch.equal(env.robot.data.joint_vel[1:], native_velocity[1:])
+    assert not env.robot.data.joint_vel[0].any()
+
+
+def test_failed_first_substep_is_parked_before_terrain_and_later_physics_ticks():
+    env = environment()
+    env._numerical_interval_active = True
+    env._pre_physics_step(None)
+    healthy_initial = env.robot.data.joint_pos[1:].clone()
+    for tick in range(1, 5):
+        env._physical_tick = tick
+        if tick == 1:
+            env.robot.data.joint_vel[0, 0] = 838.
+        elif env.robot.data.joint_vel[0, 0] > 800:
+            # The previous implementation reached NaNs before end-of-step reset.
+            env.robot.data.root_pose[0, :3] = float('nan')
+        env.robot.data.joint_pos[1:, 0] += .01
+        env._joint_positions()
+        assert torch.isfinite(env.robot.data.root_pose).all()
+    torch.testing.assert_close(env.robot.data.joint_pos[1:, 0], healthy_initial[:, 0] + .04)
+    assert env._numerical_invalid.tolist() == [True, False, False]
+    assert env._numerical_invalid_total == 1

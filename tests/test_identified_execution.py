@@ -76,6 +76,24 @@ def test_software_total_dynamic_mode_is_passive_and_explicitly_has_no_static_mod
         assert row["friction"] == row["dynamic_friction"] == row["viscous_friction"] == 0
 
 
+def test_native_floor_plus_software_residual_matches_full_moving_table_once():
+    native = response(count=4, mode="native_floor", dtype=torch.float64)
+    software = response(count=4, mode="software_dynamic", dtype=torch.float64)
+    # Away from the existing one-tick non-reversal clamp, the two ownership
+    # modes reconstruct the same moving table in both directions.
+    speed = torch.tensor([[0., 0., 0., 0., 2., -2.], [0., 0., 0., 0., -6., 6.],
+                          [0., 0., 0., 0., 20., -20.], [0., 0., 0., 0., -55., 55.]], dtype=torch.float64)
+    residual = native.step(torch.zeros_like(speed), speed).passive_effort_nm
+    total = software.step(torch.zeros_like(speed), speed).passive_effort_nm
+    native_loss = -speed[:, 4:].sign() * native.floor
+    torch.testing.assert_close(residual[:, 4:] + native_loss, total[:, 4:], rtol=1e-14, atol=1e-14)
+    torch.testing.assert_close(residual[:, :4], total[:, :4], rtol=0, atol=0)
+    # At rest the software contributes no substitute static threshold;
+    # the opted-in native solver owns the measured nominal breakaway.
+    zero = torch.zeros_like(speed)
+    assert not native.step(zero, zero).passive_effort_nm.any()
+
+
 def test_braking_cap_remains_available_above_motoring_zero_speed():
     migrated = response(count=2)
     torque = torch.tensor([[0., 0., 0., 0., 4.5, -4.5], [0., 0., 0., 0., -4.5, 4.5]])

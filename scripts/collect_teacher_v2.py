@@ -3,18 +3,15 @@
 from __future__ import annotations
 
 import argparse
-from dataclasses import asdict
 import json
 from pathlib import Path
 import time
 import traceback
 
-import torch
-
 from supermimic_rl.adapters.packed import PackedEnvironment
 from supermimic_rl.cli import native_logs, _native_schema_source
-from supermimic_rl.runtime import atomic_save
 from supermimic_rl.world_model_v2.collection import Collector
+from supermimic_rl.world_model_v2.dataset import save_native_dataset
 from supermimic_rl.world_model_v2.records import MODEL_CONTRACT
 
 
@@ -79,7 +76,6 @@ def main():
             source_rng, source_config = [], None
             if args.record_stair_source:
                 from supermimic_rl.world_model_v2.stair_source import StairScenario
-                trigger = adapter.env._terrain_course.tof_trigger
                 source_config = StairScenario.capture(adapter.env).to_dict()
 
             def progress(record):
@@ -93,28 +89,9 @@ def main():
             report.update(elapsed_s=time.monotonic() - started, teacher=teacher.source_metadata,
                           model_contract=MODEL_CONTRACT, action_noise_std=args.action_noise_std,
                           scope='native teacher data collection only; no world-model or policy update')
-            payload = {'format': 'supermimic-world-v2-dataset-v1', 'model_contract': MODEL_CONTRACT,
-                         'schema': env.schema.to_dict(), 'schema_fingerprint': env.schema.fingerprint,
-                         'replay': collector.replay.state_dict(), 'collection': report}
-            if source_config is not None:
-                payload['stair_source_config'] = source_config
-                payload['source_rng'] = {
-                    'format': 'supermimic-vector-step-rng-v1', 'device': str(trigger.generator.device),
-                    'num_envs': env.num_envs,
-                    'sequence': torch.tensor([entry[0] for entry in source_rng], dtype=torch.int64),
-                    'state': torch.stack([entry[1] for entry in source_rng]),
-                }
-                (output / 'stair-source-config.json').write_text(json.dumps(source_config, indent=2) + '\n')
-            if args.record_jumps:
-                from supermimic_rl.world_model_v2.jump_task import JumpTaskConfig
-                payload['jump_task_config'] = asdict(JumpTaskConfig.capture(adapter.env))
-                (output / 'jump-task-config.json').write_text(json.dumps(payload['jump_task_config'], indent=2) + '\n')
-            if args.record_recovery:
-                from supermimic_rl.world_model_v2.recovery_task import RecoveryTaskConfig
-                payload['recovery_task_config'] = asdict(RecoveryTaskConfig.capture(adapter.env))
-                (output / 'recovery-task-config.json').write_text(
-                    json.dumps(payload['recovery_task_config'], indent=2) + '\n')
-            atomic_save(payload, output / 'replay.pt')
+            report['dataset'] = save_native_dataset(collector, output / 'replay.pt', report.copy(),
+                source_rng=source_rng, stair_source_config=source_config,
+                source={'kind': 'native_teacher_collection', 'teacher': teacher.source_metadata})
             (output / 'collection.json').write_text(json.dumps(report, indent=2) + '\n')
             print(json.dumps(report), flush=True)
         except BaseException:

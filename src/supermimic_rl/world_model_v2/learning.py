@@ -14,12 +14,35 @@ import math
 import torch
 from torch import Tensor, nn
 
+from .dynamics import MODEL_FIT_PRECISIONS
 from .fitting import WorldModelFit
 from .imagination import Critic, Imagined, Imagination, InvalidImagination
 from .model import WorldModelV2
 from .policy import EstimatorActor
 from .records import decode_memory, decode_physical
 from .termination import PoseContactTermination
+
+
+@dataclass(frozen=True)
+class LearningRateDecay:
+    """Cosine decay of every learner rate over actor updates, then constant.
+
+    SuperMimic (Table A.5) decays to 0.03x over 250k of 320k iterations, with
+    one policy update per iteration; the actor-update count is that clock here.
+    Model updates before policy learning starts therefore keep the full rate.
+    """
+    updates: int
+    final_fraction: float = .03
+
+    def __post_init__(self):
+        if type(self.updates) is not int or self.updates < 1:
+            raise ValueError('Learning-rate decay needs a positive integer number of actor updates')
+        if not 0 < self.final_fraction <= 1:
+            raise ValueError('Learning-rate decay final fraction must be in (0, 1]')
+
+    def factor(self, actor_updates: int) -> float:
+        progress = min(actor_updates / self.updates, 1.)
+        return self.final_fraction + (1 - self.final_fraction) * .5 * (1 + math.cos(math.pi * progress))
 
 
 @dataclass(frozen=True)
@@ -44,10 +67,22 @@ class LearningConfig:
     # start histories. Imagination may improve the student only near the
     # teacher, where the world model has data. 0 disables it.
     anchor_coefficient: float = 0.
+    # CUDA motion-MLP fitting only; policy imagination and CPU remain FP32.
+    model_fit_precision: str = 'float32'
+    # None keeps every rate constant (legacy).
+    learning_rate_decay: LearningRateDecay | None = None
 
     def __post_init__(self):
+        if isinstance(self.learning_rate_decay, dict):
+            object.__setattr__(self, 'learning_rate_decay', LearningRateDecay(**self.learning_rate_decay))
+        if self.learning_rate_decay is not None and not isinstance(self.learning_rate_decay, LearningRateDecay):
+            raise ValueError('Learning-rate decay must be a LearningRateDecay or its dictionary')
+        if type(self.imagination_horizon) is not int or self.imagination_horizon < 1:
+            raise ValueError('Imagination horizon must be a positive integer')
         if not math.isfinite(self.anchor_coefficient) or self.anchor_coefficient < 0:
             raise ValueError('Anchor coefficient must be finite and nonnegative')
+        if self.model_fit_precision not in MODEL_FIT_PRECISIONS:
+            raise ValueError('Model fit precision must be float32 or bfloat16')
 
 
 @torch.no_grad()
@@ -81,18 +116,34 @@ def frozen_parameters(*modules):
 class Learner:
     def __init__(self, model: WorldModelV2, actor: EstimatorActor, critic: Critic,
                  termination: PoseContactTermination, config: LearningConfig, *, reward,
-                 stair_task=None, stair_source=None, jump_task=None, recovery_task=None):
+                 stair_task=None, stair_source=None, jump_task=None, recovery_task=None, disturbance_config=None,
+                 platform_task=None, platform_contact=None, platform_geometry=None):
         self.model, self.actor, self.critic, self.config = model, actor, critic, config
         self.fit = WorldModelFit(model)
         self.imagination = Imagination(model, actor, critic, termination, reward=reward, gamma=config.gamma,
                                        stair_task=stair_task, stair_source=stair_source, jump_task=jump_task,
-                                       recovery_task=recovery_task, bootstrap_gradient=config.bootstrap_gradient)
+                                       recovery_task=recovery_task, bootstrap_gradient=config.bootstrap_gradient,
+                                       disturbance_config=disturbance_config,
+                                       platform_task=platform_task, platform_contact=platform_contact,
+                                       platform_geometry=platform_geometry)
+        self.platform_contact = platform_contact
+        if platform_contact is not None:
+            from .platform_contacts import PlatformContactModel
+
+            if not isinstance(platform_contact, PlatformContactModel):
+                raise ValueError('Platform learning requires a persistable contact model')
         self.optimizers = {
             "model": torch.optim.Adam(model.parameters(), lr=config.model_learning_rate),
             "actor": torch.optim.Adam(actor.decoder.parameters(), lr=config.actor_learning_rate),
             "critic": torch.optim.Adam(critic.parameters(), lr=config.critic_learning_rate),
             "estimator": torch.optim.Adam(actor.estimator.parameters(), lr=config.estimator_learning_rate),
         }
+        if platform_contact is not None:
+            self.optimizers['platform_contact'] = torch.optim.Adam(
+                platform_contact.parameters(), lr=config.model_learning_rate)
+        # Every optimizer's configured rate, including optional heads, is its schedule base.
+        self.base_learning_rates = {name: optimizer.param_groups[0]['lr']
+                                    for name, optimizer in self.optimizers.items()}
         self.updates = {name: 0 for name in self.optimizers}
         self.skipped = {name: 0 for name in self.optimizers}
         self.anchor = None   # (frozen teacher actor, teacher action std [6])
@@ -110,6 +161,19 @@ class Learner:
             target = teacher(frames)
         return .5 * ((self.actor(frames) - target) / std).square().mean()
 
+    def learning_rate_factor(self) -> float:
+        decay = self.config.learning_rate_decay
+        return 1. if decay is None else decay.factor(self.updates['actor'])
+
+    def _schedule(self, name: str) -> None:
+        # Rates follow the schedule only when it is enabled; otherwise any
+        # externally managed rate (resume reset, guard) is left untouched.
+        if self.config.learning_rate_decay is None:
+            return
+        rate = self.base_learning_rates[name] * self.learning_rate_factor()
+        for group in self.optimizers[name].param_groups:
+            group['lr'] = rate
+
     def _step(self, name: str, loss: Tensor) -> bool:
         optimizer = self.optimizers[name]
         optimizer.zero_grad(set_to_none=True)
@@ -120,6 +184,7 @@ class Learner:
             norm = nn.utils.clip_grad_norm_(parameters, self.config.gradient_clip)
             finite = bool(torch.isfinite(norm))
         if finite:
+            self._schedule(name)
             optimizer.step()
             self.updates[name] += 1
         else:
@@ -133,7 +198,8 @@ class Learner:
         # Statistics keep seeing the current real course distribution. They
         # are never updated with imagined states or during a backward graph.
         self.fit.observe(windows)
-        terms = self.fit.terms(windows)
+        with self.model.motion.fitting_precision(self.config.model_fit_precision):
+            terms = self.fit.terms(windows)
         updated = self._step("model", terms.state + terms.ticks)
         return {"model/updated": updated, "model/state": float(terms.state.detach()),
                 "model/ticks": float(terms.ticks.detach()), "model/skipped": self.skipped["model"],
@@ -148,6 +214,43 @@ class Learner:
         loss = self.actor.estimator_loss(frames[valid], target[..., :3], target[..., 3:5])
         return {"estimator/updated": self._step("estimator", loss), "estimator/labels": int(valid.sum()),
                 "estimator/loss": float(loss.detach()), "estimator/skipped": self.skipped["estimator"]}
+
+    def fit_platform_contact(self, record: dict[str, Tensor], *, command_height: Tensor) -> dict:
+        """Fit attribution from actual four-tick evidence without updating motion.
+
+        The caller provides the admitted height for this recorded interval.
+        Unknown historical evidence supplies no labels, including no negatives.
+        Normalizers see only real, labeled training examples. Actor imagination
+        never invokes this method or supplies its own predictions as truth.
+        """
+        from .jump_task import JumpTaskState
+        from .model import Ticks
+        from .platform_records import PlatformRecordState
+
+        model = self.platform_contact
+        if model is None:
+            raise ValueError('Platform contact fitting requires an installed model')
+        ticks = Ticks.decode(record['ticks'], decode_physical(record['physical']))
+        arguments = dict(intent=PlatformRecordState.decode(record).intent,
+                         jump_state=JumpTaskState.decode(record),
+                         terrain_tile=record['terrain_tile'][:, 0].long(), command_height=command_height)
+        targets = model.targets(record, command_height=command_height)
+        with torch.no_grad():
+            prediction = model.predict(ticks, **arguments)
+            valid = prediction.available & targets.valid
+            labels = int(valid.sum())
+            if not labels:
+                return {'platform_contact/updated': False, 'platform_contact/labels': 0,
+                        'platform_contact/skipped': self.skipped['platform_contact']}
+            model.observe(prediction, targets)
+        # Observe changes both feature and height scales; evaluate the loss
+        # with the newly observed scales, just as the motion fitter does.
+        terms = model.losses_from_features(prediction.features, targets, available=prediction.available)
+        updated = self._step('platform_contact', sum(terms.values()))
+        return {'platform_contact/updated': updated, 'platform_contact/labels': labels,
+                'platform_contact/height_labels': int((valid & targets.height_valid).sum()),
+                'platform_contact/skipped': self.skipped['platform_contact'],
+                **{'platform_contact/' + name: float(value.detach()) for name, value in terms.items()}}
 
     def _usable_rollout(self, start, frames):
         """Retain the healthy graph on an atlas miss; replay other invalid graphs.
@@ -227,7 +330,8 @@ class Learner:
         accepted = replayed = 0
         causes = dict.fromkeys(('nonfinite_prediction', 'terrain_query', 'reward_reference', 'nonfinite_return'), 0)
         gradient = torch.enable_grad() if train_actor else torch.no_grad()
-        with frozen_parameters(self.model, self.critic), gradient:
+        contact = () if self.platform_contact is None else (self.platform_contact,)
+        with frozen_parameters(self.model, self.critic, *contact), gradient:
             for first in range(0, batch_size, microbatch_size):
                 part = slice(first, first + microbatch_size)
                 rollout, rejected, retried, rejected_causes = self._usable_rollout(
@@ -268,6 +372,7 @@ class Learner:
             norm = nn.utils.clip_grad_norm_(self.actor.decoder.parameters(), config.gradient_clip)
             finite = bool(torch.isfinite(norm))
         if finite and train_actor:
+            self._schedule('actor')
             optimizer.step()
             self.updates['actor'] += 1
         elif train_actor:
@@ -286,6 +391,7 @@ class Learner:
                     total_loss += float(loss.detach())
                     batches += 1
         return {"actor/updated": finite and train_actor, "actor/loss": actor_loss if accepted else float('nan'),
+                "learning_rate/factor": self.learning_rate_factor(),
                 "actor/anchor_kl": anchor,
                 "actor/skipped": self.skipped["actor"], "critic/loss": total_loss / max(batches, 1),
                 "critic/skipped": self.skipped["critic"],
@@ -322,19 +428,31 @@ class Learner:
         return {"model": self.model.state_dict(), "actor": self.actor.state_dict(),
                 "critic": self.critic.state_dict(), "updates": self.updates.copy(), "skipped": self.skipped.copy(),
                 "optimizers": {name: optimizer.state_dict() for name, optimizer in self.optimizers.items()},
+                **({} if self.platform_contact is None else
+                   {'platform_contact': self.platform_contact.state_dict()}),
                 **({} if floor is None else {"contact_floor": {"body": floor[0], "base": floor[1]}}),
                 **({} if self.anchor is None else
-                   {"anchor": {"actor": self.anchor[0].state_dict(), "std": self.anchor[1]}})}
+                   {"anchor": {"actor": self.anchor[0].state_dict(), "std": self.anchor[1],
+                               "actor_features": self.anchor[0].features.configuration}})}
 
     def load_state_dict(self, state: dict) -> None:
+        if (self.platform_contact is None) != ('platform_contact' not in state):
+            raise ValueError('Checkpoint and learner platform contact contracts differ')
         for name in ("model", "actor", "critic"):
             getattr(self, name).load_state_dict(state[name])
+        if self.platform_contact is not None:
+            self.platform_contact.load_state_dict(state['platform_contact'])
         for name, optimizer in self.optimizers.items():
             optimizer.load_state_dict(state["optimizers"][name])
         self.updates, self.skipped = dict(state["updates"]), dict(state["skipped"])
         anchor = state.get("anchor")
         if anchor is not None:
+            from ..actor_features import ActorFeatures
+
             teacher = copy.deepcopy(self.actor)
+            # An existing reference policy retains its own command semantics
+            # when the trainable actor activates new decoder features.
+            teacher.features = ActorFeatures(anchor.get("actor_features"))
             teacher.load_state_dict(anchor["actor"])
             self.set_anchor(teacher, anchor["std"])
         floor = state.get("contact_floor")

@@ -135,6 +135,8 @@ def test_recorded_hold_without_flight_reaches_shared_missed_jump_reward():
     jump = JumpTaskState.decode(start)
     jump.ids[:, 1] = jump.ids[:, 4] = 7
     jump.values[:, [1, 2, 9, 10, 11]] = 0.
+    jump.values[1, 11] = 1.  # Supported extension is ascent, but never actual liftoff.
+    jump = replace(jump, flight_latch=torch.tensor([[7, 0, 0], [7, 0, 0]]))
     jump.values[:, 5] = .10
     jump.values[:, 6] = .35
     jump.values[:, 8] = 3.  # Reference completed; request is still within its 6 s window.

@@ -175,7 +175,8 @@ class StairTask:
         return ready, torch.where(ready[:, None], contact, 0.), torch.where(ready, tilt, 0.)
 
     def advance_motion(self, state, packet, *, motion, queues, readout, goal, estimate, physics_dt_s,
-                       admission=None, base_mode=None, jump_active=None, request_height=None, request_clock=None):
+                       admission=None, base_mode=None, jump_active=None, request_height=None, request_clock=None,
+                       request_owned=None):
         """Compose native command admission -> request FSM -> gimbal task.
 
         Called after the preceding interval's reward/termination. The returned
@@ -196,7 +197,8 @@ class StairTask:
         jump_active = base_mode == int(CommandMode.JUMP) if jump_active is None else jump_active
         result = self.advance(state, packet, now_s=now, estimate=estimate, admitted=admitted,
                               base_mode=base_mode, jump_active=jump_active)
-        following, next_goal = following.finish_command(result.command, goal, mode=result.mode)
+        following, next_goal = following.finish_command(result.command, goal, mode=result.mode,
+                                                         request_owned=request_owned)
         if request_height is not None:
             if request_clock is None:
                 raise ValueError('Jump goal needs both the native requested height and visible clock')
@@ -251,7 +253,10 @@ class StairTask:
                                   ready=ready & ~packet.safety_abort, completed_id=packet.completed_id)
         finished = condition.finished_id >= 0
         released = finished & (condition.end_reason == int(RequestEnd.ESTIMATED_COMPLETE))
-        fsm.reset((finished & ~released).nonzero().flatten())
+        reset_rows = (finished & ~released).nonzero().flatten()
+        # Empty indexed resets still launch writes and validate ranges on CUDA.
+        if reset_rows.numel():
+            fsm.reset(reset_rows)
         ordinary = (base_mode != int(CommandMode.JUMP)) & (base_mode != int(CommandMode.RECOVERY))
         output = fsm.deployment_step(
             step_height_m=condition.height_m, wheel_contact_probability=contact, tilt_rad=tilt,

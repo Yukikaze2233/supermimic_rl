@@ -266,3 +266,37 @@ def test_fresh_guard_keeps_existing_absolute_policy_start(tmp_path, monkeypatch)
     assert trainer.guard_cold_cycles_remaining == 0
     assert trainer.guard_cold_previous_bad_cycles is None
     assert trainer.guard.best is None and trainer.guard.bad_cycles == trainer.guard.restorations == 0
+
+
+def test_report_resume_observes_immediately_after_absolute_task_warmup(tmp_path, monkeypatch):
+    from supermimic_rl.world_model_v2.guard import NativeRegressionGuard
+    from supermimic_rl.world_model_v2.learning import LearningConfig
+    from supermimic_rl.world_model_v2.policy import EstimatorActor
+
+    calls = []
+    trainer = _stub_trainer(tmp_path, monkeypatch, calls, cycles=633,
+        policy_start_cycle=620, guard_drop_fraction=.05, guard_patience=2, guard_mode='report',
+        learning=LearningConfig(actor_learning_rate=5e-5))
+    trainer.cycle = 631
+    learner = trainer.learner
+    learner.actor = EstimatorActor(history_length=1, estimator_hidden=(4,), actor_hidden=(4,), frame_dim=35)
+    learner.optimizers = {'actor': torch.optim.Adam(learner.actor.decoder.parameters(), lr=5e-5),
+                          'estimator': torch.optim.Adam(learner.actor.estimator.parameters(), lr=1e-3)}
+    previous = NativeRegressionGuard(.05, 2, 5e-5, mode='report')
+    previous.best_reward, previous.bad_cycles = .09385, 1
+    trainer._initialize_guard({'guard': previous.state_dict()})
+    assert trainer.guard_cold_cycles_remaining == 0
+    rewards = iter([.0146, .2])
+    trainer.collector.collect = lambda *args, **kwargs: {
+        'terminations': 0, 'student_reward_mean': next(rewards)}
+
+    trainer.train()
+
+    metrics = [json.loads(line) for line in (tmp_path / 'metrics.jsonl').read_text().splitlines()]
+    assert [row['guard']['judged_student_reward'] for row in metrics] == [.0146, .2]
+    assert calls == ['actor', 'actor'] * 2
+    assert all(row['policy_learning'] for row in metrics)
+    assert all('deferred_reason' not in row['guard'] and not row['guard']['restored']
+               and row['guard']['actor_learning_rate'] == 5e-5 for row in metrics)
+    assert trainer.guard.best_reward == .2
+    assert trainer.guard.restorations == 0

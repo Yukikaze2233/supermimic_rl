@@ -1,4 +1,4 @@
-"""Fixed native course requests and endpoint-based evaluation accounting.
+"""Fixed native course requests, physical events and transition accounting.
 
 Scenarios select existing task/command interfaces. Physics, command admission,
 reward and physical success criteria remain upstream. Parameter values below
@@ -14,6 +14,8 @@ import torch
 from ..compact_state import named_field
 from .jump_evaluation import JumpEvaluation
 from .recovery_evaluation import RecoveryEvaluation
+from .stair_evaluation import StairRequestEvaluation
+from .stationary_evaluation import StationaryEvaluation
 
 # Radiant 0bf3456 clips before MAE. Keep these secondary summaries separate
 # from raw error and document our native coordinates/sample-weighted reduction.
@@ -27,10 +29,14 @@ class CourseEvaluationConfig:
     family: str | None = None
     seed: int = 0
     recovery_qualification: bool = False
+    recovery_bridges: bool = False
+    recovery_midpoints: bool = False
 
     def __post_init__(self):
         if (not isinstance(self.evaluation_stage, str)
                 or type(self.recovery_qualification) is not bool
+                or type(self.recovery_bridges) is not bool
+                or type(self.recovery_midpoints) is not bool
                 or type(self.seed) is not int or not 0 <= self.seed < 2**63
                 or not isinstance(self.scenarios, (tuple, list))
                 or any(not isinstance(name, str) for name in self.scenarios)
@@ -52,6 +58,10 @@ class FixedCourseScenarios:
         self.env, self.device = adapter.env, adapter.device
         self.family_type, self.terrain_type = TaskFamily, TerrainKind
         self.posture_names = RECOVERY_NAMES
+        if config.recovery_bridges and not getattr(adapter.curriculum.config, 'recovery_roll_bridge', False):
+            raise ValueError('Fixed recovery bridges require the enabled birth geometry')
+        if config.recovery_midpoints and not getattr(adapter.curriculum.config, 'recovery_midpoint_bridge', False):
+            raise ValueError('Fixed recovery midpoints require the enabled midpoint birth geometry')
         stage_names = adapter.curriculum.stage_names
         if config.evaluation_stage not in stage_names:
             raise ValueError("Unknown formal evaluation stage")
@@ -80,6 +90,18 @@ class FixedCourseScenarios:
         self.scenarios = {name: bank[name] for name in names}
         self.names = tuple(names)
         self.row_names = tuple(names[row % len(names)] for row in range(adapter.num_envs))
+        # An even-sized recovery suite otherwise assigns every repetition of
+        # left/right poses to opposite gimbal endpoints. Balance each posture's
+        # repetitions without changing the native endpoints or drawing RNG.
+        occurrences = {}
+        pitch_slots = []
+        for row, name in enumerate(self.row_names):
+            recovery = self.scenarios[name]['family'] == 'RECOVERY'
+            balanced = recovery and (config.recovery_qualification or config.recovery_bridges
+                                     or config.recovery_midpoints)
+            pitch_slots.append(occurrences.get(name, 0) % 2 if balanced else row % 2)
+            occurrences[name] = occurrences.get(name, 0) + 1
+        self.gimbal_pitch_slots = tuple(pitch_slots)
         self.births = torch.zeros(adapter.num_envs, dtype=torch.long, device=self.device)
         self.command_source = torch.zeros_like(self.births)
         self.qualification_clock = None
@@ -105,7 +127,8 @@ class FixedCourseScenarios:
         tiles = manifest['tiles']
         result = {}
         for name, case in self.scenarios.items():
-            authored = {'authored_single_step': 'road_step', 'authored_two_platforms': 'central_steps'}.get(name)
+            authored = {'authored_single_step': 'road_step', 'authored_single_step_low': 'road_step',
+                        'authored_two_platforms': 'central_steps', 'authored_two_platforms_low': 'central_steps'}.get(name)
             candidates = [index for index, tile in enumerate(tiles)
                 if tile['name'] == authored] if authored else [index for index, tile in enumerate(tiles)
                 if tile['kind'] == int(self.terrain_type[case['terrain']])
@@ -152,6 +175,18 @@ class FixedCourseScenarios:
                 add(f"jump_{motion}_{level}", "REQUEST", [command(forward)], jump=rise)
         for name in self.curriculum.config.recovery_postures:
             add("recovery_" + name, "RECOVERY", [command()], posture=name)
+        if self.config.recovery_bridges:
+            from .recovery_bridge import BRIDGE_VARIANTS
+
+            for index, name in enumerate(BRIDGE_VARIANTS):
+                add('recovery_' + name, 'RECOVERY', [command()], posture=self.posture_names[4 + index % 2])
+                bank['recovery_' + name]['recovery_variant'] = name
+        if self.config.recovery_midpoints:
+            from .recovery_bridge import MIDPOINT_BASE_POSTURES, MIDPOINT_VARIANTS
+
+            for name, base in zip(MIDPOINT_VARIANTS, MIDPOINT_BASE_POSTURES, strict=True):
+                add('recovery_' + name, 'RECOVERY', [command()], posture=self.posture_names[base])
+                bank['recovery_' + name]['recovery_variant'] = name
         for direction, sign in (("positive", 1), ("negative", -1)):
             add("spin_translation_" + direction, "MOTION",
                 [command(self.env._gimbal_course.config.translation_speed_m_s[1])],
@@ -176,6 +211,31 @@ class FixedCourseScenarios:
         if positive.numel():
             add("low_obstacle", "TERRAIN", [command(p.approach_forward_m_s[0])],
                 terrain="STEP_UP", step=float(positive.min()))
+        # Preserve the reviewed PPO22600 fixed cases and the earlier bank's
+        # order. These speed aliases retain authored 200 mm collision geometry.
+        add("authored_single_step_low", "TERRAIN", [command(p.approach_forward_m_s[0])],
+            terrain="STEP_UP", step=d.step_up_m[1])
+        add("authored_two_platforms_low", "TERRAIN", [command(p.approach_forward_m_s[0])],
+            terrain="TWO_PLATFORMS", step=d.step_up_m[1])
+        for motion, forward in (("standing", 0.), ("moving", p.approach_forward_m_s[0])):
+            add(f"jump_{motion}_100mm", "REQUEST", [command(forward)], jump=.1)
+        # Keep the historical high-speed/max-yaw corner as a pressure case.
+        # These appended cases separate lower-yaw turning and rough coverage;
+        # their existing pool/domain targets do not certify traction capacity.
+        for direction, sign in (("left", 1), ("right", -1)):
+            add(f"forward_turning_{direction}", "ROTATION",
+                [command(vx, sign * p.approach_yaw_rad_s)])
+        add("fast_turning_negative", "ROTATION", [command(vx, -p.normal_yaw_rad_s)])
+        add("rough_forward_speed", "TERRAIN", [command(vx)], terrain="ROUGH")
+        for direction, sign in (("left", 1), ("right", -1)):
+            add(f"rough_turning_{direction}", "TERRAIN",
+                [command(vx, sign * p.approach_yaw_rad_s)], terrain="ROUGH")
+        # Keep the original positive spin case and append its opposite and
+        # upper-speed endpoints from the instantiated command pool.
+        add("in_place_rotation_negative", "ROTATION", [command(yaw=-p.spin_mid_rad_s[0])])
+        for direction, sign in (("positive", 1), ("negative", -1)):
+            add(f"in_place_rotation_high_{direction}", "ROTATION",
+                [command(yaw=sign * p.spin_mid_rad_s[1])])
         return bank
 
     def _selected(self, ids):
@@ -235,11 +295,11 @@ class FixedCourseScenarios:
             course.mode[row] = int(mode)
             course.special[row] = special
             course.target[row, 0] = world_angles[row, 0] if mode != GimbalMode.BODY_FIXED else 0.
-            # Opposite endpoints exist from birth, even if episodes end before
-            # the first segment boundary. Repeated rows of the 27-case suite
-            # also receive opposite endpoints because its length is odd.
+            # Recovery repetitions use both endpoints even when every episode
+            # finishes before the first segment boundary. Other suites retain
+            # their original row-based assignment.
             segment = int(self.env._terrain_course.tasks.elapsed[row] / self.pool.config.segment_s[0])
-            course.target[row, 1] = c.pitch_target_rad[(row + segment) % 2]
+            course.target[row, 1] = c.pitch_target_rad[(self.gimbal_pitch_slots[row] + segment) % 2]
             course.rate[row] = c.yaw_rate_rad_s[int(case["rotation_sign"] > 0)] if sweep else 0.
             course.speed[row] = c.translation_speed_m_s[1] if special else 0.
             course.direction[row] = 0.
@@ -253,6 +313,26 @@ class FixedCourseScenarios:
         # Reuse the already installed sampler, preparation and sensor objects.
         # Calling env.set_task_sampler again would replace recovery components.
         tasks = self.env._terrain_course.tasks
+        bridge = getattr(self.env, 'supermimic_recovery_bridge', None)
+        if (self.config.recovery_bridges or self.config.recovery_midpoints) and bridge is None:
+            raise ValueError('Fixed recovery bridge geometry has not been installed')
+        if bridge is not None:
+            # Default fixed plans retain the original endpoints, regardless
+            # of the training birth cycle. Additional poses are explicit.
+            self._install(bridge, 'evaluation', True)
+            if self.config.recovery_bridges or self.config.recovery_midpoints:
+                from .recovery_bridge import variant_names
+
+                names = variant_names(midpoints=self.curriculum.config.recovery_midpoint_bridge)
+
+                variants = torch.tensor([
+                    names.index(case.get('recovery_variant', case['posture']))
+                    if case['posture'] is not None else 0
+                    for case in self._selected(torch.arange(self.adapter.num_envs, device=self.device))
+                ], dtype=torch.int64)
+                self._install(bridge, 'fixed_variants', variants)
+            else:
+                self._install(bridge, 'fixed_variants', None)
         original_tracking = tasks.begin_tracking
 
         def begin_tracking(mask):
@@ -263,6 +343,11 @@ class FixedCourseScenarios:
             return result
 
         self._install(self.curriculum, 'sample', self.sample)
+        motion_owner = getattr(self.env, '_motion_trajectory_owner', None)
+        if motion_owner is not None:
+            # Fixed scenarios own their requested waveform and may explicitly
+            # test special gimbal translation on the MOTION family.
+            self._install(motion_owner, 'training_commands_enabled', False)
         self._install(self.env._task_sampler, 'curriculum', self.curriculum)
         self._install(self.adapter, 'curriculum', self.curriculum)
         self._install(tasks, '_draw_segments', self.draw_segments)
@@ -315,6 +400,10 @@ class FixedCourseScenarios:
         selection = asdict(self.config)
         if not self.config.recovery_qualification:
             selection.pop('recovery_qualification')
+        if not self.config.recovery_bridges:
+            selection.pop('recovery_bridges')
+        if not self.config.recovery_midpoints:
+            selection.pop('recovery_midpoints')
         result = {"selection": selection, "scenarios": self.scenarios,
                 "fixed_atlas_tiles": self.fixed_tiles,
                 "resolved_curriculum": {"stage": self.curriculum.stage,
@@ -324,7 +413,8 @@ class FixedCourseScenarios:
                     "coordinate_semantics": "isolated evaluation difficulty; not claimed training samples"},
                 "assigned_rows": {name: self.row_names.count(name) for name in self.names},
                 "row_assignment": [{"env_id": row, "scenario": name,
-                                    "initial_pitch_target_rad": self.env._gimbal_course.config.pitch_target_rad[row % 2]}
+                                    "initial_pitch_target_rad": self.env._gimbal_course.config.pitch_target_rad[
+                                        self.gimbal_pitch_slots[row]]}
                                    for row, name in enumerate(self.row_names)],
                 "unassigned_scenarios": [name for name in self.names if name not in self.row_names],
                 "parameters": {"task_domain": asdict(self.domain),
@@ -333,6 +423,13 @@ class FixedCourseScenarios:
                 "parameter_source": "instantiated pinned native contracts; jump low/high=effective domain endpoints, intermediate=initial-domain upper endpoint capped by effective domain; not success thresholds",
                 "placement": "requested terrain kind/height; actual routed tiles and declared collision profiles are reported separately",
                 "randomness": "scheduled command targets and collision tiles fixed; native birth/recovery handoff commands, request timing, birth, dynamics and sensor DR retained; training terrain coverage/proficiency routing excluded"}
+        if self.config.recovery_qualification or self.config.recovery_bridges or self.config.recovery_midpoints:
+            result['recovery_gimbal_assignment'] = {
+                'version': 1,
+                'initial_pitch': 'Alternate existing pitch endpoints by occurrence within each recovery scenario.',
+                'segment_pitch': 'Retain the existing alternating segment schedule from each assigned endpoint.',
+                'randomness': 'No additional random draws; this balances targets, not all native birth/DR states.',
+            }
         if self.config.recovery_qualification:
             result['randomness'] = ('Native birth, handoff and segment RNG draws remain unchanged; '
                 'recovery requests inside the qualification budget use the pre-authored stationary override. '
@@ -342,11 +439,23 @@ class FixedCourseScenarios:
                 'budget_clock': 'Policy-owned physical ticks from each recovery birth; successful certification does not release the fixed command early.',
                 'timeout_s': self.qualification_timeout_s,
                 'randomness': 'Native handoff/segment RNG and underlying trajectories remain unchanged; only admitted requests inside the qualification window are overridden.'}
+        if self.config.recovery_bridges or self.config.recovery_midpoints:
+            result['recovery_birth_variants'] = {
+                'scope': 'Original endpoints and explicit 45/60/75-degree side-roll cases are reported separately.',
+                'evaluation_override': 'This opt-in fixed plan supersedes the source receipt description of the default sixteen-pose evaluation; the pinned training birth geometry is unchanged.',
+                'placement': 'Existing RecoveryPoseCompiler and collision geometry; no rotation of an old root height.',
+                'row_variant': [self.scenarios[name].get('recovery_variant', self.scenarios[name]['posture'])
+                                for name in self.row_names],
+            }
+            if self.config.recovery_midpoints:
+                result['recovery_birth_variants']['scope'] = (
+                    'Original endpoints and explicit bridge/midpoint cases are reported separately; '
+                    'midpoints are side 82.5 and pitch 67.5 degrees, not certified recovery skills.')
         return result
 
 
 class CourseEvaluation:
-    """Aggregate actual pre-reset endpoints, distinct from requested coverage."""
+    """Aggregate native events and pre-reset intervals, not requested coverage."""
 
     def __init__(self, adapter, configuration=None):
         self.adapter = adapter
@@ -357,6 +466,8 @@ class CourseEvaluation:
         self.recovery_phase_buckets = {}
         self.recovery_evidence = None
         self.jump_evidence = None
+        self.stair_request_evidence = None
+        self.stationary_evidence = None
         self._hook_restore = []
         self._authored_pending = None
         self._active = False
@@ -372,6 +483,17 @@ class CourseEvaluation:
             self.phase_buckets = {}
             self.recovery_phase_buckets = {}
             self._install_authored_evidence()
+            if (set(StationaryEvaluation.FIELDS) <= {field.name for field in schema.state_fields}
+                    and hasattr(self.adapter.env, '_commands')):
+                from transformer_rl.formal.control.observation import CommandMode
+                self.stationary_evidence = StationaryEvaluation(
+                    schema, self.plan.row_names, normal_mode=int(CommandMode.NORMAL))
+            course = self.adapter.env._terrain_course
+            if (getattr(course, 'stair_requests', None) is not None
+                    and hasattr(course, '_tof_command')
+                    and hasattr(getattr(course, 'tof_trigger', None), 'last_riser_xy')):
+                self.stair_request_evidence = StairRequestEvaluation(self.adapter.env, self.plan.row_names)
+                self.stair_request_evidence.install()
             if getattr(self.adapter.env._terrain_course, 'recovery', None) is not None:
                 options = ({'qualification_commands': self.plan.qualification_commands,
                             'qualification_clock': self.plan.qualification_clock}
@@ -398,6 +520,8 @@ class CourseEvaluation:
                 'routed_step_height_m': router.step_table[tile].detach().clone(),
                 'routed_slope_rad': router.slope_table[tile].detach().clone(),
                 'routed_roughness_m': router.roughness_table[tile].detach().clone()}
+        if self.stationary_evidence is not None:
+            result['stationary_admitted_command'] = self.adapter.env._commands().admitted_body_command.detach().clone()
         if self.recovery_evidence is not None:
             result.update(self.recovery_evidence.sample())
         return result
@@ -439,6 +563,8 @@ class CourseEvaluation:
 
     def close(self):
         """Restore only evaluation wrappers, also when a rollout raises."""
+        if self.stair_request_evidence is not None:
+            self.stair_request_evidence.close()
         if self.jump_evidence is not None:
             self.jump_evidence.close()
         if self.recovery_evidence is not None:
@@ -489,6 +615,9 @@ class CourseEvaluation:
             "valid_samples": 0, "invalid_count": 0, "nonfinite_measurement_count": 0,
             "policy_owned_samples": 0, "jump_physical_success_events": 0,
             "recovery_physical_success_events": 0, "actual": {},
+            "jump_physical_success_events_raw": 0, "jump_physical_success_events_excluded": 0,
+            "recovery_physical_success_events_raw": 0, "recovery_physical_success_events_excluded": 0,
+            "jump_endpoint_success_samples": 0, "recovery_endpoint_verified_rises": 0,
             "tracking_absolute_sum": [0., 0., 0.], "tracking_square_sum": [0., 0., 0.],
             "tracking_clipped_absolute_sum": [0., 0., 0.],
             "tracking_samples": 0, "command_min": None, "command_max": None}
@@ -535,12 +664,29 @@ class CourseEvaluation:
             for value in context.values():
                 finite &= torch.isfinite(value).reshape(len(reward), -1).all(-1)
         valid = transition.valid.detach().cpu() & finite
+        if self.stationary_evidence is not None:
+            self.stationary_evidence.observe_transition(transition, tracking, valid)
+        physical_events = [[] for _ in self.plan.row_names]
         if self.recovery_evidence is not None:
-            self.recovery_evidence.observe_transition(transition, valid)
+            for event in self.recovery_evidence.observe_transition(transition, valid):
+                physical_events[event['env_id']].append(('recovery', event))
         if self.jump_evidence is not None:
-            self.jump_evidence.observe_transition(transition, valid)
+            for event in self.jump_evidence.observe_transition(transition, valid):
+                physical_events[event['env_id']].append(('jump', event))
         for row, name in enumerate(self.plan.row_names):
             total_bucket = self.buckets.setdefault(name, self._empty_bucket())
+            if authored is not None:
+                # A reset can end one attempt and start another on an invalid
+                # transition. Retain the native lifecycle ledger separately;
+                # its completion flags are not trusted capability evidence.
+                keys = ('started', 'ended', 'complete', 'ended_complete', 'incomplete')
+                ledgers = ['authored_whole_course_raw']
+                if not valid[row]:
+                    ledgers.append('authored_whole_course_excluded')
+                for ledger in ledgers:
+                    events = total_bucket.setdefault(ledger, dict.fromkeys(keys, 0))
+                    for key, occurrences in zip(keys, authored[row].tolist()):
+                        events[key] += occurrences
             if not owned[row]:
                 phase = 'script_owned'
             elif context is None:
@@ -555,6 +701,21 @@ class CourseEvaluation:
                     'post_handoff_tracking' if context['recovery_after_handoff'][row] else 'other')
                 recovery_phases = self.recovery_phase_buckets.setdefault(name, {})
                 row_buckets.append(recovery_phases.setdefault(recovery_phase, self._empty_bucket()))
+            for kind, event in physical_events[row]:
+                event_buckets = row_buckets
+                if not event['interval_matches_episode']:
+                    # Preserve raw scenario counts without assigning a stale
+                    # event to this newborn episode's command/recovery phase.
+                    event_buckets = [total_bucket, phases.setdefault(
+                        'unattributed_physical_events', self._empty_bucket())]
+                    if context is not None and 'recovery_active' in context:
+                        event_buckets.append(recovery_phases.setdefault(
+                            'unattributed_physical_events', self._empty_bucket()))
+                field = f'{kind}_physical_success_events'
+                for bucket in event_buckets:
+                    bucket[field + '_raw'] += 1
+                    bucket[field] += int(event['validated_event'])
+                    bucket[field + '_excluded'] += int(not event['validated_event'])
             for bucket in row_buckets:
                 # Preserve the original observed-sample count. Every capability
                 # numerator and error denominator below uses only trusted rows.
@@ -567,7 +728,7 @@ class CourseEvaluation:
                 if context is not None:
                     terrain = bucket.setdefault('routed_terrain_ranges', {})
                     for key, value in context.items():
-                        if key not in ('command_source', 'recovery_active', 'recovery_after_handoff'):
+                        if key not in ('command_source', 'recovery_active', 'recovery_after_handoff', 'stationary_admitted_command'):
                             self._record_range(terrain, key, value[row])
                 bucket["reward_sum"] += float(reward[row])
                 bucket["terminated"] += int(terminated[row])
@@ -581,9 +742,9 @@ class CourseEvaluation:
                     for key, occurrences in zip(events, authored[row].tolist()):
                         events[key] += occurrences
                 if jump is not None:
-                    bucket["jump_physical_success_events"] += int(jump[row] > .5)
+                    bucket["jump_endpoint_success_samples"] += int(jump[row] > .5)
                 if recovered_end is not None and recovered_start is not None:
-                    bucket["recovery_physical_success_events"] += int((recovered_end[row] > .5) & (recovered_start[row] <= .5))
+                    bucket["recovery_endpoint_verified_rises"] += int((recovered_end[row] > .5) & (recovered_start[row] <= .5))
                 for key, values in actual.items():
                     if key == "tracking":
                         bucket["tracking_samples"] += 1
@@ -680,8 +841,11 @@ class CourseEvaluation:
                 "native_final_metrics": after,
                 "validity_semantics": "samples counts all observed intervals; valid_samples excludes transition.valid=false or nonfinite measured rows; all capability, reward, range and tracking statistics exclude those invalid rows",
                 "native_counter_semantics": "raw upstream aggregate counters, including invalid/reset events; not the validity-filtered per-case capability statistics",
+                "physical_event_observers": {"jump": self.jump_evidence is not None,
+                                             "recovery": self.recovery_evidence is not None},
+                "physical_event_semantics": "Physical success events come only from native certification: jump at its physics substep, recovery at finish_interval using physical evidence. Each episode/request (jump) or episode (recovery) is counted once. Validated events require a matching valid completed interval and no prior invalid interval/nonfinite physical tick through certification. Raw and excluded counts retain uncertified attribution. Phase uses that interval's pre-action producer; unmatched episode events use unattributed_physical_events with no sample denominator. Recovery certification is distinct from later native handoff or independent stationary qualification. Endpoint success samples/verified rises are diagnostic snapshots, never event counts or a fallback when an observer is absent.",
                 "clipped_mae_reference": "Radiant 0bf3456 clip bounds only; native coordinates and sample weighting differ from its first-episode trajectory-weighted evaluation",
-                "success_semantics": "per-case native jump pulse/recovery rising edge/authored observe-finish-reset events; global counters are separate and never apportioned to cases",
+                "success_semantics": "per-case native jump/recovery certification events captured before advancement/reset clears their flags; authored observe-finish-reset events remain separate; global counters are never apportioned to cases",
                 "scope": "observed intervals only; empty buckets and incomplete events are not demonstrated capabilities"}
         if self.recovery_evidence is not None:
             report['recovery_diagnostics'] = self.recovery_evidence.summary()
@@ -691,6 +855,18 @@ class CourseEvaluation:
                 'Phase totals partition observed samples, not certified skill successes.')
         if self.jump_evidence is not None:
             report['jump_diagnostics'] = self.jump_evidence.summary()
+        if self.stationary_evidence is not None:
+            report['stationary_diagnostics'] = self.stationary_evidence.summary()
+        if self.stair_request_evidence is not None:
+            report['stair_request_diagnostics'] = self.stair_request_evidence.summary()
+        if self._authored_pending is not None:
+            report['authored_counter_semantics'] = (
+                'authored_whole_course uses valid transition endpoints only. '
+                'authored_whole_course_raw preserves all native per-row lifecycle events, '
+                'including reset births and ends on invalid intervals; '
+                'authored_whole_course_excluded is their invalid-interval subset. '
+                'Raw completion flags are not certified successes. These are separate '
+                'ledgers, not a success numerator and denominator to divide together.')
         if self.config.recovery_qualification:
             report['command_phase_semantics'] += (
                 ' With recovery_qualification enabled, scheduled_segment also includes the fixed '

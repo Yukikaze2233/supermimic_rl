@@ -39,8 +39,8 @@ def tick(env, *, height=.32, vz=0., load=20., angular=0., tilt=0., dt=.005):
 def boundary(evidence, *, valid=True, episode=0):
     n = len(evidence.row_names)
     endpoints = SimpleNamespace(episode_id=torch.full((n,), episode, dtype=torch.long))
-    evidence.observe_transition(SimpleNamespace(start=endpoints, end=endpoints),
-                                torch.full((n,), valid, dtype=torch.bool))
+    return evidence.observe_transition(SimpleNamespace(start=endpoints, end=endpoints),
+                                       torch.full((n,), valid, dtype=torch.bool))
 
 
 def test_physical_substeps_distinguish_micro_unload_from_peak_and_noise_stability():
@@ -57,6 +57,9 @@ def test_physical_substeps_distinguish_micro_unload_from_peak_and_noise_stabilit
     report = evidence.summary()
     micro, quiet, noisy = report['requests']
     assert all(row['flight_seen'] for row in (micro, quiet, noisy))
+    assert all(row['max_continuous_both_wheels_unloaded_s'] == pytest.approx(.01)
+               for row in (micro, quiet, noisy))
+    assert all(row['max_minimum_wheel_clearance_m'] is None for row in (micro, quiet, noisy))
     assert not micro['ascent_seen'] and not micro['peak_in_target_window']
     assert micro['peak_rise_m'] == pytest.approx(.001, abs=1e-7)
     assert micro['physical_end_reason'] == 'active_at_evaluation_end'
@@ -213,6 +216,10 @@ def test_reset_preserves_pre_reset_summary_and_next_episode_does_not_inherit_evi
     new = report['requests'][1]
     assert new['episode_id'] == 1 and new['request_id'] == 5
     assert new['peak_rise_m'] == 0 and not new['flight_seen']
+    assert new['max_continuous_both_wheels_unloaded_s'] == 0
+    assert new['total_both_wheels_unloaded_s'] == 0
+    assert new['wheel_clearance_observed_ticks'] == 0
+    assert new['max_minimum_wheel_clearance_while_unloaded_m'] is None
     assert new['physical_end_reason'] == 'active_at_evaluation_end'
     evidence.close()
 
@@ -229,6 +236,95 @@ def test_final_substep_success_requires_observed_valid_boundary():
         tick(env)
     row = evidence.summary()['requests'][0]
     assert row['native_verified_physical_success'] and not row['validated_boundary']
-    boundary(evidence)
+    assert evidence.summary()['physical_success_events'][0]['validated_event'] is None
+    events = boundary(evidence)
+    assert len(events) == 1 and events[0]['validated_event']
     assert evidence.summary()['requests'][0]['validated_boundary']
+    evidence.close()
+
+
+@pytest.mark.parametrize('boundary_valid', [True, False])
+@pytest.mark.parametrize('next_state', ['cleared', 'replacement', 'reset'])
+def test_native_success_event_survives_clearing_replacement_and_reset(next_state, boundary_valid):
+    from supermimic_rl.course.curriculum import SuperMimicCurriculum
+    from transformer_rl.formal.lab_env.formal_curriculum import LabTaskDrawSampler
+
+    env = environment()
+    tasks = env._terrain_course.tasks
+    evidence = JumpEvaluation(env, ['jump'])
+    evidence.install()
+    try:
+        advance(env, request=4)
+        for _ in range(2):
+            tick(env, height=.38, vz=.4, load=0.)
+        for _ in range(401):
+            tick(env)
+        assert tasks.physical_outcome_counts[0] == 1
+        if next_state == 'reset':
+            ids = torch.arange(1)
+            draw = LabTaskDrawSampler(SuperMimicCurriculum(1))(ids)
+            tasks.reset(ids, draw, env.time, terrain_kind=draw.terrain_kind)
+            env._episode_id += 1
+        elif next_state == 'replacement':
+            advance(env, cancel=4)
+            advance(env, request=5)
+            assert tasks.physical_id.item() == 5
+        else:
+            advance(env)
+        assert tasks.success_id.item() == -1
+        # Even when native auto-reset already published a newborn ID, the
+        # completed transition still contains the old pre-reset endpoint.
+        events = boundary(evidence, valid=boundary_valid, episode=0)
+        assert len(events) == 1
+        event = events[0]
+        assert (event['episode_id'], event['request_id']) == (0, 4)
+        assert event['interval_matches_episode']
+        assert event['validated_event'] is boundary_valid
+        assert boundary(evidence, episode=int(env._episode_id[0])) == []
+        records = evidence.summary()['requests']
+        assert records[0]['native_verified_physical_success']
+        if next_state == 'replacement':
+            assert not records[1]['native_verified_physical_success']
+    finally:
+        evidence.close()
+
+
+def test_unloading_excludes_birth_and_breaks_on_unowned_invalid_and_supported_ticks():
+    env = environment()
+    course = env._terrain_course
+    course.wheel_ground = torch.tensor([[.10, .20]])
+    course._support_sample = SimpleNamespace(
+        wheel_bottom_world_z_m=torch.tensor([[.18, .202]]), valid=torch.tensor([True]))
+    evidence = JumpEvaluation(env, ['jump'])
+    evidence.install()
+    for _ in range(20):
+        tick(env, load=0.)
+    # Establish supported native acceptance after the unrequested spawn drop.
+    tick(env)
+    advance(env, request=0)
+    for _ in range(3):
+        tick(env, load=0.)
+    env._interval_policy_owned.fill_(False)
+    tick(env, load=0.)
+    env._interval_policy_owned.fill_(True)
+    for _ in range(2):
+        tick(env, load=0.)
+    tick(env)
+    tick(env, load=0.)
+    tick(env, load=float('nan'))
+    for _ in range(2):
+        tick(env, load=0.)
+    # Invalid geometry is unavailable, not a fabricated clearance maximum.
+    course._support_sample.valid.fill_(False)
+    course._support_sample.wheel_bottom_world_z_m.fill_(100.)
+    tick(env, load=0.)
+    row = evidence.summary()['requests'][0]
+    assert row['max_continuous_both_wheels_unloaded_s'] == pytest.approx(.015)
+    assert row['total_both_wheels_unloaded_s'] == pytest.approx(.045)
+    assert row['max_minimum_wheel_clearance_m'] == pytest.approx(.002, abs=1e-7)
+    assert row['max_minimum_wheel_clearance_while_unloaded_m'] == pytest.approx(.002, abs=1e-7)
+    assert row['wheel_clearance_observed_ticks'] == 9
+    assert row['nonfinite_physical_ticks'] == 1
+    assert row['non_policy_owned_physical_ticks'] == 1
+    assert not row['native_verified_physical_success']
     evidence.close()

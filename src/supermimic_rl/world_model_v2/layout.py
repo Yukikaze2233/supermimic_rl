@@ -18,6 +18,7 @@ from .physical import POSITION_JOINTS, VELOCITY_JOINTS, PhysicalState, increment
 from .records import (CONTACT_BODIES, FORBIDDEN_BODIES, RESULTANT_BODIES, PASSIVE_KNEE_JOINTS,
                       Memory, encode_memory, encode_physical, encode_queues)
 from .sensing import SensorQueues
+from .disturbance import DISTURBANCE_STATE_FIELDS
 
 def _names(frame: str, kind: str) -> tuple[str, ...]:
     match = re.search(rf"native {kind} order: ([^;]+)", frame)
@@ -52,7 +53,10 @@ class SnapshotLayout:
     CONTEXT_FIELDS = ("body_mass_kg", "requested.motor_strength", "requested.pd_encoder_bias_rad",
                       "wheel_material", "identified.wheel_total_inertia_kg_m2")
 
-    def __init__(self, schema: StateSchema, *, record_terrain: bool = False):
+    def __init__(self, schema: StateSchema, *, record_terrain: bool = False,
+                 record_platform: bool = False):
+        if any(field.name == 'requested.wheel_aggregate_delay_s' for field in schema.context_fields):
+            raise ValueError('World model v2 assumes fixed wheel delay; episode delay DR is currently PPO-only')
         if not schema.substep_fields:
             raise ValueError("v2 requires recorded substep truth (record_substeps=true)")
         self.schema = schema
@@ -61,6 +65,16 @@ class SnapshotLayout:
         if record_terrain and any(name not in self.state for name in ('course.terrain_tile', 'course.tasks.family')):
             raise ValueError('Terrain records require the actual native tile assignment and task family')
         self.substep = _Fields(schema.substep_fields)
+        self.record_platform = record_platform
+        contact = self.substep.slices.get('contact_measurement_valid')
+        if type(record_platform) is not bool or (record_platform and (
+                schema.substeps_per_step != 4 or contact is None or contact[1] != (1,))):
+            raise ValueError('Platform collection needs four scalar native contact-valid ticks')
+        disturbance_fields = [name in self.state for name in DISTURBANCE_STATE_FIELDS]
+        disturbance_fields += [name in self.substep for name in ("velocity_push_world", "external_wrench_body")]
+        if any(disturbance_fields) and not all(disturbance_fields):
+            raise ValueError("Disturbance records require both scheduler state and issued substep conditions")
+        self.record_disturbances = all(disturbance_fields)
         frames = {field.name: field.frame for field in schema.state_fields}
         self.joint_names = _names(frames["joint_velocity_native"], "joint")
         substep_frames = {field.name: field.frame for field in schema.substep_fields}
@@ -147,7 +161,7 @@ class SnapshotLayout:
 
     # -- compact records ------------------------------------------------------------
     def encode(self, transition) -> dict[str, Tensor]:
-        """One packed ``Transition`` -> the compact v2 record (all float32 ``[N, ...]``)."""
+        """One packed transition -> compact records, including opt-in typed evidence."""
         start, end = transition.start, transition.end
         state, context = start.state, start.context
         physical = self.physical(state)
@@ -213,4 +227,13 @@ class SnapshotLayout:
         if self.record_terrain:
             record['terrain_tile'] = get('course.terrain_tile').reshape(-1, 1)
             record['task_family'] = get('course.tasks.family').reshape(-1, 1)
+        if self.record_platform:
+            record['contact_valid_ticks'] = self.substep(
+                transition.substeps, 'contact_measurement_valid').eq(1)
+        if self.record_disturbances:
+            record['disturbance'] = self.state.flat(state, DISTURBANCE_STATE_FIELDS)
+            record['end_disturbance'] = self.state.flat(end.state, DISTURBANCE_STATE_FIELDS)
+            record['velocity_push'] = self.substep(transition.substeps, 'velocity_push_world')[:, 0]
+            record['external_wrench'] = self.substep(transition.substeps, 'external_wrench_body')
+            record['disturbance_record_valid'] = state.new_ones(state.shape[0], 1)
         return record

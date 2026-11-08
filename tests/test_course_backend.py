@@ -40,6 +40,20 @@ def test_kamino_identity_adds_only_explicit_constraint_overrides(monkeypatch):
     assert tuned.identity["kamino_constraints"] == {"joint_alpha": .3}
 
 
+def test_identified_friction_mode_is_opt_in_and_rejects_unsupported_backend():
+    runtime = {"physics": {"solver_position_iterations": 64, "solver_velocity_iterations": 16}}
+    legacy = select_course_backend(backend("physx"), runtime, {})
+    native = select_course_backend(backend("physx"), runtime, {"identified_friction_mode": "native_floor"})
+    assert legacy.identified_friction_mode == "software_dynamic"
+    assert native.identified_friction_mode == "native_floor"
+    assert legacy.identity == native.identity  # Execution receipt owns this difference.
+    with pytest.raises(ValueError, match="Kamino cannot express"):
+        select_course_backend(backend("kamino"), runtime, {"identified_friction_mode": "native_floor"})
+    for value in (None, True, "static_only", {}):
+        with pytest.raises(ValueError, match="identified_friction_mode"):
+            select_course_backend(backend("physx"), runtime, {"identified_friction_mode": value})
+
+
 class LogHealth:
     def __init__(self):
         self.closed = False

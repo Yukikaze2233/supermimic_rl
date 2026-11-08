@@ -62,6 +62,10 @@ class AtlasTerrain:
             pin = manifest['files'][name]
             if len(payload) != pin['bytes'] or hashlib.sha256(payload).hexdigest() != pin['sha256']:
                 raise ValueError('Imagined terrain payload differs: ' + name)
+        # The native query keeps the device object verbatim. Resolve aliases
+        # (cuda -> cuda:<current>, cpu:0 -> cpu) before both producers allocate,
+        # so strict device checks still reject genuinely different devices.
+        device = torch.empty(0, device=device).device
         query = StaticTerrainQuery(path.parent / 'geometry.npz', path.parent / 'query_index.npz', device=device)
         origins = torch.tensor([tile['origin_m'] for tile in manifest['tiles']], device=query.device)
         return cls(query, origins, manifest_sha256=expected_sha256)

@@ -1,12 +1,13 @@
 """Identified execution at the pinned full-vehicle environment's effort boundary.
 
 The parent owns action latching, controller feedback, curriculum, gimbal and
-reset behavior. A temporary transparent robot proxy intercepts only its final
-native effort write. This module never mutates the scene's articulation.
+reset behavior. A temporary transparent robot proxy intercepts its final
+native effort write. Numerically rejected rows are parked until normal reset.
 """
 from __future__ import annotations
 
 from dataclasses import dataclass
+import hashlib
 import json
 import math
 from types import SimpleNamespace
@@ -61,6 +62,56 @@ not native readback. Passive-joint damping and auxiliary actuators stay intact.
                 modified_actuator_groups=list(dict.fromkeys(name for name, _, _ in selected)),
                 declarative_scene_copy_updated=len(robot_configs) == 2,
                 native_readback_required=True)
+
+
+def read_identified_native_friction(robot, execution: IdentifiedExecution, *, backend: str) -> dict:
+    """Verify the solver's properties, not the actuator configuration/cache.
+
+    The current PhysX tensor API reports [static effort, dynamic effort,
+    viscous coefficient] in backend joint order. The first two are N.m for
+    these revolute axes (Isaac Sim 5+), not legacy dimensionless coefficients.
+    This reads all six active axes so an unintended leg friction term is also
+    detected. Passive joints and the independent gimbal remain unmodified.
+    """
+    if backend != "physx" or execution.friction_mode != "native_floor":
+        raise ValueError("Native-floor readback requires the explicit PhysX friction mode")
+    view = robot.root_view
+    names = tuple(view.shared_metatype.dof_names)
+    if len(set(names)) != len(names) or set(names) != set(robot.joint_names):
+        raise ValueError("PhysX friction readback joint names differ from the articulation")
+    values = view.get_dof_friction_properties()
+    values = getattr(values, "torch", values)
+    if not isinstance(values, Tensor):
+        import warp
+
+        values = warp.to_torch(values)
+    if values.shape != (execution.count, len(names), 3):
+        raise ValueError("PhysX friction readback requires all environments, joints and three components")
+    indices = torch.tensor([names.index(name) for name in ACTION_ORDER], device=values.device)
+    actual = values.index_select(1, indices).detach().clone()
+    fields = ("friction", "dynamic_friction", "viscous_friction")
+    parameters = execution.native_parameters()
+    expected = actual.new_tensor([[parameters[name][field] for field in fields] for name in ACTION_ORDER])
+    if (not torch.isfinite(actual).all()
+            or not torch.allclose(actual, expected.expand_as(actual), rtol=1e-6, atol=1e-8)):
+        raise RuntimeError("PhysX identified joint friction readback differs from the pinned model")
+    actual = actual.cpu().contiguous()
+    return {
+        "contract": "physx_identified_native_friction_readback_v1", "verified": True,
+        "reader": "robot.root_view.get_dof_friction_properties",
+        "joint_order": list(ACTION_ORDER), "component_order": list(fields),
+        "units": ["N.m", "N.m", "N.m/(rad/s)"], "environment_count": execution.count,
+        "requested": expected.cpu().tolist(),
+        "actual_min": actual.amin(0).tolist(), "actual_max": actual.amax(0).tolist(),
+        "actual_sha256": hashlib.sha256(actual.numpy().tobytes()).hexdigest(),
+        "static_identification": [{
+            "joint": name, "nominal_nm": row["static_breakaway_nominal_nm"],
+            "observed_interval_nm": row["static_breakaway_observed_interval_nm"],
+            "exactly_identified": row["static_breakaway_exactly_identified"],
+        } for name, row in zip(ACTION_ORDER[4:], execution.wheel_rows)],
+        "scope": "Wheel static/dynamic solver ownership; leg static friction remains unidentified and zero",
+        "dynamics_validated": False,
+    }
 
 
 @dataclass(frozen=True)
@@ -133,6 +184,8 @@ class _EffortIntercept:
             target.index_select(1, indices), velocity, motor_enabled=enabled)
         applied = target.clone()
         applied.index_copy_(1, indices, self.result.native_effort_nm)
+        if env._numerical_had_event:
+            applied[env._numerical_invalid] = 0.
         self.calls += 1
         return self.native.set_joint_effort_target(applied)
 
@@ -147,6 +200,7 @@ def make_environment(base_type, execution: IdentifiedExecution):
             self._numerical_invalid = None
             self._numerical_had_event = False
             self._numerical_invalid_total = 0
+            self._numerical_start_pose = self._numerical_start_position = None
             super().__init__(*args, **kwargs)
             if (self.num_envs != execution.count or self._device != execution.device
                     or abs(float(self.physics_dt) - execution.dt) > 1e-12):
@@ -169,20 +223,20 @@ def make_environment(base_type, execution: IdentifiedExecution):
             install_newton_coordinates(self)
             self._numerical_invalid = torch.zeros(self.num_envs, dtype=torch.bool, device=self._device)
             self.numerical_isolation_receipt = {
-                'contract': 'physx_finite_coordinate_sampling_row_isolation_v2',
+                'contract': 'physx_finite_coordinate_sampling_row_isolation_v3',
                 'native_period_rad': 2 * math.tau,
                 'scope': 'finite ambiguous position/speed samples; reject the entire policy interval',
-                'invalid_reader_velocity': 'zero-filled copy for already rejected rows only',
-                'native_state_modified': False, 'unknown_or_nonfinite_errors': 'raise',
+                'rejected_rows': 'restore interval-start pose/joints with zero velocity, then normal episode reset',
+                'native_state_modified': 'rejected rows only; never used for learning',
+                'unknown_or_nonfinite_errors': 'raise',
             }
 
         def _joint_positions(self):
             try:
                 return super()._joint_positions()
             except RuntimeError as error:
-                # Only these pinned reader failures have an attributable
-                # finite row mask and can be repaired without inventing a
-                # physical state or changing the native 4*pi representation.
+                # These pinned reader failures identify the finite bad rows.
+                # Healthy rows retain the native 4*pi coordinate decoder.
                 if str(error) not in (
                         'continuous joint position increment is ambiguous',
                         'continuous joint state is nonfinite or angular sampling is ambiguous'):
@@ -230,10 +284,6 @@ def make_environment(base_type, execution: IdentifiedExecution):
                 self._numerical_invalid[rows] = True
                 self._numerical_had_event = True
                 self._terminated[rows] = True
-                # This seeds only the decoder cache. The simulator's joint
-                # coordinates/velocities and controller limits stay untouched;
-                # the normal end-of-policy-step reset removes the invalid row.
-                reader.reset_rows(rows, position.index_select(0, rows))
                 pairs = bad.nonzero()[:16]
                 self._numerical_last_event = {
                     'event': 'numerical_interval_rejected', 'physical_tick': self._physical_tick,
@@ -248,18 +298,38 @@ def make_environment(base_type, execution: IdentifiedExecution):
                     'invalid_intervals_total': self._numerical_invalid_total,
                 }
                 print(json.dumps(self._numerical_last_event), flush=True)
-                # Velocity only gates the encoder's sampling ambiguity; it is
-                # not integrated by this reader. Previously rejected rows and
-                # new failures get finite decoder padding until normal reset.
-                # Native physics/sample velocity remains the original tensor,
-                # and the entire interval is excluded from both PPO and replay.
-                reader_velocity = velocity.clone()
-                reader_velocity[self._numerical_invalid] = 0.
-                return reader.read(position, reader_velocity, self._physical_tick)
+                self._park_numerical_rows(rows)
+                return reader.read(self._as_torch(self.robot.data.joint_pos),
+                                   self._as_torch(self.robot.data.joint_vel), self._physical_tick)
+
+        def _park_numerical_rows(self, rows):
+            # Waiting for the policy boundary lets a failed articulation turn
+            # into NaNs during the remaining physics ticks. Restore only its
+            # last finite pose now. Keep task/reward identity until normal
+            # reset: the whole transition is already excluded from learning.
+            position = self._numerical_start_position.index_select(0, rows)
+            pose = self._numerical_start_pose.index_select(0, rows)
+            self.robot.write_root_link_pose_to_sim_index(root_pose=pose, env_ids=rows)
+            self.robot.write_root_com_velocity_to_sim_index(
+                root_velocity=pose.new_zeros(len(rows), 6), env_ids=rows)
+            self.robot.write_joint_position_to_sim_index(position=position, env_ids=rows)
+            self.robot.write_joint_velocity_to_sim_index(velocity=torch.zeros_like(position), env_ids=rows)
+            self._joint_coordinates.reset_rows(rows, position)
+            self.scene.write_data_to_sim()
+            self.sim.forward()
+            self.scene.update(dt=0.)
+
+        def _observe_substep(self):
+            # Resolve a failed joint row before terrain queries dereference its
+            # root/wheel poses. The parent otherwise queries terrain first.
+            self._joint_positions()
+            return super()._observe_substep()
 
         def _pre_physics_step(self, actions):
             self._numerical_invalid.zero_()
             self._numerical_had_event = False
+            self._numerical_start_position = self._as_torch(self.robot.data.joint_pos).clone()
+            self._numerical_start_pose = torch.cat((self._root_link_position(), self._root_link_quat()), -1)
             return super()._pre_physics_step(actions)
 
         def step(self, action):

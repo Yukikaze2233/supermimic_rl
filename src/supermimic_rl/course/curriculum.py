@@ -68,6 +68,9 @@ class CourseCurriculumConfig:
     foundation_terrain_kinds: tuple[str, ...] = (
         "FLAT", "SLOPE", "ROUGH", "STEP_UP", "STEP_DOWN", "MATERIAL",
     )
+    # Positive integer quotas in one deterministic terrain-family cycle.
+    # Empty retains the original one-slot-per-kind order and source identity.
+    foundation_terrain_kind_weights: dict[str, int] = field(default_factory=dict)
     full_terrain_kinds: tuple[str, ...] = tuple(kind.name for kind in TerrainKind)
     mixture_blend_fraction: float = .25
     jump_standing_fraction_of_stage: float = .25
@@ -85,6 +88,14 @@ class CourseCurriculumConfig:
     # may draw it}. Postures absent from the map use the first stage. Empty keeps
     # every configured posture from the first recovery birth on.
     recovery_posture_stages: dict = field(default_factory=dict)
+    # Reuse a periodic share of STEP_UP births for the two named authored
+    # assets. The default retains the original one-in-five birth quota.
+    foundation_authored_rehearsal: bool = False
+    foundation_authored_rehearsal_every: int = 5
+    # Six intermediate side-roll births replace alternate easy-pose slots;
+    # original difficult-pose and task-family shares remain unchanged.
+    recovery_roll_bridge: bool = False
+    recovery_midpoint_bridge: bool = False
 
     def __post_init__(self):
         budgets = tuple(self.stage_transition_budgets)
@@ -127,6 +138,12 @@ class CourseCurriculumConfig:
                     or not set(required) <= set(values)):
                 raise ValueError("Missing or invalid named course coverage: " + name)
             object.__setattr__(self, name, values)
+        terrain_weights = self.foundation_terrain_kind_weights
+        if (not isinstance(terrain_weights, dict)
+                or (terrain_weights and set(terrain_weights) != set(self.foundation_terrain_kinds))
+                or any(type(value) is not int or value < 1 for value in terrain_weights.values())):
+            raise ValueError('Foundation terrain weights must give every named kind a positive integer quota')
+        object.__setattr__(self, 'foundation_terrain_kind_weights', dict(terrain_weights))
         for name in ("mixture_blend_fraction", "jump_standing_fraction_of_stage",
                      "jump_full_motion_fraction_of_stage", "moving_jump_min_fraction"):
             value = getattr(self, name)
@@ -152,6 +169,17 @@ class CourseCurriculumConfig:
                 or any(stage not in STAGE_NAMES for stage in stages.values())):
             raise ValueError("recovery_posture_stages maps configured postures to course stages")
         object.__setattr__(self, "recovery_posture_stages", stages)
+        if type(self.foundation_authored_rehearsal) is not bool:
+            raise ValueError("foundation_authored_rehearsal must be boolean")
+        if (type(self.foundation_authored_rehearsal_every) is not int
+                or self.foundation_authored_rehearsal_every < 1):
+            raise ValueError("foundation_authored_rehearsal_every must be a positive integer")
+        if type(self.recovery_roll_bridge) is not bool:
+            raise ValueError("recovery_roll_bridge must be boolean")
+        if type(self.recovery_midpoint_bridge) is not bool:
+            raise ValueError("recovery_midpoint_bridge must be boolean")
+        if self.recovery_midpoint_bridge and not self.recovery_roll_bridge:
+            raise ValueError("recovery_midpoint_bridge requires recovery_roll_bridge")
         if self.jump_standing_fraction_of_stage >= self.jump_full_motion_fraction_of_stage:
             raise ValueError("Jump moving exposure must follow standing exposure")
         object.__setattr__(self, "stage_transition_budgets", budgets)
@@ -169,7 +197,20 @@ class CourseCurriculumConfig:
         return cls(**value)
 
     def to_dict(self):
-        return json.loads(json.dumps(asdict(self)))
+        result = json.loads(json.dumps(asdict(self)))
+        # A disabled opt-in must preserve old checkpoint configuration identity.
+        if not self.foundation_terrain_kind_weights:
+            result.pop('foundation_terrain_kind_weights')
+        if not self.foundation_authored_rehearsal:
+            result.pop("foundation_authored_rehearsal")
+        # Existing enabled sources also omit the original fixed period.
+        if self.foundation_authored_rehearsal_every == 5:
+            result.pop("foundation_authored_rehearsal_every")
+        if not self.recovery_roll_bridge:
+            result.pop("recovery_roll_bridge")
+        if not self.recovery_midpoint_bridge:
+            result.pop("recovery_midpoint_bridge")
+        return result
 
 
 class _TransitionBudget:
@@ -231,6 +272,31 @@ class SuperMimicCurriculum(FormalTaskCurriculum):
             "family": [0] * len(TaskFamily), "terrain": [0] * len(TerrainKind),
             "recovery_posture": [0] * len(RECOVERY_NAMES), "jump_motion": [0, 0],
         }
+        self._recovery_birth_variant = None
+        self._pending_recovery_variant = None
+        if config.recovery_roll_bridge:
+            from .recovery_bridge import variant_names
+
+            self.sample_counts['recovery_posture'] = [0] * len(
+                variant_names(midpoints=config.recovery_midpoint_bridge))
+            self._recovery_birth_variant = torch.full((num_envs,), -1, dtype=torch.long, device=device)
+        # A reset samples then routes within the same call. This transient row
+        # receipt is never replayed across physical reset/checkpoint restore;
+        # the persisted terrain ordinal determines the next draw exactly.
+        self._foundation_authored_rows = (torch.zeros(num_envs, dtype=torch.bool, device=device)
+                                         if config.foundation_authored_rehearsal else None)
+        self._pending_foundation_authored = None
+        quotas = config.foundation_terrain_kind_weights
+        # Round-robin quota slots spread repeated kinds across the cycle.
+        # The unchanged terrain-family ordinal makes partial reset batches
+        # and resumed samplers use the same sequence without random draws.
+        cycle = [int(TerrainKind[name])
+                 for slot in range(max(quotas.values(), default=1))
+                 for name in config.foundation_terrain_kinds if slot < quotas.get(name, 1)]
+        self._foundation_terrain_pool = torch.tensor(cycle, dtype=torch.long, device=device)
+        step_up = self._foundation_terrain_pool == int(TerrainKind.STEP_UP)
+        self._foundation_step_up_count = cycle.count(int(TerrainKind.STEP_UP))
+        self._foundation_step_up_ordinal = step_up.to(torch.long).cumsum(0) - 1
 
     def set_progress(self, real_transitions, actor_updates):
         for name, value in (("real_transitions", real_transitions), ("actor_updates", actor_updates)):
@@ -309,6 +375,9 @@ class SuperMimicCurriculum(FormalTaskCurriculum):
         posture, terrain = draw.recovery_posture.clone(), draw.terrain_kind.clone()
         command, nominal = draw.requested_command.clone(), draw.nominal.clone()
         trajectory, step = draw.trajectory_kind.clone(), draw.step_up_m.clone()
+        rehearsal = (torch.zeros_like(draw.family, dtype=torch.bool)
+                     if self.config.foundation_authored_rehearsal else None)
+        variants = (torch.full_like(draw.family, -1) if self.config.recovery_roll_bridge else None)
         for family in (TaskFamily.RECOVERY, TaskFamily.TERRAIN, TaskFamily.REQUEST):
             rows = (draw.family == int(family)).nonzero().flatten()
             if not len(rows):
@@ -319,12 +388,16 @@ class SuperMimicCurriculum(FormalTaskCurriculum):
                 names = self.recovery_posture_pool()
                 pool = posture.new_tensor([RECOVERY_NAMES.index(name) for name in names])
                 posture[rows] = pool[ordinal % len(pool)]
+                if variants is not None:
+                    from .recovery_bridge import select_variants
+
+                    posture[rows], variants[rows] = select_variants(
+                        ordinal, posture[rows], names, midpoints=self.config.recovery_midpoint_bridge)
                 nominal[rows], trajectory[rows] = False, 0
             elif family == TaskFamily.TERRAIN:
-                names = (self.config.foundation_terrain_kinds
-                         if self.stage < self.stage_names.index('authored_steps')
-                         else self.config.full_terrain_kinds)
-                pool = terrain.new_tensor([int(TerrainKind[name]) for name in names])
+                foundation = self.stage < self.stage_names.index('authored_steps')
+                pool = (self._foundation_terrain_pool if foundation else terrain.new_tensor(
+                    [int(TerrainKind[name]) for name in self.config.full_terrain_kinds]))
                 terrain[rows] = pool[ordinal % len(pool)]
                 # Half the stair cycles request the declared endpoint exactly.
                 # The terrain router must still place the actual authored mesh.
@@ -335,11 +408,29 @@ class SuperMimicCurriculum(FormalTaskCurriculum):
                     ]))
                 if self.stage >= self.stage_names.index('authored_steps'):
                     step[rows[endpoint]] = self.domain.step_up_m[1]
+                if rehearsal is not None and self.stage_name == 'terrain_foundation':
+                    # Select a periodic share of the existing STEP_UP slots.
+                    # Divide by the same period to alternate the two assets
+                    # across batches and restores without extra random draws.
+                    # Count STEP_UP slots, not complete mixed-terrain cycles:
+                    # weighted cycles may contain several slots of this kind.
+                    cycle = ((ordinal // len(pool)) * self._foundation_step_up_count
+                             + self._foundation_step_up_ordinal[ordinal % len(pool)])
+                    every = self.config.foundation_authored_rehearsal_every
+                    selected = ((terrain[rows] == int(TerrainKind.STEP_UP)) & (cycle % every == 0))
+                    chosen = rows[selected]
+                    terrain[chosen] = torch.where((cycle[selected] // every) % 2 == 0,
+                                                 int(TerrainKind.STEP_UP), int(TerrainKind.TWO_PLATFORMS))
+                    step[chosen] = self.domain.step_up_m[1]
+                    rehearsal[chosen] = True
             else:
                 scale = self._request_motion_scale()
                 moving = (ordinal % 2 == 1) & (scale > 0)
                 command[rows, :3] *= scale
                 command[rows[~moving], :3] = 0
+                # Moving jumps go straight: the native success needs a quiet body
+                # angular speed (<= 0.5 rad/s), which a yaw command would prevent.
+                command[rows, 2] = 0
                 motion_rows = rows[moving]
                 if len(motion_rows):
                     domain = self._effective_domain()
@@ -350,6 +441,8 @@ class SuperMimicCurriculum(FormalTaskCurriculum):
                 nominal[rows], trajectory[rows] = False, 0
                 self.sample_counts["jump_motion"][0] += int((~moving).sum())
                 self.sample_counts["jump_motion"][1] += int(moving.sum())
+        self._pending_foundation_authored = rehearsal
+        self._pending_recovery_variant = variants
         return replace(draw, recovery_posture=posture, terrain_kind=terrain,
                        requested_command=command, nominal=nominal,
                        trajectory_kind=trajectory, step_up_m=step)
@@ -362,14 +455,66 @@ class SuperMimicCurriculum(FormalTaskCurriculum):
                 or ids.unique().numel() != len(ids)):
             raise ValueError("Reset IDs must be unique in-range integer environment indices")
         draw = super().sample(ids)
+        if self._foundation_authored_rows is not None:
+            self._foundation_authored_rows[ids] = self._pending_foundation_authored
+            self._pending_foundation_authored = None
+        if self._recovery_birth_variant is not None:
+            self._recovery_birth_variant[ids] = self._pending_recovery_variant
         for name, values in (
             ("family", draw.family),
             ("terrain", draw.terrain_kind[draw.family == int(TaskFamily.TERRAIN)]),
-            ("recovery_posture", draw.recovery_posture[draw.family == int(TaskFamily.RECOVERY)]),
+            ("recovery_posture", (draw.recovery_posture if self._pending_recovery_variant is None
+                                  else self._pending_recovery_variant)[draw.family == int(TaskFamily.RECOVERY)]),
         ):
             counts = torch.bincount(values, minlength=len(self.sample_counts[name])).cpu().tolist()
             self.sample_counts[name] = [a + b for a, b in zip(self.sample_counts[name], counts)]
+        self._pending_recovery_variant = None
         return draw
+
+    def recovery_birth_variants(self, ids):
+        """Actual latest birth labels, distinct from reused native base-pose IDs."""
+        if self._recovery_birth_variant is None:
+            raise ValueError('Recovery roll bridge is disabled')
+        labels = self._recovery_birth_variant[ids]
+        if (labels < 0).any():
+            raise ValueError('A recovery birth must have a current sampler label')
+        return labels.clone()
+
+    def recovery_birth_samples(self):
+        """Named cumulative reset draws, not measured placements or successes."""
+        names = RECOVERY_NAMES
+        if self.config.recovery_roll_bridge:
+            from .recovery_bridge import variant_names
+
+            names = variant_names(midpoints=self.config.recovery_midpoint_bridge)
+        return dict(zip(names, self.sample_counts['recovery_posture'], strict=True))
+
+    def foundation_authored_rehearsal_receipt(self):
+        if not self.config.foundation_authored_rehearsal:
+            return None
+        result = {
+            "contract": "foundation_authored_birth_rehearsal_v1",
+            "stage": self.stage_names.index('terrain_foundation'),
+            "source_slots": "STEP_UP in the configured foundation terrain cycle",
+            "slot_period": self.config.foundation_authored_rehearsal_every,
+            "asset_cycle": ["road_step", "central_steps"],
+            "requested_step_up_m": self.domain.step_up_m[1],
+            "selection": "persisted terrain-family ordinal; no extra random draws",
+            "other_routes": "native routing and its 20-percent ceiling exploration unchanged",
+            "cap_scope": "selected authored births only; ordinary level and step caps unchanged",
+        }
+        if self.config.foundation_terrain_kind_weights:
+            result['terrain_kind_weights'] = dict(self.config.foundation_terrain_kind_weights)
+            result['selection'] = 'persisted terrain-family ordinal with STEP_UP-local cadence; no extra random draws'
+        return result
+
+    def foundation_authored_rehearsal_rows(self, ids):
+        """Rows certified by their latest birth draw before synchronous routing."""
+        if self._foundation_authored_rows is None:
+            raise ValueError("Foundation authored rehearsal is disabled")
+        if self.stage_name != 'terrain_foundation':
+            return torch.zeros(len(ids), dtype=torch.bool, device=self.device)
+        return self._foundation_authored_rows[ids].clone()
 
     def state_dict(self):
         return {
@@ -401,3 +546,9 @@ class SuperMimicCurriculum(FormalTaskCurriculum):
         self.real_transitions, self.actor_updates = prepared.real_transitions, prepared.actor_updates
         self.budget, self.sampler = prepared.budget, prepared.sampler
         self.sample_counts = {key: list(value) for key, value in counts.items()}
+        if self._foundation_authored_rows is not None:
+            self._foundation_authored_rows.zero_()
+            self._pending_foundation_authored = None
+        if self._recovery_birth_variant is not None:
+            self._recovery_birth_variant.fill_(-1)
+            self._pending_recovery_variant = None

@@ -134,13 +134,18 @@ def test_missed_jump_imagination_matches_native_ticks_and_retains_motion_gradien
     from transformer_rl.formal.control.observation import CommandMode
     from transformer_rl.formal.tasks.jump import ReferenceStage
     from supermimic_rl.course.reward import install_shared_reward
-    from supermimic_rl.reward_kernel import RewardExtensions
+    from supermimic_rl.reward_kernel import JumpProgress, RewardExtensions
 
     native, assembly, geometry, start, legs, memory = setup('legacy')
     extensions = RewardExtensions(jump_missed=1.)
     stage = torch.full((2,), int(ReferenceStage.HOLD))
-    install_shared_reward(native, extensions=extensions,
-        jump_tasks=SimpleNamespace(jump_reference=lambda: SimpleNamespace(clock_stage=stage)))
+    # Row 0 rises while supported. Only row 1 achieves real liftoff from tick 2.
+    ascents = [torch.tensor([True, tick >= 2]) for tick in range(4)]
+    flights = [torch.tensor([False, tick >= 2]) for tick in range(4)]
+    tasks = SimpleNamespace(jump_reference=lambda: SimpleNamespace(clock_stage=stage), ascent_seen=ascents[0],
+                            physical_id=torch.zeros(2, dtype=torch.long), air_ticks=torch.zeros(2, dtype=torch.long),
+                            landed_s=torch.zeros(2), observe_physics=lambda *args, **kwargs: None)
+    install_shared_reward(native, extensions=extensions, jump_tasks=tasks)
     assembly.parameters = replace(assembly.parameters, extensions=extensions)
     ids, owned = torch.zeros(2, dtype=torch.long), torch.ones(2, dtype=torch.bool)
     mode = torch.full_like(ids, int(CommandMode.JUMP))
@@ -157,13 +162,17 @@ def test_missed_jump_imagination_matches_native_ticks_and_retains_motion_gradien
         endpoint = replace(start, velocity=torch.full((2, 3), .1, requires_grad=True))
         samples.append(RewardTick(endpoint, geometry(endpoint), torch.zeros(2), torch.zeros(2, 2),
             torch.zeros(2, 21), torch.zeros(2, 2), torch.zeros(2, 3), owned, ~owned, reference,
-            native._time + (tick + 1) * .005, ids, ids, owned, jump_reference_stage=stage))
+            native._time + (tick + 1) * .005, ids, ids, owned,
+            jump_progress=JumpProgress(stage, ascents[tick], flight_started=flights[tick])))
     queue = torch.zeros(2, 3, 2)
     result = assembly.integrate(start, tuple(samples), action, memory, queue, legs,
                                 torch.zeros(2, 6), torch.ones(2, 6))
     target, correction = legs.decode_target(action, start.joint_position[:, :4])
     previous, support = start, memory.support
-    for tick in samples:
+    for index, tick in enumerate(samples):
+        tasks.ascent_seen = ascents[index]
+        tasks.air_ticks = flights[index].long() * 2
+        tasks.observe_physics()
         speed = previous.joint_velocity[:, 4:6]
         queue = assembly.wheels.push(queue, assembly.wheels.motor_input(
             assembly.wheels.target(action), speed, torch.ones(2, 2)))
@@ -180,7 +189,7 @@ def test_missed_jump_imagination_matches_native_ticks_and_retains_motion_gradien
                                torch.tensor([-.02, -.01], dtype=torch.float64))
     for name in ('positive.forward', 'positive.yaw'):
         assert result.components[name][0] == 0
-        assert result.components[name][1] > 0  # This row switches to FLIGHT on tick 3.
+        assert result.components[name][1] > 0  # This row achieves real liftoff on tick 3.
     assert (result.components['positive.jump_attitude'] > 0).all()
     loss = sum(result.components.values()).sum()
     gradients = torch.autograd.grad(loss, tuple(tick.state.velocity for tick in samples))
@@ -320,7 +329,9 @@ def test_terrain_reward_and_termination_height_match_native_task_family_rules(ki
 
 @pytest.mark.parametrize('profile', ['legacy', 'rough_dash'])
 @pytest.mark.parametrize('skills', [False, True])
-def test_tick_batching_retains_targets_masses_static_limits_and_gradients(monkeypatch, profile, skills):
+@pytest.mark.parametrize('weighted_components', [False, True])
+def test_tick_batching_retains_targets_masses_static_limits_and_gradients(
+        monkeypatch, profile, skills, weighted_components):
     import supermimic_rl.world_model_v2.reward_assembly as module
     from transformer_rl.formal.tasks.reward import CommandMode
 
@@ -374,7 +385,11 @@ def test_tick_batching_retains_targets_masses_static_limits_and_gradients(monkey
     torch.testing.assert_close(parameters.mass_kg, mass.repeat(4), atol=0, rtol=0)
     torch.testing.assert_close(reference.admitted_body_command,
                                torch.cat([tick.reference.admitted_body_command for tick in ticks]), atol=0, rtol=0)
-    gradients = torch.autograd.grad(batched.physical_reward.sum(), (action, perturbation, mass),
+    # Unequal per-component weights also check the individual dictionary views;
+    # the summed reward alone could hide a swapped or disconnected component.
+    loss = (sum((index + 1) * value.sum() for index, value in enumerate(batched.components.values()))
+            if weighted_components else batched.physical_reward.sum())
+    gradients = torch.autograd.grad(loss, (action, perturbation, mass),
                                     retain_graph=True, allow_unused=True)
     # Exercise the preserved serial kernel path on exactly the same states,
     # targets, controller history and graph leaves; only batching differs.
@@ -384,7 +399,9 @@ def test_tick_batching_retains_targets_masses_static_limits_and_gradients(monkey
     calls.clear()
     serial = assembly.integrate(*args)
     assert len(calls) == 4
-    expected_gradients = torch.autograd.grad(serial.physical_reward.sum(), (action, perturbation, mass),
+    expected_loss = (sum((index + 1) * value.sum() for index, value in enumerate(serial.components.values()))
+                     if weighted_components else serial.physical_reward.sum())
+    expected_gradients = torch.autograd.grad(expected_loss, (action, perturbation, mass),
                                             allow_unused=True)
     assert batched.components.keys() == serial.components.keys()
     for name in batched.components:

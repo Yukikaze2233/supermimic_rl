@@ -1,9 +1,9 @@
 """Native collection and repeated world/BPTT updates with recoverable replay.
 
-The initial producer supports the foundation course. Its coordinate stays zero
-until a native capability evaluation admits the next task producer; elapsed
-data volume alone never claims a new skill. Teacher trajectories are data, not
-PPO updates or behavior-cloning targets for the student.
+Fixed producers retain their selected coordinate. An explicit progression maps
+collection steps to the pinned sampling schedule; passing through a stage does
+not claim skill mastery. Teacher trajectories are data, not PPO updates or
+behavior-cloning targets for the student.
 """
 from __future__ import annotations
 
@@ -16,9 +16,12 @@ import time
 import torch
 
 from ..contracts import StateSchema
+from ..chassis_observation import COMMAND_CONTRACTS, HEADING_COMMANDS, LEGACY_COMMANDS
 from ..formal_observation import known_horizon
 from ..runtime import atomic_save
+from .auxiliary_data import AuxiliaryWorldData, WorldDatasetConfig
 from .collection import Collector
+from .course_progression import CourseProgression, CourseProgressionConfig
 from .factory import make_learner
 from .learning import LearningConfig
 from .mixing import MixedDecision
@@ -28,12 +31,17 @@ from .replay import CompactReplay
 from .stair_source import StairScenario, StairSourceState
 from .stair_task import StairTaskState
 from .terrain import AtlasTerrain
-from .jump_task import JumpTaskConfig, JumpTaskState, JumpTask, JUMP_RECORD_FIELDS, JUMP_TRIGGER_RECORD_FIELDS
+from .jump_task import (JumpTaskConfig, JumpTaskState, JumpTask, JUMP_FLIGHT_LATCH_RECORD_FIELDS,
+                        JUMP_RECORD_FIELDS, JUMP_TRIGGER_RECORD_FIELDS)
 from .recovery_task import RecoveryTaskConfig, RecoveryTask, RECOVERY_RECORD_FIELDS
-from .guard import NativeRegressionGuard
+from .guard import NativeRegressionGuard, validate_guard_settings
 from .validation import calibrate_contact_floor, validate
 
 CHECKPOINT_FORMAT = 'supermimic-online-v2'
+
+
+GUARD_SETTINGS = ('guard_drop_fraction', 'guard_patience', 'guard_window', 'guard_mode',
+                  'guard_min_rate_fraction', 'guard_recover_after')
 
 
 @dataclass(frozen=True)
@@ -63,15 +71,25 @@ class OnlineConfig:
     record_stair_source: bool = False
     record_jumps: bool = False
     record_recovery: bool = False
+    record_platform: bool = False
+    platform_contact_hidden: tuple[int, ...] | None = None
+    # Fresh runs initialize randomly unless an explicit supervised head is supplied.
+    # Complete resumes restore the saved head and its Adam, never this artifact again.
+    initial_platform_contact: str | None = None
+    initial_platform_contact_sha256: str | None = None
     course_coordinate: int | None = None
+    course_progression: CourseProgressionConfig | None = None
     policy_start_cycle: int = 0
     seed: int = 7
     model_hidden: tuple[int, ...] = (2048, 2048, 2048)
     actor_hidden: tuple[int, ...] = (512, 256, 128)
     actor_frame_dim: int = 45
+    chassis_command_contract: str = LEGACY_COMMANDS
+    actor_features: dict | None = None
     estimator_hidden: tuple[int, ...] = (128, 64)
     critic_hidden: tuple[int, ...] = (256, 128)
     learning: LearningConfig = field(default_factory=LearningConfig)
+    world_datasets: tuple[WorldDatasetConfig, ...] = ()
     # A fresh run may copy a PPO actor (same 5x35 interface and bounds) into the student.
     initial_actor: str | None = None
     initial_actor_sha256: str | None = None
@@ -87,6 +105,12 @@ class OnlineConfig:
     # native returns can. 0 disables it.
     guard_drop_fraction: float = 0.
     guard_patience: int = 2
+    # Collections averaged per judgment, and "restore" or review-only "report" (see guard.py).
+    guard_window: int = 1
+    guard_mode: str = 'restore'
+    # Restore mode: lowest actor rate as a base fraction, and good judgments that undo one halving.
+    guard_min_rate_fraction: float = 0.
+    guard_recover_after: int = 0
 
     @classmethod
     def from_dict(cls, value):
@@ -94,14 +118,32 @@ class OnlineConfig:
         for key in ('model_hidden', 'actor_hidden', 'estimator_hidden', 'critic_hidden'):
             if key in value:
                 value[key] = tuple(value[key])
+        if value.get('platform_contact_hidden') is not None:
+            value['platform_contact_hidden'] = tuple(value['platform_contact_hidden'])
         value['learning'] = LearningConfig(**value.get('learning', {}))
+        value['world_datasets'] = tuple(WorldDatasetConfig(**item) for item in value.get('world_datasets', ()))
+        if value.get('course_progression') is not None:
+            value['course_progression'] = CourseProgressionConfig(**value['course_progression'])
         return cls(**value)
 
     def __post_init__(self):
+        from ..actor_features import actor_feature_config
+        sources = tuple(self.world_datasets)
+        if (any(not isinstance(source, WorldDatasetConfig) for source in sources)
+                or len({source.name for source in sources}) != len(sources)
+                or sum(source.fraction for source in sources) >= 1):
+            raise ValueError('Auxiliary world sources need distinct names and total fraction below one')
+        object.__setattr__(self, 'world_datasets', sources)
+        actor_feature_config(self.actor_features)
+        if self.actor_features is not None and (self.actor_frame_dim != 35 or not self.record_jumps):
+            raise ValueError('Actor reference features require the 35D actor and recorded jump tasks')
         if self.replay_device not in ('learner', 'cpu'):
             raise ValueError('Replay device must be learner or cpu')
         if type(self.actor_frame_dim) is not int or self.actor_frame_dim not in (35, 45):
             raise ValueError('Actor frame dimension must be 35 or 45')
+        if (self.chassis_command_contract not in COMMAND_CONTRACTS
+                or self.actor_frame_dim != 35 and self.chassis_command_contract != LEGACY_COMMANDS):
+            raise ValueError('Projected chassis commands require the 35D actor')
         for name in ('cycles', 'collection_steps', 'replay_steps', 'model_updates', 'model_batch_size',
                      'fit_horizon', 'actor_updates', 'imagination_batch_size', 'imagination_microbatch_size',
                      'checkpoint_interval', 'replay_checkpoint_interval', 'validation_horizon', 'validation_batch_size'):
@@ -123,10 +165,30 @@ class OnlineConfig:
             raise ValueError('Jump collection requires the complete terrain and stair arbitration producer')
         if self.record_recovery and not self.record_jumps:
             raise ValueError('Recovery collection requires the complete jump and stair arbitration producer')
+        if type(self.record_platform) is not bool:
+            raise ValueError('Platform recording must be an explicit boolean')
+        if self.record_platform:
+            if (not self.record_jumps or not self.platform_contact_hidden
+                    or any(type(width) is not int or width < 1 for width in self.platform_contact_hidden)):
+                raise ValueError('Platform online learning requires recorded jumps and explicit positive head widths')
+        elif any(value is not None for value in (self.platform_contact_hidden, self.initial_platform_contact,
+                                                 self.initial_platform_contact_sha256)):
+            raise ValueError('Platform head configuration requires platform recording')
+        if (self.initial_platform_contact is None) != (self.initial_platform_contact_sha256 is None):
+            raise ValueError('initial_platform_contact and its SHA256 must be given together')
+        if self.course_progression is not None:
+            if (not isinstance(self.course_progression, CourseProgressionConfig) or not self.record_recovery
+                    or self.course_coordinate != self.course_progression.start_coordinate):
+                raise ValueError('Course progression requires the full task producer and matching initial coordinate')
         if (self.initial_actor is None) != (self.initial_actor_sha256 is None):
             raise ValueError('initial_actor and initial_actor_sha256 must be given together')
-        if not 0 <= self.guard_drop_fraction < 1 or type(self.guard_patience) is not int or self.guard_patience < 1:
-            raise ValueError('Guard needs a drop fraction in [0, 1) and a positive integer patience')
+        if (self.learning.learning_rate_decay is not None and self.guard_drop_fraction
+                and self.guard_mode == 'restore'):
+            raise ValueError('A scheduled learning rate cannot share the actor rate with a restoring guard')
+        validate_guard_settings(drop_fraction=self.guard_drop_fraction, patience=self.guard_patience,
+                                window=self.guard_window, mode=self.guard_mode,
+                                min_rate_fraction=self.guard_min_rate_fraction,
+                                recover_after=self.guard_recover_after)
         if self.learning.anchor_coefficient and self.initial_actor is None:
             raise ValueError('The teacher anchor needs the PPO initial_actor it is centered on')
         if self.initial_actor is not None and self.actor_frame_dim != 35:
@@ -136,6 +198,7 @@ class OnlineConfig:
 def policy_start_candidates(replay, config, env_ids, policy_dt_s):
     """Shared native-record eligibility for training and isolated BPTT audits."""
     key = ('online_starts', config.record_stair_source, config.record_tasks, config.record_jumps, config.record_recovery,
+           config.record_platform,
            tuple(env_ids), policy_dt_s)
     if key not in replay._cache:
         candidates = replay.start_candidates(env_ids)
@@ -159,7 +222,8 @@ def policy_start_candidates(replay, config, env_ids, policy_dt_s):
                     raise ValueError('Jump imagination requires complete native records; old rows are not inferred')
                 ordinary &= data['jump_record_valid'][slots, env, 0] > .5
                 jump = JumpTaskState.decode({name: data[name][slots, env] for name in
-                                            (*JUMP_RECORD_FIELDS, *JUMP_TRIGGER_RECORD_FIELDS) if name in data})
+                                            (*JUMP_RECORD_FIELDS, *JUMP_TRIGGER_RECORD_FIELDS,
+                                             *JUMP_FLIGHT_LATCH_RECORD_FIELDS) if name in data})
                 if jump.trigger_flags is not None:
                     ordinary &= jump.trigger_flags[:, 0]
             if config.record_recovery:
@@ -179,6 +243,12 @@ def policy_start_candidates(replay, config, env_ids, policy_dt_s):
             dynamic = horizon[:, 1]
         if not config.record_stair_source:
             known = known_horizon(horizon[:, 0], dynamic, goal, policy_dt_s) >= 1
+        if 'disturbance' in data:
+            ordinary &= data['disturbance_record_valid'][slots, env, 0] > .5
+        if config.record_platform:
+            if 'platform_record_valid' not in data:
+                raise ValueError('Platform imagination requires explicit native caller/landing validity')
+            ordinary &= data['platform_record_valid'][slots, env, 0]
         replay._cache[key] = candidates[(data['reward_context_valid'][slots, env, 0] > .5) & ordinary & known]
     return replay._cache[key]
 
@@ -194,17 +264,21 @@ class OnlineTrainer:
         torch.manual_seed(config.seed)
         self.generator = torch.Generator(device=self.replay_device).manual_seed(config.seed + 1)
         self.validation_generator = torch.Generator(device=self.replay_device).manual_seed(config.seed + 4)
+        self.platform_generator = (torch.Generator(device=self.replay_device).manual_seed(config.seed + 6)
+                                   if config.record_platform else None)
         if environment.current is None:
             environment.reset()
         self.stair_scenario = None
         self.jump_scenario = None
         self.recovery_scenario = None
-        terrain = stair_task = stair_source = jump_task = recovery_task = None
+        terrain = stair_task = stair_source = jump_task = recovery_task = platform_task = None
+        platform_owner = self._platform_owner() if config.record_platform else None
         if config.record_stair_source:
             scenario = StairScenario.capture(environment.adapter.env)
             self.stair_scenario = scenario.to_dict()
-            terrain = AtlasTerrain.load(runtime['terrain_atlas_pin']['path'],
-                expected_sha256=json.loads(environment.schema.source)['terrain_sha256'], device=self.device)
+            terrain = (platform_owner.terrain if platform_owner is not None else
+                       AtlasTerrain.load(runtime['terrain_atlas_pin']['path'],
+                           expected_sha256=json.loads(environment.schema.source)['terrain_sha256'], device=self.device))
             stair_task, stair_source = scenario.build(terrain)
         if config.record_jumps:
             jump_config = JumpTaskConfig.capture(environment.adapter.env)
@@ -214,15 +288,24 @@ class OnlineTrainer:
             recovery_config = RecoveryTaskConfig.capture(environment.adapter.env)
             self.recovery_scenario = asdict(recovery_config)
             recovery_task = RecoveryTask(recovery_config)
+        if platform_owner is not None:
+            from .platform_task import PlatformTask
+
+            platform_task = PlatformTask(jump_task, stair_task, stair_source)
         self.learner = make_learner(environment.schema, runtime, config.learning,
             linkage_path=linkage_path, asset_directory=asset_directory, identified_bundle=identified_bundle,
             device=self.device, model_hidden=config.model_hidden, actor_hidden=config.actor_hidden,
             estimator_hidden=config.estimator_hidden, critic_hidden=config.critic_hidden, record_tasks=config.record_tasks,
             terrain=terrain, stair_task=stair_task, stair_source=stair_source, jump_task=jump_task,
             recovery_task=recovery_task,
-            actor_frame_dim=config.actor_frame_dim)
+            actor_frame_dim=config.actor_frame_dim, chassis_command_contract=config.chassis_command_contract,
+            actor_features=config.actor_features,
+            **({} if platform_owner is None else dict(platform_task=platform_task,
+                platform_geometry=platform_owner.geometry, platform_contact_hidden=config.platform_contact_hidden)))
         self.teacher_source = teacher_source
         self.actor_initialization = None
+        self.platform_contact_initialization = None
+        self.course_progression = None
         saved = None
         if resume is not None:
             saved = torch.load(resume, map_location='cpu', weights_only=True)
@@ -232,16 +315,31 @@ class OnlineTrainer:
             if dataset['cycle'] != saved['cycle'] or dataset['schema_fingerprint'] != environment.schema.fingerprint:
                 raise ValueError('Checkpoint and replay generation differ')
             self.learner.load_state_dict(saved['learner'])
-            if config.record_stair_source and saved['environment']['curriculum']['real_transitions'] != config.course_coordinate:
+            self._initialize_course_progression(saved)
+            expected_coordinate = (config.course_coordinate if config.course_progression is None else
+                                   config.course_progression.coordinate(max(0, saved['collection_steps'] - 1)))
+            if config.record_stair_source and saved['environment']['curriculum']['real_transitions'] != expected_coordinate:
                 raise ValueError('Resume course placement must match the explicitly migrated lookup coordinate')
             environment.load_training_state_dict(saved['environment'])
             self.cycle = saved['cycle']
             self.seed_source = saved['seed_source']
             self.actor_initialization = saved.get('actor_initialization')
+            self.platform_contact_initialization = saved.get('platform_contact_initialization')
         else:
+            self._initialize_course_progression(None)
             if seed_dataset is None or world_checkpoint is None:
                 raise ValueError('A fresh online run requires native seed data and its fitted world model')
             dataset = torch.load(seed_dataset, map_location='cpu', weights_only=True, mmap=True)
+            # Manual evaluation can share a schema while using future commands
+            # that were never recorded. Such data still support dynamics fitting,
+            # but cannot seed policy imagination, even with complete tensor fields.
+            source = dataset.get('source') or {}
+            manual = source.get('manual_platform_jump', {}).get('data_use', {})
+            contact = source.get('contact_collection', {})
+            if (manual.get('joint_imagination_forbidden') is True
+                    or manual.get('joint_task_imagination_supported') is False
+                    or contact.get('joint_actor_starts_allowed') is False):
+                raise ValueError('Dynamics/contact-only data cannot seed online policy imagination')
             if dataset.get('format') != 'supermimic-world-v2-dataset-v1' or dataset['model_contract'] != MODEL_CONTRACT:
                 raise ValueError('Online seed data must use the current compact world-model contract')
             if (dataset['schema_fingerprint'] != environment.schema.fingerprint
@@ -259,6 +357,8 @@ class OnlineTrainer:
                     or tuple(contract['hidden']) != config.model_hidden):
                 raise ValueError('Initial world checkpoint does not match the live contract')
             self.learner.model.load_state_dict(world['model'])
+            if config.record_platform:
+                self._initialize_platform_contact(linkage_path)
             if config.initial_actor is not None:
                 from .student_transfer import initialize_student_from_ppo
                 self.actor_initialization = initialize_student_from_ppo(
@@ -282,13 +382,58 @@ class OnlineTrainer:
             record_terrain=config.record_stair_source, record_stairs=config.record_stair_source,
             record_stair_source=config.record_stair_source, record_jumps=config.record_jumps,
             record_recovery=config.record_recovery,
-            record_jump_trigger=jump_task is not None and jump_task.config.trigger is not None)
+            record_platform=config.record_platform,
+            record_jump_trigger=jump_task is not None and jump_task.config.trigger is not None,
+            record_jump_flight_latch=jump_task is not None and jump_task.config.flight_latch,
+            record_disturbances=self.learner.model.disturbances)
         if any(name not in replay.data or tuple(replay.data[name].shape[2:]) != shape for name, shape in expected.items()):
             raise ValueError('Online replay field layout differs from the current compact contract')
         self.mixing = MixedDecision(environment, self.learner.actor, teacher_decision, seed=config.seed + 2,
             initial_fraction=config.teacher_fraction, hold_updates=config.teacher_hold_updates,
             fade_updates=config.teacher_fade_updates)
         self.resume_migrations = list(saved.get('resume_migrations', [])) if saved is not None else []
+        if getattr(self, 'actor_features_activated', False):
+            self.resume_migrations.append({'actor_features': config.actor_features,
+                'learner_replay_rng_preserved': True, 'additional_warmup_cycles': 0,
+                'scope': 'Actor decoder input only; raw replay, estimator, dynamics and rewards preserved'})
+        if getattr(self, 'chassis_commands_activated', False):
+            self.resume_migrations.append({'chassis_command_contract': config.chassis_command_contract,
+                'learner_replay_rng_preserved': True, 'additional_warmup_cycles': 0,
+                'scope': 'project raw formal45 commands on read; dynamics, rewards and replay are unchanged'})
+        if getattr(self, 'course_progression_activated', False):
+            self.resume_migrations.append({'course_progression_activated': asdict(config.course_progression),
+                'learner_replay_rng_preserved': True, 'additional_warmup_cycles': 0,
+                'scope': 'sampling schedule only; skill progress remains independently evaluated'})
+        if getattr(self, 'jump_height_progression_changed', None):
+            self.resume_migrations.append({'jump_height_progression': self.jump_height_progression_changed,
+                'learner_replay_rng_preserved': True, 'additional_warmup_cycles': 0,
+                'scope': 'Future height sampling only; gate verdicts and course clocks preserved'})
+        if getattr(self, 'model_fit_precision_changed', None):
+            self.resume_migrations.append({'model_fit_precision': self.model_fit_precision_changed,
+                'learner_replay_rng_preserved': True, 'additional_warmup_cycles': 0,
+                'scope': 'CUDA motion MLP fitting arithmetic only; FP32 parameters, optimizer state, '
+                         'normalizers, analytic modules and policy imagination preserved'})
+        if getattr(self, 'imagination_horizon_changed', None):
+            self.resume_migrations.append({'imagination_horizon': self.imagination_horizon_changed,
+                'resumed_cycle': self.cycle, 'learner_replay_rng_preserved': True,
+                'additional_warmup_cycles': 0,
+                'scope': 'Policy imagination and critic return horizon only; model fitting, '
+                         'networks, optimizer state, sampling and task/reward contracts preserved'})
+        if getattr(self, 'anchor_coefficient_changed', None):
+            self.resume_migrations.append({'anchor_coefficient': self.anchor_coefficient_changed,
+                'resumed_cycle': self.cycle, 'learner_replay_rng_preserved': True,
+                'additional_warmup_cycles': 0,
+                'scope': 'Actor teacher-anchor objective weight only; saved anchor and its action std, '
+                         'networks, optimizer state, learning rates, replay and task/reward contracts preserved'})
+        if getattr(self, 'imagination_microbatch_changed', None):
+            self.resume_migrations.append({
+                'imagination_microbatch_size': self.imagination_microbatch_changed,
+                'resumed_cycle': self.cycle, 'learner_replay_rng_preserved': True,
+                'additional_warmup_cycles': 0,
+                'imagination_batch_size': config.imagination_batch_size,
+                'actor_updates': config.actor_updates,
+                'scope': 'Policy gradient accumulation partition only; total batch, update counts, '
+                         'networks, optimizer state, replay and task/reward contracts preserved'})
         self.task_norm_pending = bool(saved.get('task_norm_pending', False)) if saved is not None else False
         self.critic_norm_from = saved.get('critic_norm_from') if saved is not None else None
         self.collector = Collector(environment, self.mixing, capacity_steps=config.replay_steps, replay=replay,
@@ -296,12 +441,29 @@ class OnlineTrainer:
             curriculum_transition_cap=config.curriculum_transition_cap, record_tasks=config.record_tasks,
             record_terrain=config.record_stair_source, record_stairs=config.record_stair_source,
             record_stair_source=config.record_stair_source, record_jumps=config.record_jumps,
-            record_recovery=config.record_recovery, course_coordinate=config.course_coordinate)
+            record_recovery=config.record_recovery, course_coordinate=config.course_coordinate,
+            course_coordinate_at=None if config.course_progression is None else config.course_progression.coordinate,
+            **({} if platform_owner is None else platform_owner.recording_options()))
         held = max(1, round(environment.num_envs * config.validation_fraction))
         if held >= environment.num_envs:
             raise ValueError('Online learning needs distinct training and validation environment rows')
         self.train_ids = list(range(environment.num_envs - held))
         self.validation_ids = list(range(environment.num_envs - held, environment.num_envs))
+        from .migrations.source_lineage import source_lineage_from_saved
+
+        self.auxiliary_world = (AuxiliaryWorldData(config.world_datasets, environment.schema, replay,
+            config.fit_horizon, seed=config.seed + 5,
+            disturbance_runtime_pairs=tuple(m['disturbance_runtime_pair'] for m in self.resume_migrations
+                                            if 'disturbance_runtime_pair' in m),
+            terrain_migrations=tuple(m['terrain_repair'] for m in self.resume_migrations
+                                     if 'terrain_repair' in m),
+            source_lineage=source_lineage_from_saved(saved, environment.schema) if saved is not None else ())
+            if config.world_datasets else None)
+        if self.auxiliary_world is not None and saved is not None and saved.get('auxiliary_world') is not None:
+            self.auxiliary_world.load_state_dict(saved['auxiliary_world'])
+        if getattr(self, 'world_datasets_changed', None) is not None:
+            self.resume_migrations.append({'world_datasets': self.world_datasets_changed,
+                'scope': 'Auxiliary dynamics windows only; live replay and all learner states preserved'})
         self._initialize_guard(saved)
         if saved is not None:
             self.collector.steps = saved['collection_steps']
@@ -318,19 +480,92 @@ class OnlineTrainer:
         self._write_json(self.output / 'configuration.json', asdict(config))
         self._write_json(self.output / 'resume-migrations.json', self.resume_migrations)
 
+    def _platform_owner(self):
+        """Reuse the actually installed native scene, without relabeling its source."""
+        native = self.env.adapter.env
+        owner = getattr(native, 'supermimic_platform_course', None)
+        source = json.loads(self.env.schema.source)
+        if (owner is None or owner.native is not native or source.get('platform_task') != owner.receipt()
+                or owner.geometry.terrain is not owner.terrain
+                or owner.terrain.manifest_sha256 != source['terrain_sha256']
+                or owner.terrain.origins.device != torch.device(self.device)):
+            raise ValueError('Platform online learning requires the source-matched native owner and atlas')
+        if source.get('contact_collection', {}).get('joint_actor_starts_allowed') is False:
+            raise ValueError('Contact-only collection does not encode its future command producer for imagination')
+        owner.recording_options()  # Require the same installed caller and tick owner before constructing the learner.
+        return owner
+
+    def _initialize_platform_contact(self, linkage_path):
+        """Fresh head weights/statistics only; full resumes use the learner checkpoint."""
+        from .leg_linkage import file_sha256
+        from .platform_contacts import PLATFORM_CONTACT_PRODUCER
+
+        config = self.config
+        if config.initial_platform_contact is None:
+            self.platform_contact_initialization = {'method': 'random', 'seed': config.seed,
+                                                    'hidden': list(config.platform_contact_hidden)}
+            return
+        path = Path(config.initial_platform_contact)
+        if file_sha256(path) != config.initial_platform_contact_sha256:
+            raise ValueError('Initial platform contact artifact SHA256 differs')
+        saved = torch.load(path, map_location='cpu', weights_only=True)
+        source = json.loads(self.env.schema.source)
+        expected = {'linkage_sha256': file_sha256(linkage_path),
+                    'asset_manifest_sha256': source['asset_manifest_sha256'],
+                    'terrain_sha256': source['terrain_sha256'],
+                    'catalog_sha256': source['platform_task']['catalog_sha256']}
+        if (saved.get('format') != 'supermimic-platform-contact-head-v1'
+                or saved.get('producer') != PLATFORM_CONTACT_PRODUCER
+                or tuple(saved.get('recipe', {}).get('hidden', ())) != config.platform_contact_hidden
+                or any(saved.get('geometry_pins', {}).get(name) != value for name, value in expected.items())):
+            raise ValueError('Initial platform contact architecture or mechanical/terrain identity differs')
+        self.learner.platform_contact.load_state_dict(saved['model'])
+        self.platform_contact_initialization = {'method': 'supervised_artifact', 'path': str(path.resolve()),
+            'sha256': config.initial_platform_contact_sha256, 'geometry_pins': expected,
+            'source_inputs': saved.get('inputs'), 'split_sha256': saved.get('split_sha256'),
+            'optimizer': 'new online Adam; initialization does not certify contact or skill accuracy'}
+
+    def _initialize_course_progression(self, saved):
+        config = self.config.course_progression
+        if config is None:
+            return
+        self.course_progression = CourseProgression(config, self.env.adapter.curriculum)
+        from ..course.metrics import install_jump_outcome_metrics
+        install_jump_outcome_metrics(self.env.adapter.env)
+        if saved is not None and saved.get('course_progression') is not None:
+            self.course_progression.load_state_dict(saved['course_progression'])
+        elif saved is not None:
+            config.validate_activation(saved, self.config.course_coordinate)
+        elif config.start_collection_step != 0:
+            raise ValueError('Fresh course progression must begin at collection step zero')
+        self.course_progression.apply_difficulty()
+
     def _initialize_guard(self, saved):
         config = self.config
         self.guard = (NativeRegressionGuard(config.guard_drop_fraction, config.guard_patience,
-                                            config.learning.actor_learning_rate)
+                                            config.learning.actor_learning_rate, window=config.guard_window,
+                                            mode=config.guard_mode, min_rate_fraction=config.guard_min_rate_fraction,
+                                            recover_after=config.guard_recover_after)
                       if config.guard_drop_fraction else None)
         self.guard_cold_cycles_remaining = 0
         self.guard_cold_previous_bad_cycles = None
+        if getattr(self, 'guard_settings_changed', None):
+            self.resume_migrations.append({'guard_settings_changed': self.guard_settings_changed})
+        if saved is not None and self.guard is None:
+            # A rate lowered by an earlier guard must not outlive the guard.
+            for group in self.learner.optimizers['actor'].param_groups:
+                group['lr'] = config.learning.actor_learning_rate
         if saved is not None and self.guard is not None:
-            if saved.get('guard') is not None:
-                self.guard.load_state_dict(saved['guard'])
-            # Native resume resets the full population physically. Reuse the
-            # existing startup observation budget without restarting learning.
-            if config.policy_start_cycle:
+            if saved.get('guard') is not None and not self.guard.load_state_dict(saved['guard']):
+                self.resume_migrations.append('guard judgment restarted under a new window/mode')
+            # The resumed Adam carries the rate of the saved guard state; apply this guard's rate.
+            for group in self.learner.optimizers['actor'].param_groups:
+                group['lr'] = self.guard.learning_rate()
+            # Cold births can trigger a premature restore, but report-only
+            # monitoring must keep observing them for human review. In that
+            # mode an absolute task warmup endpoint must not become a new
+            # hundreds-of-cycles blind period after every handoff.
+            if config.policy_start_cycle and self.guard.restores:
                 self.guard_cold_cycles_remaining = config.policy_start_cycle
                 self.guard_cold_previous_bad_cycles = self.guard.bad_cycles
                 self.guard.bad_cycles = 0
@@ -340,10 +575,61 @@ class OnlineTrainer:
                 or saved['schema_fingerprint'] != self.env.schema.fingerprint):
             raise ValueError('Online checkpoint contract differs')
         configuration, requested = asdict(OnlineConfig.from_dict(saved['config'])), asdict(self.config)
-        configuration.pop('cycles')
-        requested.pop('cycles')
+        before = configuration['learning'].pop('model_fit_precision')
+        after = requested['learning'].pop('model_fit_precision')
+        self.model_fit_precision_changed = None if before == after else {'before': before, 'after': after}
+        # Unroll length is a recorded recipe change, not a different model or
+        # replay contract. Loading the learner must retain Adam and its rates.
+        before = configuration['learning'].pop('imagination_horizon')
+        after = requested['learning'].pop('imagination_horizon')
+        self.imagination_horizon_changed = None if before == after else {'before': before, 'after': after}
+        before = configuration['learning'].pop('anchor_coefficient')
+        after = requested['learning'].pop('anchor_coefficient')
+        self.anchor_coefficient_changed = None if before == after else {'before': before, 'after': after}
+        if (self.anchor_coefficient_changed and after > 0
+                and saved.get('learner', {}).get('anchor') is None):
+            # Resume must use the original saved teacher, never initialize an
+            # anchor from the current student or silently reload a new teacher.
+            raise ValueError('Changing to a nonzero anchor coefficient requires a saved teacher anchor')
+        # The full start batch and its random realization are drawn before
+        # partitioning; only the graph held during gradient accumulation changes.
+        before = configuration.pop('imagination_microbatch_size')
+        after = requested.pop('imagination_microbatch_size')
+        self.imagination_microbatch_changed = None if before == after else {'before': before, 'after': after}
+        before, after = configuration.pop('world_datasets'), requested.pop('world_datasets')
+        self.world_datasets_changed = None if before == after else {'before': before, 'after': after}
+        before, after = configuration.pop('actor_features'), requested.pop('actor_features')
+        self.actor_features_activated = before != after
+        if self.actor_features_activated and (before is not None or after is None):
+            raise ValueError('Resume may activate actor reference features, not silently replace them')
+        before, after = configuration.pop('chassis_command_contract'), requested.pop('chassis_command_contract')
+        self.chassis_commands_activated = before != after
+        if self.chassis_commands_activated and (before, after) != (LEGACY_COMMANDS, HEADING_COMMANDS):
+            raise ValueError('Resume only activates the versioned chassis command projection')
+        old_progression, new_progression = configuration.pop('course_progression'), requested.pop('course_progression')
+        self.jump_height_progression_changed = None
+        if old_progression is not None and new_progression is not None:
+            # A sampling-clock choice does not replace the coordinate mapping
+            # or its gate evidence. All other progression changes stay checked.
+            before = old_progression.pop('jump_height_progression')
+            after = new_progression.pop('jump_height_progression')
+            if before != after:
+                self.jump_height_progression_changed = {'before': before, 'after': after}
+        self.course_progression_activated = old_progression != new_progression
+        if self.course_progression_activated:
+            if old_progression is not None or self.config.course_progression is None:
+                raise ValueError('An active course progression cannot be replaced or removed on resume')
+            self.config.course_progression.validate_activation(saved, self.config.course_coordinate)
+        # The cycle budget and the guard's supervision settings may change on
+        # resume; the guard does not change the gradient recipe it supervises.
+        changed = {}
+        for name in ('cycles', *GUARD_SETTINGS):
+            before, after = configuration.pop(name), requested.pop(name)
+            if name != 'cycles' and before != after:
+                changed[name] = [before, after]
         if configuration != requested or self.config.cycles <= saved['cycle']:
-            raise ValueError('Resume may extend the cycle budget, not change the training recipe')
+            raise ValueError('Resume training recipe differs beyond explicitly supported settings')
+        self.guard_settings_changed = changed
         if saved.get('teacher_source') != self.teacher_source:
             raise ValueError('Resume teacher source differs')
         if json.dumps(saved.get('stair_scenario'), sort_keys=True) != json.dumps(self.stair_scenario, sort_keys=True):
@@ -364,12 +650,54 @@ class OnlineTrainer:
 
     def _restore_sampling_rng(self, saved):
         """A storage-device migration must supply explicitly initialized RNGs."""
-        for name, generator in (('sample', self.generator), ('validation', self.validation_generator)):
+        generators = [('sample', self.generator), ('validation', self.validation_generator)]
+        if self.config.record_platform:
+            generators.append(('platform_sample', self.platform_generator))
+        for name, generator in generators:
             recorded = saved.get(name + '_rng_device')
             if (recorded is None and self.config.replay_device == 'cpu'
                     or recorded is not None and torch.device(recorded).type != generator.device.type):
                 raise ValueError('Replay sampling RNG device differs; use an explicit storage migration')
             generator.set_state(saved[name + '_rng'])
+
+    def fit_platform_contact(self):
+        """Draw real single intervals independently of motion windows and auxiliary data.
+
+        The native step observes all four ticks before changing the next command;
+        SnapshotLayout stores start.goal from the clean command frame (height x5).
+        Thus this interval's admitted height is goal[:, 3]/5, including request tails.
+        Teacher-produced physical transitions remain useful labels; validation rows
+        and unknown historical platform records never update this head or its norms.
+        """
+        from .platform_records import PLATFORM_RECORD_FIELDS
+
+        replay = self.collector.replay
+        key = ('platform_contact_intervals', tuple(self.train_ids))
+        if key not in replay._cache:
+            candidates = replay.window_candidates(1, self.train_ids)
+            slots = (candidates // replay.num_envs + replay.head - replay.size) % replay.capacity
+            env = candidates % replay.num_envs
+            data = replay.data
+            flags = data['platform_evidence_ticks'][slots, env]
+            labels = (data['platform_record_valid'][slots, env]
+                      & data['contact_valid_ticks'][slots, env, :, 0] & flags[..., 0] & flags[..., 1])
+            replay._cache[key] = candidates[labels.any(-1)]
+        candidates = replay._cache[key]
+        if not candidates.numel():
+            return {'platform_contact/updated': False, 'platform_contact/labels': 0,
+                    'platform_contact/skipped': self.learner.skipped['platform_contact']}
+        index = torch.randint(len(candidates), (self.config.model_batch_size,), device=replay.device,
+                              generator=self.platform_generator)
+        chosen = candidates[index]
+        slots = (chosen // replay.num_envs + replay.head - replay.size) % replay.capacity
+        env = chosen % replay.num_envs
+        names = (*PLATFORM_RECORD_FIELDS, 'physical', 'ticks', 'terrain_tile', 'valid', 'goal',
+                 *(name for name in replay.data if name.startswith('jump_')))
+        record = {name: replay.data[name][slots, env].to(self.device) for name in names}
+        height_scaled = record['goal'][:, 3]
+        if not torch.isfinite(height_scaled).all() or (height_scaled.abs() >= 100).any():
+            raise ValueError('Recorded command height cannot be recovered through a clipped clean frame')
+        return self.learner.fit_platform_contact(record, command_height=height_scaled / 5.)
 
     def sample_starts(self, batch):
         replay = self.collector.replay
@@ -399,7 +727,8 @@ class OnlineTrainer:
         if staging is not None:
             # Wait once after all transfers, before reusing pinned host storage.
             torch.cuda.current_stream(self.device).synchronize()
-        return moved
+        auxiliary = getattr(self, 'auxiliary_world', None)
+        return moved if auxiliary is None else auxiliary.mix(moved)
 
     @torch.no_grad()
     def initialize_added_critic_norm(self):
@@ -456,12 +785,19 @@ class OnlineTrainer:
             'mixing': self.mixing.state_dict(), 'resume_migrations': self.resume_migrations,
             'guard': None if self.guard is None else self.guard.state_dict(),
             'task_norm_pending': self.task_norm_pending,
+            'course_progression': (None if self.course_progression is None else self.course_progression.state_dict()),
             'critic_norm_from': self.critic_norm_from, 'stair_scenario': self.stair_scenario,
             'jump_scenario': self.jump_scenario, 'recovery_scenario': self.recovery_scenario,
             'sample_rng': self.generator.get_state(), 'torch_rng': torch.get_rng_state(),
             'validation_rng': self.validation_generator.get_state(),
             'sample_rng_device': str(self.generator.device),
             'validation_rng_device': str(self.validation_generator.device),
+            'auxiliary_world': (None if getattr(self, 'auxiliary_world', None) is None
+                                else self.auxiliary_world.state_dict()),
+            **({} if not self.config.record_platform else {
+                'platform_contact_initialization': self.platform_contact_initialization,
+                'platform_sample_rng': self.platform_generator.get_state(),
+                'platform_sample_rng_device': str(self.platform_generator.device)}),
             'cuda_rng': torch.cuda.get_rng_state_all() if torch.cuda.is_available() else []}
         checkpoint = f'resume-{slot}.pt'
         atomic_save(payload, self.output / checkpoint)
@@ -484,8 +820,14 @@ class OnlineTrainer:
             guard_deferred = self.guard is not None and self.guard_cold_cycles_remaining > 0
             guarded = self.guard is not None and cycle > cfg.policy_start_cycle and not guard_deferred
             snapshot = (self.guard.snapshot(learner.actor, learner.optimizers['actor'],
-                        estimator_optimizer=learner.optimizers['estimator']) if guarded else None)
+                        estimator_optimizer=learner.optimizers['estimator'])
+                        if guarded and self.guard.restores else None)
+            progression = getattr(self, 'course_progression', None)
+            before_counters = (None if progression is None else
+                               progression.snapshot_counters(self.env.adapter.env))
             collection = self.collector.collect(cfg.collection_steps, actor_updates=learner.updates['actor'])
+            course = (None if progression is None else
+                      progression.observe(self.env.adapter.env, collection, before_counters))
             guard = (self.guard.observe(collection.get('student_reward_mean'), snapshot, learner.actor,
                         learner.optimizers['actor'], estimator_optimizer=learner.optimizers['estimator'])
                      if guarded else None)
@@ -504,9 +846,14 @@ class OnlineTrainer:
             self._write_json(self.output / 'progress.json', {'cycle': cycle, 'phase': 'world', 'completed': 0,
                                                             'requested': cfg.model_updates})
             world = []
+            contact = []
+            auxiliary = getattr(self, 'auxiliary_world', None)
+            auxiliary_before = {} if auxiliary is None else auxiliary.sampled.copy()
             for index in range(cfg.model_updates):
                 windows = self.sample_windows(cfg.model_batch_size, cfg.fit_horizon)
                 world.append(learner.fit_model(windows))
+                if cfg.record_platform:
+                    contact.append(self.fit_platform_contact())
                 if (index + 1) % 12 == 0 or index + 1 == cfg.model_updates:
                     self._write_json(self.output / 'progress.json', {'cycle': cycle, 'phase': 'world',
                         'completed': index + 1, 'requested': cfg.model_updates, 'updates': learner.updates.copy()})
@@ -529,12 +876,19 @@ class OnlineTrainer:
                         'completed': index + 1, 'requested': cfg.actor_updates, 'updates': learner.updates.copy()})
             self.cycle = cycle
             record = {'cycle': cycle, 'real_transitions': self.collector.steps * self.env.num_envs,
-                'policy_learning': policy_learning, 'course_coordinate': cfg.course_coordinate,
+                'policy_learning': policy_learning,
+                'course_coordinate': collection.get('course_coordinate', cfg.course_coordinate),
                 'replay_transitions': len(self.collector.replay), 'collection': collection,
                 'world': {key: sum(row[key] for row in world) / len(world) for key in world[0]},
                 'policy': {key: sum(row[key] for row in policy) / len(policy) for key in policy[0]},
                 'updates': learner.updates.copy(), 'skipped': learner.skipped.copy(),
+                **({} if auxiliary is None else {'auxiliary_world_windows': {
+                    name: count - auxiliary_before[name] for name, count in auxiliary.sampled.items()}}),
                 **({} if guard is None else {'guard': guard}),
+                **({} if course is None else {'course': course}),
+                **({} if not contact else {'platform_contact': {
+                    key: sum(row[key] for row in contact if key in row) / sum(key in row for row in contact)
+                    for key in set().union(*(row.keys() for row in contact))}}),
                 **({} if floor_report is None else {'contact_floor': {
                     name: {key: channel[key] for key in ('floor_n', 'false_positive_raw', 'false_positive_floored',
                                                          'true_positive_raw', 'true_positive_floored')}
@@ -551,6 +905,9 @@ class OnlineTrainer:
             # Invalid optimizer attempts are logged as null, never nonstandard JSON NaN.
             for group in ('world', 'policy'):
                 record[group] = {key: value if math.isfinite(value) else None for key, value in record[group].items()}
+            if contact:
+                record['platform_contact'] = {
+                    key: value if math.isfinite(value) else None for key, value in record['platform_contact'].items()}
             with (self.output / 'metrics.jsonl').open('a') as stream:
                 stream.write(json.dumps(record, allow_nan=False) + '\n')
             print(json.dumps(record, allow_nan=False), flush=True)
@@ -567,6 +924,9 @@ class OnlineTrainer:
                     if floor_report is not None:
                         validation['contact_floor'] = floor_report
                     self._write_json(self.output / f'world-validation-{cycle:06d}.json', validation)
+                    if auxiliary is not None:
+                        self._write_json(self.output / f'auxiliary-world-validation-{cycle:06d}.json',
+                                         auxiliary.validate(learner, cfg, self.device))
                 finally:
                     # A diagnostic failure must not discard the completed cycle
                     # that is needed to reproduce it. Preserve state, then raise.

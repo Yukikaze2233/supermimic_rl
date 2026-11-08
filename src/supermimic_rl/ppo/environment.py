@@ -14,7 +14,8 @@ from dataclasses import dataclass
 import torch
 from torch import Tensor
 
-from .policy import FRAME_DIM, HISTORY_LENGTH
+from .policy import HISTORY_LENGTH
+from ..chassis_observation import COMMAND_CONTRACTS, LEGACY_COMMANDS, chassis_frame
 
 NATIVE_FRAME_DIM = 42
 WHEEL_CONTACT_N = 2.
@@ -49,6 +50,18 @@ class CourseEnvironment:
         self._health = getattr(adapter, "_health")
         self._label = torch.zeros(self.num_envs, 5, device=self.device)
         self._label_valid = torch.zeros(self.num_envs, dtype=torch.bool, device=self.device)
+        self.chassis_command_contract = LEGACY_COMMANDS
+
+    def set_chassis_command_contract(self, contract: str) -> None:
+        if contract not in COMMAND_CONTRACTS:
+            raise ValueError("Unknown chassis command contract")
+        self.chassis_command_contract = contract
+
+    @property
+    def joint_speed_turn_exposure(self) -> dict | None:
+        """Native telemetry definition, including its actual policy clock."""
+        composer = self.env._formal_reward.composer
+        return getattr(composer, 'supermimic_joint_speed_turn_exposure', None)
 
     @property
     def action_bounds(self) -> tuple[float, ...]:
@@ -57,7 +70,7 @@ class CourseEnvironment:
 
     def _observation(self) -> Observation:
         frames = self.env.obs_buf["policy"].reshape(self.num_envs, HISTORY_LENGTH, NATIVE_FRAME_DIM)
-        return Observation(frames[..., :FRAME_DIM].clone(), self.env.obs_buf["critic"].clone(),
+        return Observation(chassis_frame(frames, self.chassis_command_contract).clone(), self.env.obs_buf["critic"].clone(),
                            self._label.clone(), self._label_valid.clone())
 
     def reset(self) -> Observation:
@@ -105,6 +118,16 @@ class CourseEnvironment:
             for name in ("physical_step_reward", "learning_reward"):
                 if hasattr(result, name):
                     diagnostics[f"reward_step/{name}"] = getattr(result, name).clone()
+            # Native moments already mask placeholder commands and integrate
+            # all physical substeps. Keep their exposure denominator instead
+            # of averaging per-interval RMS values or filling inactive rows.
+            for name, count in getattr(result, "scoped_error_counts", {}).items():
+                moments = (result.scoped_error_sums[name],
+                           result.scoped_error_square_sums[name], count)
+                measured = torch.stack(tuple(torch.isfinite(value) for value in moments)).all(0)
+                for field, value in zip(("sum", "square_sum", "count"), moments):
+                    diagnostics[f"tracking_scope/{field}/{name}"] = torch.where(
+                        measured, value, float("nan"))
         return Step(self._observation(), reward.float(), terminated.bool(), truncated.bool(),
                     self.env._terminal_critic_182.clone(), tracking,
                     extras["interval_observation_valid"].clone(),
@@ -126,6 +149,16 @@ class CourseEnvironment:
                  "command_yaw_rate_rad_s": command[:, 2], "actual_yaw_rate_rad_s": yaw_rate,
                  "command_height_m": command[:, 3], "actual_height_m": height})
 
+    def set_opened_course_gates(self, keys) -> None:
+        """Apply performance openings, or None to use the authored height schedule."""
+        self.adapter.curriculum.set_opened_gates(keys)
+
+    def check_course_gates(self, configured_keys) -> None:
+        """A difficulty ladder whose gates are not configured would silently stay at its first level."""
+        missing = set(getattr(self.adapter.curriculum, "ladder_gate_keys", tuple)()) - set(configured_keys)
+        if missing:
+            raise ValueError(f"Report-mode course gates miss the course's ladder gates: {sorted(missing)}")
+
     def course_stage_starts(self) -> dict[str, int]:
         """First real-transition coordinate of each native course stage."""
         curriculum = self.adapter.curriculum
@@ -136,34 +169,15 @@ class CourseEnvironment:
         return starts
 
     def course_progress(self) -> tuple[dict[str, float], dict[str, float]]:
-        """Native cumulative skill counters (since cold setup) and current course gauges.
+        """Read native cumulative skill counters and current course gauges."""
+        from ..course.metrics import course_progress
 
-        Jump outcomes are physically verified request results; stair completion
-        is the read-only authored whole-course evidence; recovery counts are the
-        native lifecycle. None of these is a policy input.
-        """
-        metrics = self.env._terrain_course.metrics()
-        counters = {f"course/jump/{name}": value
-                    for name, value in metrics["physical_request_outcomes"].items()}
-        counters.update({f"course/stair/{name}": value for name, value in metrics["stair_closed_loop"].items()})
-        authored = metrics["authored_stair_completion"]
-        for name in ("ended", "ended_complete"):
-            counters[f"course/stair/authored_{name}"] = sum(authored[name + "_by_tile"])
-        counters.update({f"course/recovery/{name}": value
-                         for name, value in metrics["recovery"]["counts"].items()})
-        counters.update({f"course/births/{name}": value
-                         for name, value in metrics["episode_birth_family_counts"].items()})
-        levels = metrics["level_histogram"]
-        rows = sum(levels)
-        gauges = {"course/terrain/level_fraction": (
-            sum(level * count for level, count in enumerate(levels)) / (rows * max(len(levels) - 1, 1))
-            if rows else 0.)}
-        assist = getattr(self.env, "supermimic_jump_assist", None)
-        if assist is not None:
-            assist_counters, assist_gauges = assist.metrics()
-            counters.update(assist_counters)
-            gauges.update(assist_gauges)
-        return counters, gauges
+        return course_progress(self.env, self.adapter.curriculum)
+
+    def recovery_birth_samples(self) -> dict[str, int] | None:
+        """Read the host sampling ledger without native queries or RNG draws."""
+        read = getattr(self.adapter.curriculum, "recovery_birth_samples", None)
+        return read() if callable(read) else None
 
     def termination_reasons(self) -> dict:
         latch = getattr(self.env, "_failure_latch", None)

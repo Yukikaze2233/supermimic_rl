@@ -83,6 +83,28 @@ HEIGHT 的行为；有池时 family 保持 RECOVERY，不能把这类正常行�
 现有 `_RecoveryPreparation` 是策略接管前的关节动作域准备／被动释放，其记录仍按原生控制权
 排除。四向评价必须记录**策略接管时的实际姿态**和准备段，不能把准备段完成的翻身算作完整 RL 翻正。
 
+## 可选恢复接稳奖励
+
+`reward_extensions.recovery_quiet` 默认是 0。启用时，原生环境与想象共用以下连续奖励密度：
+
+```text
+recovery_quiet × 1[mode == RECOVERY] × positive.height × exp(-||omega_body||² / 0.25)
+```
+
+`positive.height` 沿用已有站高与直立条件，角速度包含三个轴；翻倒或塌低时几乎不给分，
+handoff 后不再支付。候选系数 1/s 与核尺度分别取自已有 yaw 正奖励幅度和高斯核，
+属于待训练评价的选择，不是已验证的最优值，也不意味着侧倒翻正已经学会。
+它不改变出生姿态、成功判据、探索 std、观测维度或控制器。
+
+完整在线断点可通过 `upgrade_online_reward_reference.py --change recovery-quiet` 迁移。
+该路径只接受已知旧 kernel 到 `recovery_quiet=1` 的变化，并要求同权重教师的新原生评价。
+模型、优化器、课程、归一化、RNG 与历史 replay 全部保留；旧 reward 标签仍注明旧语义，
+想象中的 Actor/Critic 目标重新计算，不额外 warmup。
+
+独立辅助数据只用于动力学拟合，可以保留不同解析奖励 kernel/扩展权重下的物理记录。
+文件 SHA、原 schema 和留出环境不变；物理、执行、任务及记录合同仍须一致，
+该兼容规则不用于 Actor 想象起点。验证报告记录原 schema，并明确未使用历史奖励标签。
+
 ## 显式迁移已有 jump 分支
 
 `world_model_v2/migrations/recovery.py` 仅接受已校准的 chassis35、motion/stair/source/jump 完整

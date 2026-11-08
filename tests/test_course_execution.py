@@ -9,6 +9,7 @@ import torch
 from supermimic_rl.course.execution import (
     configure_identified_actuators,
     make_environment,
+    read_identified_native_friction,
 )
 from supermimic_rl.course.identified_execution import ACTION_ORDER, IdentifiedExecution
 
@@ -74,6 +75,72 @@ def test_unsupported_native_friction_and_duplicate_owners_fail_before_config_mut
     with pytest.raises(ValueError, match="exactly one"):
         configure_identified_actuators(cfg, execution(), backend="newton")
     assert cfg == before
+
+
+def test_native_floor_config_uses_existing_wheel_measurements_without_leg_static_friction():
+    cfg, model = config(), execution(mode="native_floor")
+    untouched = {key: deepcopy(cfg.robot_cfg.actuators[key]) for key in ("pressure", "gimbal")}
+    configure_identified_actuators(cfg, model, backend="physx")
+    for key, value in untouched.items():
+        assert cfg.robot_cfg.actuators[key] == value
+    legs, wheels = (cfg.robot_cfg.actuators[key] for key in ("legs", "wheels"))
+    for field in ("friction", "dynamic_friction", "viscous_friction"):
+        assert set(getattr(legs, field).values()) == {0.}
+    for name, row in zip(ACTION_ORDER[4:], model.wheel_rows):
+        assert wheels.friction[name] == row["static_breakaway_nominal_nm"]
+        assert wheels.dynamic_friction[name] == min(row["moving_friction_nm"]) - abs(row["direction_bias_nm"])
+        assert wheels.viscous_friction[name] == 0.
+
+
+def friction_readback_robot(model):
+    # Deliberately different public and backend joint order. Auxiliary values
+    # are not ours to rewrite and must not affect active-axis validation.
+    public = list(ACTION_ORDER) + ["M_joint1", "L_spring_slide"]
+    names = list(reversed(public))
+    properties = torch.full((model.count, len(names), 3), 17.)
+    requested = model.native_parameters()
+    for name in ACTION_ORDER:
+        properties[:, names.index(name)] = torch.tensor([
+            requested[name][field] for field in ("friction", "dynamic_friction", "viscous_friction")])
+    # A bogus cache must not be used instead of the actual solver getter.
+    robot = SimpleNamespace(joint_names=public, data=SimpleNamespace(joint_friction_coeff=torch.zeros_like(properties)),
+        root_view=SimpleNamespace(shared_metatype=SimpleNamespace(dof_names=names),
+                                  get_dof_friction_properties=lambda: properties))
+    return robot, properties
+
+
+def test_native_floor_reads_solver_all_rows_and_backend_joint_order_without_mutation():
+    model = execution(mode="native_floor")
+    robot, properties = friction_readback_robot(model)
+    before = properties.clone()
+    report = read_identified_native_friction(robot, model, backend="physx")
+    assert torch.equal(properties, before)
+    assert report["verified"] is True and report["dynamics_validated"] is False
+    assert report["actual_min"] == report["actual_max"] == report["requested"]
+    assert report["joint_order"] == list(ACTION_ORDER)
+    assert report["environment_count"] == 2
+    assert report["static_identification"][0]["observed_interval_nm"] == [.15, .23]
+    assert all(row["exactly_identified"] is False for row in report["static_identification"])
+
+
+@pytest.mark.parametrize("axis,component,value", [
+    ("L_joint3", 0, 0.), ("R_joint3", 1, 0.), ("L_joint1", 0, .1), ("L_joint3", 2, float("nan"))])
+def test_native_floor_readback_detects_dropped_static_dynamic_or_unintended_leg_friction(axis, component, value):
+    model = execution(mode="native_floor")
+    robot, properties = friction_readback_robot(model)
+    properties[1, robot.root_view.shared_metatype.dof_names.index(axis), component] = value
+    with pytest.raises(RuntimeError, match="readback differs"):
+        read_identified_native_friction(robot, model, backend="physx")
+
+
+def test_native_floor_readback_rejects_legacy_shape_or_wrong_backend():
+    model = execution(mode="native_floor")
+    robot, properties = friction_readback_robot(model)
+    with pytest.raises(ValueError, match="explicit PhysX"):
+        read_identified_native_friction(robot, model, backend="newton")
+    robot.root_view.get_dof_friction_properties = lambda: properties[..., 0]
+    with pytest.raises(ValueError, match="three components"):
+        read_identified_native_friction(robot, model, backend="physx")
 
 
 class FakeRobot:

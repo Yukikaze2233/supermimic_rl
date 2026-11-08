@@ -2,8 +2,8 @@
 """Fit only the V2 world model on a fixed recorded replay, without Isaac or an actor.
 
 An online recovery pair can initialize the world model and its Adam moments.
-CPU replay sends complete sampled windows to the model device; the original
-held-out environment IDs remain disjoint. This does not consume new PPO data.
+An explicit model-only initialization can instead fit a new native dataset,
+with its own disjoint training and validation environments. Neither updates a policy.
 """
 from __future__ import annotations
 
@@ -32,22 +32,24 @@ from supermimic_rl.world_model_v2.validation import validate
 FORMAT = 'supermimic-offline-world-v2'
 
 
-def online_source(path):
-    """Map a complete pair on CPU; select only WM weights and Adam for loading."""
+def online_source(path, *, model_only=False):
+    """Select WM/Adam from an online checkpoint, with its replay only when requested."""
     saved = torch.load(path, map_location='cpu', weights_only=True, mmap=True)
     if saved.get('format') != 'supermimic-online-v2' or saved.get('model_contract') != MODEL_CONTRACT:
         raise ValueError('World continuation needs a complete current online checkpoint')
     schema = StateSchema.from_dict(saved['schema'])
     if schema.fingerprint != saved['schema_fingerprint']:
         raise ValueError('Online world continuation schema differs')
-    replay_path = (path.parent / saved['replay_file']).resolve(strict=True)
+    replay_path = None if model_only else (path.parent / saved['replay_file']).resolve(strict=True)
     with path.open('rb') as stream:
         digest = hashlib.file_digest(stream, 'sha256').hexdigest()
-    source = {'kind': 'online_pair', 'checkpoint': str(path.resolve()), 'checkpoint_sha256': digest,
-              'replay': str(replay_path), 'cycle': saved['cycle'],
+    source = {'kind': 'online_model_initialization' if model_only else 'online_pair',
+              'checkpoint': str(path.resolve()), 'checkpoint_sha256': digest, 'cycle': saved['cycle'],
               'initial_model_updates': saved['learner']['updates']['model'],
               'initial_model_skipped': saved['learner']['skipped']['model'],
               'schema_fingerprint': schema.fingerprint}
+    if replay_path is not None:
+        source['replay'] = str(replay_path)
     initial = {'model': saved['learner']['model'], 'optimizer': saved['learner']['optimizers']['model']}
     return source, schema, saved['config'], initial
 
@@ -63,8 +65,10 @@ def paired_replay(source, schema, device):
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument('replay', type=Path, nargs='?', help='Packed or compact native dataset for a fresh fit')
+    parser.add_argument('replay', type=Path, nargs='?', help='Packed or compact native dataset for fitting')
     parser.add_argument('--online-checkpoint', type=Path, help='Initialize only WM/Adam from its paired replay')
+    parser.add_argument('--initial-online-checkpoint', type=Path,
+                        help='Initialize WM/Adam on the positional native dataset, using that dataset\'s own split')
     parser.add_argument('--linkage', type=Path, default=Path('configs/linkage/leg_linkage_e726d23c.json'))
     parser.add_argument('--terrain-atlas', type=Path, help='Pinned native atlas; required for nonflat online data')
     parser.add_argument('--identified-bundle', type=Path, default=Path('configs/identified/20261031'))
@@ -90,6 +94,9 @@ def main():
     args = parser.parse_args()
     if args.replay is not None and args.online_checkpoint is not None:
         parser.error('Choose a recorded dataset or an online checkpoint')
+    if args.initial_online_checkpoint is not None and (
+            args.replay is None or args.online_checkpoint is not None or args.resume is not None):
+        parser.error('--initial-online-checkpoint needs a new recorded dataset; use --resume alone afterwards')
     if args.resume is None and args.replay is None and args.online_checkpoint is None:
         parser.error('A replay, --online-checkpoint or --resume is required')
     if min(args.iterations, args.checkpoint_interval, args.validation_horizon, args.validation_batch) < 1:
@@ -114,8 +121,18 @@ def main():
         source, schema, source_config, initial = online_source(args.online_checkpoint)
     else:
         path = args.replay or Path(old_configuration['replay'])
-        source = {'kind': 'recorded_dataset', 'replay': str(path.resolve())}
+        source = {**(resumed.get('source', {}) if resumed is not None else {}),
+                  'kind': 'recorded_dataset', 'replay': str(path.resolve())}
         schema = None
+        if args.initial_online_checkpoint is not None:
+            initialization, _, source_config, initial = online_source(args.initial_online_checkpoint, model_only=True)
+            source['initialization'] = initialization
+        if 'initialization' in source:
+            with path.open('rb') as stream:
+                digest = hashlib.file_digest(stream, 'sha256').hexdigest()
+            if 'replay_sha256' in source and source['replay_sha256'] != digest:
+                raise ValueError('External native dataset changed since initialization')
+            source['replay_sha256'] = digest
 
     def setting(name, default):
         value = getattr(args, name)
@@ -132,7 +149,8 @@ def main():
     wheel_contact_weight = setting('wheel_contact_weight', 0.)
     seed = setting('seed', 0)
     replay_device = torch.device(setting('replay_device', 'cpu'))
-    tf32 = setting('allow_tf32', False if source['kind'] == 'online_pair' else True)
+    tf32 = setting('allow_tf32', source_config.get('allow_tf32', False) if 'initialization' in source
+                   else False if source['kind'] == 'online_pair' else True)
     clip = old_configuration.get('gradient_clip', learning.get('gradient_clip', 1.))
     if min(batch, window, *hidden) < 1 or not 0 < fraction < 1 or learning_rate <= 0:
         raise ValueError('Positive batch/window/network/rate and a disjoint validation fraction are required')
@@ -141,7 +159,7 @@ def main():
     if not math.isfinite(wheel_contact_weight) or wheel_contact_weight < 0:
         raise ValueError('Wheel contact weight must be finite and nonnegative')
     if source_config:
-        if fraction != source_config.get('validation_fraction', .125):
+        if source['kind'] == 'online_pair' and fraction != source_config.get('validation_fraction', .125):
             raise ValueError('Online continuation must preserve the original held-out environment IDs')
         if hidden != list(source_config['model_hidden']) or learning_rate != learning.get('model_learning_rate', 2e-4):
             raise ValueError('Online initialization must preserve the WM architecture and Adam learning rate')
@@ -154,6 +172,9 @@ def main():
     else:
         replay, schema = load_recorded_replay(Path(source['replay']), replay_device,
                                               record_terrain=args.terrain_atlas is not None)
+    if ('initialization' in source
+            and schema.fingerprint != source['initialization']['schema_fingerprint']):
+        raise ValueError('External native dataset and initial world-model schemas differ')
     terrain = None
     if args.terrain_atlas is not None:
         from supermimic_rl.world_model_v2.terrain import AtlasTerrain
@@ -172,7 +193,8 @@ def main():
     model = WorldModelV2(MotionInputs(LegLinkage.load(args.linkage,
         expected_asset_manifest_sha256=data_source.get('asset_manifest_sha256'))),
         WheelExecution.from_bundle(args.identified_bundle, schema.policy_dt_s / schema.substeps_per_step),
-        hidden=tuple(hidden), terrain=terrain).to(device)
+        hidden=tuple(hidden), terrain=terrain,
+        disturbances=any(field.name == 'velocity_push_world' for field in schema.substep_fields)).to(device)
     fit = WorldModelFit(model, wheel_contact_weight=wheel_contact_weight)
     optimizer = torch.optim.Adam(model.parameters(), lr=learning_rate)
     contract = {'version': MODEL_CONTRACT, 'input_dim': model.motion.input_norm.mean.numel(),
@@ -246,6 +268,10 @@ def main():
 
     previous_handler = signal.signal(signal.SIGUSR1, request_checkpoint)
     scope = 'WM-only continued fitting of fixed recorded data; no Isaac, actor, critic or new PPO-data ingestion'
+    if 'initialization' in source:
+        scope = ('WM-only warm-started fitting on a new fixed native dataset; no Isaac, actor or critic updates. '
+                 'Validation rows belong to this dataset, not the original online replay.')
+    initial_model_updates = source.get('initialization', source).get('initial_model_updates', 0)
     if args.output:
         args.output.parent.mkdir(parents=True, exist_ok=True)
     print(json.dumps({'phase': 'initialized', 'source': source, 'replay_device': str(replay_device),
@@ -292,7 +318,7 @@ def main():
                 'terrain_truncated_fraction': float(terms.terrain_truncated_fraction),
                 'per_step_state': [value if math.isfinite(value) else None
                                    for value in terms.per_step_state.mean(0).tolist()], 'skipped': skipped,
-                'model_updates': source.get('initial_model_updates', 0) + iteration - skipped,
+                'model_updates': initial_model_updates + iteration - skipped,
                 'seconds': elapsed_before + time.perf_counter() - started,
                 'iteration_seconds': time.perf_counter() - tick, 'sample_seconds': sampled - tick,
                 'peak_allocated_bytes': torch.cuda.max_memory_allocated(device) if device.type == 'cuda' else 0,

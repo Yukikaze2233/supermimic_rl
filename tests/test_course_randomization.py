@@ -78,6 +78,45 @@ def test_shared_nominal_lanes_and_independent_biases_use_requested_si_bounds():
     assert model.config.provenance()["source_sha256"]["contract"].startswith("5e2e6452")
 
 
+def test_shared_encoder_bias_keeps_other_draws_and_reset_rng_identical():
+    independent = randomized(128)
+    shared = randomized(128, shared_encoder_bias=True)
+    for mask in (torch.arange(128) % 3 == 0, torch.ones(128, dtype=torch.bool)):
+        independent.reset(mask, 5000)
+        shared.reset(mask, 5000)
+        for name, expected in independent.context_parameters().items():
+            actual = shared.context_parameters()[name]
+            if name == "policy_encoder_bias_rad":
+                expected = shared.encoder_bias_rad
+            torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+        assert torch.equal(independent.generator.get_state(), shared.generator.get_state())
+    assert "shared_encoder_bias" not in independent.config.provenance()["configuration"]
+    assert shared.config.provenance()["configuration"]["shared_encoder_bias"] is True
+    assert shared.encoder_bias_rad[shared.nominal].count_nonzero() == 0
+    assert shared.encoder_bias_rad[:, 4:].count_nonzero() == 0
+
+
+def test_shared_encoder_checkpoint_does_not_silently_change_saved_profile():
+    shared = randomized(8, shared_encoder_bias=True)
+    saved = shared.state_dict()
+    restored = randomized(8, shared_encoder_bias=True)
+    restored.restore_after_physical_reset(saved)
+    mask = torch.arange(8) % 2 == 0
+    shared.reset(mask, 3000)
+    restored.reset(mask, 3000)
+    torch.testing.assert_close(shared.policy_encoder_bias_rad, restored.policy_encoder_bias_rad,
+                               rtol=0, atol=0)
+    legacy = randomized(8)
+    old = legacy.state_dict()
+    old["configuration"].pop("shared_encoder_bias")
+    legacy.restore_after_physical_reset(old)
+    with pytest.raises(ValueError, match="identity differs"):
+        shared.restore_after_physical_reset(old)
+    for invalid in (0, 1, "true", None):
+        with pytest.raises(ValueError, match="boolean"):
+            RequestedRandomizationConfig(shared_encoder_bias=invalid)
+
+
 def test_partial_reset_preserves_other_rows_and_cold_restore_retains_rng():
     model = randomized(4)
     saved = model.state_dict()
@@ -126,8 +165,9 @@ def test_fixed_imu_rotation_and_independent_policy_bias_are_applied_once():
         (rotation.transpose(-1, -2) @ measurement.angular_velocity_body_rad_s[..., None]).squeeze(-1) + model.gyro_bias_rad_s)
 
 
-def test_native_sensor_gaussian_after_delay_matches_generator_and_keeps_reset_cache():
-    model = randomized(4, nominal_fraction=0.)
+@pytest.mark.parametrize("shared_encoder_bias", [False, True])
+def test_native_sensor_gaussian_after_delay_matches_generator_and_keeps_reset_cache(shared_encoder_bias):
+    model = randomized(4, nominal_fraction=0., shared_encoder_bias=shared_encoder_bias)
     sensor_type = make_sensor_model_type(LabSensorModel, model)
     config = SensorModelConfig(policy_dt_s=.02, nominal_episode_fraction=.25,
                                observation_delays_s=(.01,), extra_delay_probability=1., shared_delay=True)
@@ -162,6 +202,46 @@ def test_native_sensor_gaussian_after_delay_matches_generator_and_keeps_reset_ca
     sensor.seed_after_reset(partial, new_source)
     torch.testing.assert_close(sensor(new_source).policy_velocity_rad_s[1:], continuing, rtol=0, atol=0)
     assert torch.equal(rng_before, sensor.generator.get_state())
+
+
+def test_shared_encoder_native_delay_and_world_sample_use_same_coordinate_once():
+    from supermimic_rl.world_model_v2.sensing import SensorTransforms, encoder_imu_sample
+
+    model = randomized(4, nominal_fraction=0., shared_encoder_bias=True)
+    sensor_type = make_sensor_model_type(LabSensorModel, model)
+    sensor = sensor_type(4, 53, SensorModelConfig(
+        policy_dt_s=.02, observation_delays_s=(.01,),
+        extra_delay_probability=1., shared_delay=True))
+    source = state(4)
+    mask = torch.ones(4, dtype=torch.bool)
+    sensor.reset(mask, source.timestamp_s)
+    sensor.seed_after_reset(mask, replace(source, policy_position_rad=model.encoder_bias_rad.clone()))
+    for tick in range(1, 5):
+        true_q = torch.full((4, 6), tick * .1)
+        source = replace(source, policy_position_rad=true_q + model.encoder_bias_rad,
+                         timestamp_s=torch.full((4,), tick * .005, dtype=torch.float64))
+        sensor.push(source, tick)
+    generator = torch.Generator().set_state(sensor.generator.get_state())
+    noise = torch.randn(4, 18, generator=generator) * sensor._halfwidth
+    sample = sensor(source)
+    # PD uses the latest q+bias, while Actor reads the older q+bias plus its
+    # own white noise. Sharing calibration does not erase observation age.
+    torch.testing.assert_close(sample.policy_position_rad[:, :4],
+                               .2 + model.encoder_bias_rad[:, :4] + noise[:, :4])
+    assert (sample.policy_position_rad[:, :4] - source.policy_position_rad[:, :4]).abs().min() > .19
+    assert sample.sampled_at_s.eq(.01).all()
+    transformed = model.transform_measurement(source)
+    assert torch.equal(transformed.policy_position_rad, source.policy_position_rad)
+    context = model.context_parameters()
+    world = encoder_imu_sample(true_q[:, :4], source.policy_velocity_rad_s,
+                              source.angular_velocity_body_rad_s, source.gravity_body,
+                              SensorTransforms(context["policy_encoder_bias_rad"], context["gyro_bias_rad_s"],
+                                  context["imu_sensor_to_body_rotation"].reshape(4, 3, 3),
+                                  torch.ones(4, 2), torch.zeros(4, 2)))
+    native = torch.cat((transformed.policy_position_rad[:, :4], torch.zeros(4, 2),
+                       transformed.policy_velocity_rad_s, transformed.angular_velocity_body_rad_s,
+                       transformed.gravity_body), -1)
+    torch.testing.assert_close(world, native, rtol=0, atol=0)
 
 
 def test_feedback_reuses_controller_and_real_validation_with_wheel_p_and_fixed_caps():

@@ -102,6 +102,20 @@ def test_recovery_timeout_bootstraps_without_failure_payment():
         torch.testing.assert_close(rollout.objective, rollout.rewards[0] + .99 * rollout.values[1])
 
 
+def test_settling_extension_reaches_bptt_and_ends_at_recovery_handoff():
+    learner, start, frames = fixture(near_handoff=True)
+    with frozen_parameters(learner.model, learner.critic):
+        baseline = learner.imagination.rollout(start, frames, 2)
+        learner.imagination.reward.extensions = replace(learner.imagination.reward.extensions, recovery_quiet=1.)
+        candidate = learner.imagination.rollout(start, frames, 2)
+        assert (candidate.rewards[0] > baseline.rewards[0]).all()
+        torch.testing.assert_close(candidate.rewards[1], baseline.rewards[1])
+        torch.testing.assert_close(candidate.critic_inputs, baseline.critic_inputs)
+        gradient = torch.autograd.grad((candidate.objective - baseline.objective).mean(),
+                                      learner.actor.decoder[-1].bias)[0]
+        assert torch.isfinite(gradient).all() and gradient.norm() > 0
+
+
 def test_true_support_cannot_bypass_low_confidence_estimate():
     learner, start, frames = fixture(near_handoff=True)
     with torch.no_grad():

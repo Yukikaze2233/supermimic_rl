@@ -23,6 +23,23 @@ def _read_pinned(path, digest):
 
 def create_course(configuration):
     """Full45 history MLP course using the source FSM and exact static terrain."""
+    wheel_delay_randomization = configuration.get('wheel_delay_randomization', False)
+    if type(wheel_delay_randomization) is not bool:
+        raise ValueError('Wheel delay randomization must be a boolean')
+    physx_contact_randomization = configuration.get('physx_contact_randomization', False)
+    if type(physx_contact_randomization) is not bool:
+        raise ValueError('PhysX contact randomization must be a boolean')
+    motion_trajectory_owner = configuration.get('motion_trajectory_owner', False)
+    if type(motion_trajectory_owner) is not bool:
+        raise ValueError('Motion trajectory owner must be a boolean')
+    stair_timeout_retry = configuration.get("stair_timeout_retry", False)
+    if type(stair_timeout_retry) is not bool:
+        raise ValueError('Stair timeout retry must be a boolean')
+    hint_lifetime = configuration.get("stair_height_hint_lifetime", "fixed")
+    if hint_lifetime not in ("fixed", "request"):
+        raise ValueError('Stair height hint lifetime must be fixed or request')
+    if hint_lifetime == "request" and not configuration.get("tof_stair_label", False):
+        raise ValueError('Request-lifetime stair hints require the explicit ToF stair label')
     root = Path(configuration["upstream_root"]).resolve(strict=True)
     commit = subprocess.check_output(["git", "-C", str(root), "rev-parse", "HEAD"], text=True).strip()
     if commit != configuration["expected_commit"]:
@@ -39,6 +56,14 @@ def create_course(configuration):
     importlib.invalidate_caches()
     _, runtime = _read_pinned(configuration["runtime_json"], configuration["runtime_sha256"])
     _, course_configuration = _read_pinned(configuration["course_json"], configuration["course_sha256"])
+    platform_plan = None
+    if configuration.get('platform_task') is not None:
+        from .platform_course import PlatformCoursePlan
+
+        platform_plan = PlatformCoursePlan.read(configuration['platform_task'],
+            num_envs=configuration['num_envs'], atlas_sha256=runtime['terrain_atlas_pin']['sha256'],
+            record_substeps=configuration.get('record_substeps', False),
+            jump_takeoff=configuration.get('jump_takeoff'))
     asset_directory = Path(configuration["asset_directory"]).resolve(strict=True)
     _read_pinned(asset_directory / "manifest.json", configuration["asset_manifest_sha256"])
     log = Path(configuration["native_log_directory"])
@@ -62,9 +87,18 @@ def create_course(configuration):
 
     backend = PhysicsBackendConfig.from_dict(runtime["physics_backend"])
     strategy = select_course_backend(backend, runtime, configuration)
+    if platform_plan is not None and strategy.name != 'physx':
+        raise ValueError('Native platform patch collection currently requires the PhysX contact interface')
     asset = load_asset_description(str(asset_directory),
                                   expected_manifest_sha256=configuration["asset_manifest_sha256"])
     atlas = verify_pin(runtime["terrain_atlas_pin"])
+    from .physx_contact import contact_provenance, atlas_contact_profile, install_physx_contact_mapping
+
+    contact_profile = None
+    if physx_contact_randomization:
+        if strategy.name != 'physx' or runtime.get('wheel_material') is not None:
+            raise ValueError('Atlas-relative contact randomization requires PhysX and no legacy material writer')
+        contact_profile = atlas_contact_profile(atlas, runtime['terrain_atlas_pin']['sha256'])
     sections = optional_sections(runtime)
     if sections["communication"] is not None and sections["communication"].enabled:
         raise ValueError("Identified wheel aggregate delay must not also receive legacy USB delay")
@@ -79,7 +113,7 @@ def create_course(configuration):
         import torch
         from transformer_rl.formal.lab_env.cfg import build_course_env_cfg, configure_course_physics
         from transformer_rl.formal.lab_env.env import WheeledLabEnv
-        from .execution import configure_identified_actuators, make_environment
+        from .execution import configure_identified_actuators, make_environment, read_identified_native_friction
         from .twist import RECEIPT as ROOT_TWIST_RECEIPT, make_root_twist_corrected_environment
         from .adapter import CourseAdapter
         from .routing import install_authored_routing
@@ -91,7 +125,8 @@ def create_course(configuration):
         execution = IdentifiedExecution(
             configuration["num_envs"], configuration["device"], sensors.physics_dt_s,
             asset_directory=asset_directory, bundle_directory=configuration["identified_bundle"],
-            friction_mode="software_dynamic")
+            friction_mode=strategy.identified_friction_mode,
+            wheel_delay_randomization=wheel_delay_randomization)
         cfg = build_course_env_cfg(
             asset, atlas, num_envs=configuration["num_envs"], device=configuration["device"],
             seed=configuration.get("seed", 7), environment_spacing_m=runtime["environment_spacing_m"],
@@ -104,15 +139,30 @@ def create_course(configuration):
                                  device=configuration["device"], declarative_scene=launcher.declarative_scene, backend=backend)
         configure_identified_actuators(cfg, execution, backend=strategy.execution_backend)
         cfg.loop_telemetry_enabled = True
-        randomization = CourseRandomization(configuration["num_envs"], configuration.get("seed", 7),
-                                            configuration["device"], RequestedRandomizationConfig(**runtime["requested_randomization"]))
+        randomization_type = CourseRandomization
+        randomization_arguments = {}
+        if wheel_delay_randomization:
+            from .wheel_delay import WheelDelayRandomization
+
+            randomization_type = WheelDelayRandomization
+            randomization_arguments['execution'] = execution
+        randomization = randomization_type(configuration["num_envs"], configuration.get("seed", 7),
+                                            configuration["device"], RequestedRandomizationConfig(**runtime["requested_randomization"]),
+                                            **randomization_arguments)
         randomized_type = strategy.environment_type(WheeledLabEnv, randomization, execution)
         environment_type = make_environment(make_root_twist_corrected_environment(randomized_type), execution)
         native = environment_type(cfg)
+        if contact_profile is not None:
+            install_physx_contact_mapping(native, randomization, contact_profile)
+        contact_receipt = contact_provenance(native._wheel_materials, backend=strategy.name)
+        native.requested_randomization_receipt['contact_material'] = contact_receipt
+        friction_readback = (read_identified_native_friction(native.robot, execution, backend=strategy.name)
+                             if execution.friction_mode == "native_floor" else None)
         from .action_contract import install_action_bounds
 
         action_contract = install_action_bounds(native, runtime["task"]["action_bounds"])
-        from .reward import install_shared_reward
+        from .reward import (install_jump_tracking_reference, install_shared_reward,
+                             install_stair_support_reference)
 
         from ..reward_kernel import RewardExtensions
 
@@ -121,22 +171,70 @@ def create_course(configuration):
         curriculum = make_course_curriculum(configuration["num_envs"], configuration["device"],
                                             configuration.get("seed", 7), course_configuration)
         native.set_task_sampler(LabTaskDrawSampler(curriculum))
+        from .recovery_bridge import install_recovery_roll_bridge
+
+        recovery_bridge_receipt = install_recovery_roll_bridge(
+            native, curriculum, log, evaluation=configuration.get('evaluation') is not None)
+        platform_owner = None
+        if platform_plan is not None:
+            from .platform_course import NativePlatformCourse
+
+            # Bind the final router before any actual-body clearance provider.
+            install_authored_routing(native, rehearsal_curriculum=(
+                curriculum if curriculum.config.foundation_authored_rehearsal else None))
+            platform_owner = NativePlatformCourse(native, platform_plan).install_physics()
         # The native sampler installation creates LabTerrainCourse and its
         # jump task owner; the environment constructor leaves it unset.
+        extensions = RewardExtensions(**configuration.get("reward_extensions", {}))
+        jump_geometry = None
+        if extensions.needs_flight_geometry:
+            from .jump_reward_geometry import JumpRewardGeometry, NativeJumpRewardGeometry
+
+            linkage_pin = configuration.get('jump_reward_linkage', {})
+            jump_geometry = NativeJumpRewardGeometry(JumpRewardGeometry.load(asset_directory,
+                linkage_pin.get('path'), expected_linkage_sha256=linkage_pin.get('sha256')),
+                native._terrain_course)
+        stair_geometry = None
+        if extensions.stair_platform_height:
+            from .stair_platform_reward import NativeStairPlatformReward
+
+            stair_geometry = NativeStairPlatformReward(native).install()
         reward_kernel_receipt = install_shared_reward(
             native._formal_reward.composer, verify_native=configuration.get("audit_reward_kernel", False),
-            extensions=RewardExtensions(**configuration.get("reward_extensions", {})),
-            jump_tasks=native._terrain_course.tasks)
+            extensions=extensions, flight_geometry=jump_geometry,
+            stair_platform_geometry=stair_geometry,
+            jump_tasks=native._terrain_course.tasks,
+            joint_speed_turn_initial_forward_m_s=curriculum.initial_domain.forward_m_s,
+            **({} if platform_owner is None else {'platform_landing': platform_owner.landing}))
+        if extensions.stair_support_transfer:
+            reward_kernel_receipt['stair_support_transfer'] = install_stair_support_reference(native)
         course_schedule_receipt = install_jump_first_command_pool(native._terrain_course.tasks, curriculum)
+        from .gimbal_arbitration import install_request_gimbal_exclusion
+
+        gimbal_arbitration_receipt = install_request_gimbal_exclusion(
+            native, enabled=configuration.get('request_gimbal_exclusion', False))
+        from .motion_trajectory import install_motion_trajectory_owner
+
+        motion_trajectory_receipt = install_motion_trajectory_owner(native, enabled=motion_trajectory_owner)
         jump_takeoff_receipt = stair_label_receipt = None
         if configuration.get("jump_takeoff") is not None:
             from .jump_takeoff import install_jump_takeoff
 
             jump_takeoff_receipt = install_jump_takeoff(native, configuration["jump_takeoff"])
+        if native._formal_reward.composer.supermimic_reward_extensions.needs_jump_progress:
+            install_jump_tracking_reference(native)
+            reward_kernel_receipt['jump_tracking_reference'] = 'first_real_flight_landing_v1'
         if configuration.get("tof_stair_label", False):
             from .stair_label import install_tof_stair_label
 
-            stair_label_receipt = install_tof_stair_label(native)
+            stair_label_receipt = install_tof_stair_label(native, height_hint_lifetime=hint_lifetime)
+        from .stair_retry import install_stair_timeout_retry
+
+        stair_retry_receipt = install_stair_timeout_retry(native, enabled=stair_timeout_retry)
+        if platform_owner is not None:
+            # Caller reservation is outermost; ToF measurement/end/retry owners
+            # continue running underneath, as does the original take-off gate.
+            platform_owner.install_caller()
         jump_assist_receipt = None
         if configuration.get("jump_assist") is not None:
             if configuration.get("evaluation") is not None:
@@ -144,7 +242,9 @@ def create_course(configuration):
             from .jump_assist import install_jump_assist
 
             jump_assist_receipt = install_jump_assist(native, curriculum, configuration["jump_assist"]).receipt()
-        install_authored_routing(native)
+        if platform_owner is None:
+            install_authored_routing(native, rehearsal_curriculum=(
+                curriculum if curriculum.config.foundation_authored_rehearsal else None))
         provenance = {
             "upstream_commit": commit, "runtime_sha256": configuration["runtime_sha256"],
             "course_sha256": configuration["course_sha256"],
@@ -159,11 +259,13 @@ def create_course(configuration):
             "jump_takeoff": jump_takeoff_receipt,
             "stair_label": stair_label_receipt,
             "jump_assist": jump_assist_receipt,
+            "desynchronize_episodes": configuration.get("desynchronize_episodes", False),
             "reward_kernel": reward_kernel_receipt,
             "reward_config": asdict(native._formal_reward.config),
             "terrain_support_config": asdict(native._terrain_course.support_reference.config),
             "randomization": {**randomization.config.provenance(),
-                              "applied": strategy.applies_requested_randomization},
+                              "applied": strategy.applies_requested_randomization,
+                              "contact_material": contact_receipt},
             "continuous_coordinates": getattr(native, "continuous_coordinate_receipt", None),
             "numerical_isolation": native.numerical_isolation_receipt,
             "root_twist": ROOT_TWIST_RECEIPT if strategy.name == "kamino" else None,
@@ -171,19 +273,42 @@ def create_course(configuration):
             "model_state": "full physical articulation, controller memories, local terrain scan, course memories",
             "native_execution_validated": False,
             "sdk_versions": {package: metadata.version(package) for package in strategy.sdk_packages}}
+        if wheel_delay_randomization:
+            provenance['wheel_delay_randomization'] = randomization.receipt()
+        if stair_retry_receipt is not None:
+            provenance['stair_timeout_retry'] = stair_retry_receipt
+        if gimbal_arbitration_receipt is not None:
+            provenance['request_gimbal_exclusion'] = gimbal_arbitration_receipt
+        if motion_trajectory_receipt is not None:
+            provenance['motion_trajectory_owner'] = motion_trajectory_receipt
+        if recovery_bridge_receipt is not None:
+            provenance['recovery_roll_bridge'] = recovery_bridge_receipt
+        if platform_owner is not None:
+            provenance['platform_task'] = platform_owner.receipt()
+        if friction_readback is not None:
+            # Instance counts/readback tensors are setup evidence, not a new
+            # per-environment schema identity. The execution receipt already
+            # binds the friction mode and the pinned native coefficients.
+            provenance['identified_friction_readback'] = {
+                key: friction_readback[key] for key in ('contract', 'reader', 'verified')}
         (log / "course-provenance.json").write_text(json.dumps(provenance, indent=2) + "\n")
         setup = {"action_contract": action_contract,
                  "materials": getattr(native._wheel_materials, "receipt", None),
                  "dynamics": getattr(native._startup_dynamics, "receipt", None),
                  "coordinates": getattr(native, "continuous_coordinate_receipt", None),
                  "physics_health": health.receipt}
+        if friction_readback is not None:
+            setup['identified_friction'] = friction_readback
         (log / "native-setup-readback.json").write_text(json.dumps(setup, indent=2) + "\n")
         return CourseAdapter(native, launcher, health, curriculum, provenance, log,
                              mechanics_backend=strategy.mechanics_backend,
                              evaluation_configuration=configuration.get("evaluation"),
                              record_substeps=configuration.get("record_substeps", False),
                              substep_audit=configuration.get("substep_audit", False),
-                             profile_steps=configuration.get("profile_steps", False))
+                             record_disturbances=configuration.get("record_disturbances", False),
+                             profile_steps=configuration.get("profile_steps", False),
+                             desynchronize_episodes=configuration.get("desynchronize_episodes", False),
+                             seed=configuration.get("seed", 7))
     except BaseException as error:
         build_scope.close()
         failure = {"type": type(error).__name__, "message": str(error), "traceback": traceback.format_exc()}

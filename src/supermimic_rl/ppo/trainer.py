@@ -28,7 +28,8 @@ from torch import nn
 from torch.nn import functional as F
 
 from ..contracts import ACTION_BOUNDS
-from .course_gate import CourseGates, GateTimeout, StageGate
+from ..chassis_observation import COMMAND_CONTRACTS, HEADING_COMMANDS, LEGACY_COMMANDS
+from .course_gate import GATE_MODES, CourseGates, GateTimeout, StageGate
 from .policy import MEAN_SQUASHES, Critic, TeacherActor
 from .rollout import Rollout, gae
 
@@ -62,6 +63,8 @@ class PPOConfig:
     curriculum_transition_offset: int = 0
     curriculum_transition_cap: int | None = None
     mean_squash: str = "tanh"
+    chassis_command_contract: str = LEGACY_COMMANDS
+    actor_features: dict | None = None
     # Fresh runs may start from an actor-initialization artifact; its SHA256 is required.
     initial_actor: str | None = None
     initial_actor_sha256: str | None = None
@@ -80,6 +83,13 @@ class PPOConfig:
     # "restart_hold" restarts the waiting gate's timeout on resume, e.g. after a
     # course change; coordinate and opened gates are kept. "continue" keeps it.
     course_gate_resume: str = "continue"
+    # "hold" waits at each closed gate and stops at its timeout; "report" never
+    # waits or stops: gates are judged and logged for review. Height sampling
+    # is selected independently by jump_height_progression.
+    course_gate_mode: str = "hold"
+    # In report mode, sampling can follow the authored height schedule while
+    # capability gates keep reporting their actual (possibly failed) verdicts.
+    jump_height_progression: str = "performance"
     # Hand control to the native evaluation orchestrator at each newly opened gate.
     stop_after_gate: bool = False
     # Repeat a stage after a fix: on resume from a checkpoint written without
@@ -100,6 +110,10 @@ class PPOConfig:
             raise ValueError("curriculum_transition_cap must be a nonnegative integer or null")
         if self.mean_squash not in MEAN_SQUASHES:
             raise ValueError(f"mean_squash must be one of {MEAN_SQUASHES}")
+        if self.chassis_command_contract not in COMMAND_CONTRACTS:
+            raise ValueError("Unknown chassis command contract")
+        from ..actor_features import actor_feature_config
+        actor_feature_config(self.actor_features)
         if (self.initial_actor is None) != (self.initial_actor_sha256 is None):
             raise ValueError("initial_actor and initial_actor_sha256 must be given together")
         if type(self.actor_freeze_updates) is not int or self.actor_freeze_updates < 0:
@@ -121,6 +135,10 @@ class PPOConfig:
             StageGate(**gate)
         if self.course_gate_resume not in ("continue", "restart_hold"):
             raise ValueError("course_gate_resume must be continue or restart_hold")
+        if self.course_gate_mode not in GATE_MODES or self.course_gate_mode == "report" and self.stop_after_gate:
+            raise ValueError(f"course_gate_mode must be one of {GATE_MODES}; report mode never stops at a gate")
+        if self.jump_height_progression not in ("performance", "schedule"):
+            raise ValueError("jump_height_progression must be performance or schedule")
         if type(self.stop_after_gate) is not bool or self.stop_after_gate and not self.course_gates:
             raise ValueError("stop_after_gate requires a boolean and a gated course")
         if self.course_rewind_stage is not None and not self.course_gates:
@@ -167,9 +185,10 @@ class EpisodeStatistics:
     # not a claim to reproduce its first-episode, trajectory-weighted evaluation.
     CLIPPED_MAE_LIMITS = {'forward_error_m_s': 1., 'yaw_rate_error_rad_s': .8, 'height_error_m': .15}
 
-    def __init__(self, num_envs: int, device):
+    def __init__(self, num_envs: int, device, *, joint_speed_turn_exposure: dict | None = None):
         self.returns = torch.zeros(num_envs, device=device)
         self.lengths = torch.zeros(num_envs, device=device)
+        self.joint_speed_turn_exposure = joint_speed_turn_exposure
         self.reset_window()
 
     def reset_window(self):
@@ -247,11 +266,32 @@ class EpisodeStatistics:
             result.update({"episode/return_mean": float(returns.mean()), "episode/length_mean": float(lengths.mean()),
                            "episode/count": int(returns.numel())})
         if self.diagnostics is not None:
+            totals = dict(zip(self.diagnostic_names, self.diagnostics.T.cpu().tolist()))
             result["tracking_diagnostics"] = {
                 name: {"samples": int(count), "mean": total / count if count else None,
                        "min": low if count else None, "max": high if count else None}
-                for name, (total, count, low, high) in zip(
-                    self.diagnostic_names, self.diagnostics.T.cpu().tolist())}
+                for name, (total, count, low, high) in totals.items()}
+            scopes = {}
+            prefix = "tracking_scope/count/"
+            for key, (exposure, _, _, _) in totals.items():
+                if not key.startswith(prefix):
+                    continue
+                name = key[len(prefix):]
+                error = totals[f"tracking_scope/sum/{name}"][0]
+                square = totals[f"tracking_scope/square_sum/{name}"][0]
+                scopes[name] = {
+                    "equivalent_policy_intervals": exposure,
+                    "mean_error": error / exposure if exposure > 0 else None,
+                    "rms_error": math.sqrt(square / exposure) if exposure > 0 else None,
+                }
+            if scopes:
+                result["tracking_scopes"] = scopes
+                result["tracking_scope_aggregation"] = (
+                    "native physical-substep error moments divided by their own task exposure; "
+                    "equivalent_policy_intervals sums active substep fractions over valid intervals, "
+                    "including terminal intervals; zero exposure has no error estimate")
+            if self.joint_speed_turn_exposure is not None:
+                result['joint_speed_turn_exposure'] = self._joint_speed_turn_summary(totals, scopes)
             result["tracking_diagnostic_timing"] = (
                 "physical endpoint before reset versus command held during that interval; "
                 "velocity_height_gate is the native four-substep mean")
@@ -263,11 +303,47 @@ class EpisodeStatistics:
                     "reward_step": "native completed-interval reward amount"}
         return result
 
+    def _joint_speed_turn_summary(self, totals, scopes) -> dict:
+        definition = self.joint_speed_turn_exposure
+        dt = definition['policy_dt_s']
+        ordinary = totals['reward_gate/joint_speed_turn/ordinary_policy_owned'][0]
+        quadrants = {}
+        for forward_sign in ('positive', 'negative'):
+            for yaw_sign in ('positive', 'negative'):
+                name = f'forward_{forward_sign}_yaw_{yaw_sign}'
+                scope = 'joint_speed_turn/' + name
+                forward = scopes[scope + '/forward_m_s']
+                yaw = scopes[scope + '/yaw_rad_s']
+                exposure = forward['equivalent_policy_intervals']
+                quadrants[name] = {
+                    'active_seconds': exposure * dt,
+                    'fraction_of_ordinary_policy_time': exposure / ordinary if ordinary > 0 else None,
+                    'forward_mean_error_m_s': forward['mean_error'],
+                    'forward_rms_error_m_s': forward['rms_error'],
+                    'yaw_mean_error_rad_s': yaw['mean_error'],
+                    'yaw_rms_error_rad_s': yaw['rms_error'],
+                    'far_forward_error_fraction': (
+                        totals['reward_gate/' + scope + '/far_forward_error'][0] / exposure
+                        if exposure > 0 else None),
+                    'velocity_height_gate_mean': (
+                        totals['reward_gate/' + scope + '/height_gate'][0] / exposure
+                        if exposure > 0 else None),
+                }
+        return {
+            'definition': dict(definition),
+            'valid_interval_seconds': self.count * dt,
+            'ordinary_policy_owned_seconds': ordinary * dt,
+            'joint_active_seconds': sum(value['active_seconds'] for value in quadrants.values()),
+            'by_command_sign': quadrants,
+        }
+
 
 class PPOTrainer:
     def __init__(self, environment, config: PPOConfig, output: Path, *, resume: Path | None = None):
         self.environment, self.config, self.output = environment, config, Path(output)
         self.device = environment.device
+        if hasattr(environment, "set_chassis_command_contract"):
+            environment.set_chassis_command_contract(config.chassis_command_contract)
         torch.manual_seed(config.seed)
         self.observation = environment.reset()
         critic_dim = self.observation.critic.shape[-1]
@@ -276,8 +352,13 @@ class PPOTrainer:
                                                             torch.tensor(config.action_bounds)):
             raise ValueError(f"PPO action_bounds {config.action_bounds} differ from the native {native_bounds}")
         self.actor = TeacherActor(config.actor_hidden, config.estimator_hidden, config.initial_std,
-                                  mean_squash=config.mean_squash, action_bounds=config.action_bounds).to(self.device)
+                                  mean_squash=config.mean_squash, action_bounds=config.action_bounds,
+                                  chassis_command_contract=config.chassis_command_contract,
+                                  actor_features=config.actor_features).to(self.device)
+        if config.actor_features is not None:
+            self.actor.features.validate_reference(environment.env._terrain_course.tasks.reference.config)
         self.initialization = None
+        self.resume_migrations = []
         if config.initial_actor is not None and resume is None:
             self.initialization = self._load_initial_actor(Path(config.initial_actor), config.initial_actor_sha256)
         self.imitation_teacher = None
@@ -294,21 +375,30 @@ class PPOTrainer:
         self.updates = self.transitions = 0
         self.stage_action_std_applied: list[str] = []
         self.course = (CourseGates(config.course_gates, environment.course_stage_starts(),
-                                   config.curriculum_transition_cap) if config.course_gates else None)
-        # Native skill counters are cumulative since the cold physical setup.
-        self._course_counters = (environment.course_progress()[0]
-                                 if hasattr(environment, "course_progress") else None)
+                                   config.curriculum_transition_cap, mode=config.course_gate_mode)
+                       if config.course_gates else None)
+        self._apply_opened_gates()
         self._normalization_samples = None
-        self.statistics = EpisodeStatistics(environment.num_envs, self.device)
+        self.statistics = EpisodeStatistics(environment.num_envs, self.device,
+            joint_speed_turn_exposure=getattr(environment, 'joint_speed_turn_exposure', None))
+        if resume is None and self.course is not None and self.course.mode == "report":
+            # The discovery reset sampled births before the opened gates were applied.
+            self.observation = environment.reset()
         if resume is not None:
             self.load(resume)
+            self._apply_opened_gates()
             # The first reset above only discovers observation dimensions.
             # Resume starts fresh episodes at the restored/rewound course,
             # otherwise every gate audit would silently restart flat births.
             environment.set_progress(self.curriculum_transitions, self.updates)
             self.observation = environment.reset()
-            self._course_counters = (environment.course_progress()[0]
-                                     if hasattr(environment, "course_progress") else None)
+        # Exclude every setup reset, including dimension discovery and the
+        # final report-mode/resume reset, from per-update birth exposure.
+        self._course_counters = (environment.course_progress()[0]
+                                 if hasattr(environment, "course_progress") else None)
+        read_births = getattr(environment, "recovery_birth_samples", None)
+        initial_births = read_births() if callable(read_births) else None
+        self._recovery_birth_baseline = None if initial_births is None else dict(initial_births)
         self.output.mkdir(parents=True, exist_ok=True)
 
     def _read_actor_artifact(self, path: Path, expected_sha256: str) -> tuple[TeacherActor, dict]:
@@ -333,6 +423,7 @@ class PPOTrainer:
                           if isinstance(layer, nn.Linear))[:-1]
         if (hidden != config.actor_hidden or estimator != config.estimator_hidden
                 or source.mean_squash != config.mean_squash
+                or source.features.configuration != self.actor.features.configuration
                 or not torch.equal(source.action_bounds, self.actor.action_bounds)):
             raise ValueError("Initial actor artifact differs from the configured actor interface")
         state = source.state_dict()
@@ -557,6 +648,8 @@ class PPOTrainer:
                     except GateTimeout as error:
                         timeout = str(error)
                         record["course"] = {"timeout": timeout}
+                    record["course"]["jump_height_progression"] = config.jump_height_progression
+                    self._apply_opened_gates()
                 log.write(json.dumps(record) + "\n")
                 log.flush()
                 gate_passed = config.stop_after_gate and record.get("course", {}).get("gate_passed", False)
@@ -598,6 +691,15 @@ class PPOTrainer:
             log.close()
         return {"status": "complete", "updates": self.updates, "transitions": self.transitions}
 
+    def _apply_opened_gates(self) -> None:
+        """Keep capability verdicts separate from the selected height sampling clock."""
+        if self.course is not None and self.course.mode == "report":
+            if not getattr(self, "_course_gates_checked", False):
+                self.environment.check_course_gates([gate.key for gate in self.course.gates])
+                self._course_gates_checked = True
+            keys = self.course.opened if self.config.jump_height_progression == "performance" else None
+            self.environment.set_opened_course_gates(keys)
+
     def _raise_stage_action_std(self) -> str | None:
         """Raise action-std floors once when the course coordinate is inside a configured stage."""
         if self.course is None or not self.config.stage_action_std:
@@ -626,12 +728,33 @@ class PPOTrainer:
         torch.save(self.state_dict(), buffer)
         return buffer.getvalue()
 
+    def _recovery_sampling_telemetry(self) -> dict | None:
+        """Diagnostic counters only; cold resume never restores this sampler."""
+        read = getattr(getattr(self, "environment", None), "recovery_birth_samples", None)
+        current = read() if callable(read) else None
+        if current is None:
+            return None
+        baseline = getattr(self, "_recovery_birth_baseline", None)
+        return {"format": "recovery-reset-sampling-telemetry-v1",
+                "scope": "current native setup; reset draws, not placement readback or skill success",
+                "restored_on_resume": False,
+                "cumulative": dict(current),
+                "setup_baseline": None if baseline is None else dict(baseline),
+                "after_setup": (None if baseline is None else
+                                {name: count - baseline.get(name, 0) for name, count in current.items()})}
+
     def state_dict(self, *, light: bool = False) -> dict:
         payload = {"format": CHECKPOINT_FORMAT, "config": asdict(self.config), "actor": self.actor.state_dict(),
                    "critic": self.critic.state_dict(), "updates": self.updates, "transitions": self.transitions,
                    "initialization": self.initialization,
+                   "resume_migrations": self.resume_migrations,
                    "course_gates": None if self.course is None else self.course.state_dict(),
                    "stage_action_std_applied": list(self.stage_action_std_applied)}
+        # Read current host counters instead of _course_counters: an immutable
+        # completed-update snapshot is taken before the metric delta is logged.
+        telemetry = self._recovery_sampling_telemetry()
+        if telemetry is not None:
+            payload["recovery_sampling_telemetry"] = telemetry
         if not light:
             payload.update(optimizer=self.optimizer.state_dict(),
                            estimator_optimizer=self.estimator_optimizer.state_dict(),
@@ -653,6 +776,25 @@ class PPOTrainer:
         if payload.get("format") != CHECKPOINT_FORMAT or "optimizer" not in payload:
             raise ValueError("Resume requires a full PPO teacher checkpoint")
         saved = PPOConfig.from_dict(payload["config"])
+        before, after = saved.chassis_command_contract, self.config.chassis_command_contract
+        if before != after and (before, after) != (LEGACY_COMMANDS, HEADING_COMMANDS):
+            raise ValueError("Resume only activates the versioned chassis command projection")
+        self.resume_migrations = list(payload.get("resume_migrations", []))
+        if saved.jump_height_progression != self.config.jump_height_progression:
+            self.resume_migrations.append({'jump_height_progression': {
+                'before': saved.jump_height_progression, 'after': self.config.jump_height_progression},
+                'resumed_update': payload['updates'], 'learner_rng_preserved': True,
+                'scope': 'Future height sampling only; gate verdicts, course clock and optimizer preserved'})
+        if saved.actor_features != self.config.actor_features:
+            if saved.actor_features is not None or self.config.actor_features is None:
+                raise ValueError('Resume may activate actor reference features, not silently replace them')
+            self.resume_migrations.append({'actor_features': self.actor.features.configuration,
+                'resumed_update': payload['updates'], 'learner_rng_preserved': True,
+                'scope': 'Actor decoder input only; raw history, estimator, reward and optimizer preserved'})
+        if before != after:
+            self.resume_migrations.append({"chassis_command_contract": after,
+                "resumed_update": payload["updates"], "learner_rng_preserved": True,
+                "scope": "input command projection; no network, reward or optimizer reset"})
         for name in ("steps_per_update", "actor_hidden", "estimator_hidden", "critic_hidden", "mean_squash",
                      "action_bounds"):
             if getattr(saved, name) != getattr(self.config, name):
@@ -695,7 +837,9 @@ def load_actor(path: Path, device="cpu") -> TeacherActor:
         raise ValueError("Not a PPO teacher checkpoint or actor-initialization artifact")
     config = PPOConfig.from_dict(payload["config"])
     actor = TeacherActor(config.actor_hidden, config.estimator_hidden, config.initial_std,
-                         mean_squash=config.mean_squash, action_bounds=config.action_bounds).to(device)
+                         mean_squash=config.mean_squash, action_bounds=config.action_bounds,
+                         chassis_command_contract=config.chassis_command_contract,
+                         actor_features=config.actor_features).to(device)
     actor.load_state_dict(payload["actor"])
     return actor.eval()
 
@@ -705,6 +849,8 @@ def artifact_actor(payload: dict) -> TeacherActor:
     # Artifacts written before configurable bounds used the legacy contract.
     bounds = tuple(payload.get("action_bounds", ACTION_BOUNDS))
     actor = TeacherActor(tuple(payload["actor_hidden"]), tuple(payload["estimator_hidden"]),
-                         mean_squash=payload["mean_squash"], action_bounds=bounds)
+                         mean_squash=payload["mean_squash"], action_bounds=bounds,
+                         chassis_command_contract=payload.get("chassis_command_contract", LEGACY_COMMANDS),
+                         actor_features=payload.get('actor_features'))
     actor.load_state_dict(payload["actor"])
     return actor

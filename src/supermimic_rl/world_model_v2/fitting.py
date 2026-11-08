@@ -18,6 +18,7 @@ from torch import Tensor
 from .model import FlatTerrain, Ticks, WorldModelV2
 from .physical import INCREMENT_DIM, increments
 from .records import CONTACT_LABEL_DIM, decode_memory, decode_physical
+from .disturbance import shift_tick_reference
 
 # Increment floors: position, rotation, velocity, angular velocity, joint angles, joint rates.
 INCREMENT_FLOOR = (3e-3,) * 3 + (5e-3,) * 3 + (2e-2,) * 3 + (5e-2,) * 3 + (3e-3,) * 6 + (5e-2,) * 8
@@ -64,6 +65,8 @@ def recorded_rollout(model, windows):
                          gimbal_yaw_rate_target=logged.gimbal_yaw_rate_target)
         terrain = ({'terrain_tile': windows['terrain_tile'][rows, step, 0]}
                    if 'terrain_tile' in windows else {})
+        terrain.update({name: windows[name][rows, step] for name in ('velocity_push', 'external_wrench')
+                        if name in windows})
         prediction = model.step(state, height, scan, memory, windows['sim_context'][rows, step],
                                 windows['motor_strength'][rows, step, 4:6], windows['action'][rows, step], **terrain)
         tick_valid = getattr(prediction, 'tick_terrain_valid', None)
@@ -82,7 +85,7 @@ def recorded_rollout(model, windows):
 class WorldModelFit:
     RECORD_FIELDS = ('physical', 'end_physical', 'height', 'scan', 'memory', 'sim_context',
                      'motor_strength', 'action', 'ticks', 'valid')
-    OPTIONAL_RECORD_FIELDS = ('reward_route', 'terrain_tile')
+    OPTIONAL_RECORD_FIELDS = ('reward_route', 'terrain_tile', 'velocity_push', 'external_wrench')
 
     def __init__(self, model: WorldModelV2, *, wheel_contact_weight: float = 0.):
         if not math.isfinite(wheel_contact_weight) or wheel_contact_weight < 0:
@@ -100,10 +103,14 @@ class WorldModelFit:
         """Update running input/output statistics from real single steps only."""
         model = self.model
         start, end = decode_physical(windows["physical"]), decode_physical(windows["end_physical"])
-        features, _ = model.features(start, windows["height"], windows["scan"], decode_memory(windows["memory"]),
-                                     windows["sim_context"], windows["action"])
+        motion_start = model.physical_start(start, windows['sim_context'], windows.get('velocity_push'))
+        features, _ = model.features(motion_start, windows["height"], windows["scan"], decode_memory(windows["memory"]),
+                                     windows["sim_context"], windows["action"],
+                                     external_wrench=windows.get('external_wrench'))
         valid = windows["valid"]
-        targets = model.motion.targets(windows["ticks"])
+        labels = (shift_tick_reference(windows['ticks'], start, motion_start, to_pushed=True)
+                  if model.disturbances else windows['ticks'])
+        targets = model.motion.targets(labels)
         model.motion.input_norm.update(features[valid])
         model.motion.output_norm.update(targets[valid])
 

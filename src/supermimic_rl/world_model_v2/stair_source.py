@@ -32,33 +32,46 @@ class StairScenario:
     tof: TofTriggerConfig
     min_height_m: float
     max_height_m: float
+    timeout_retry: bool = False
+
+    def __post_init__(self):
+        if type(self.timeout_retry) is not bool:
+            raise ValueError('Stair timeout retry must be a boolean')
 
     @classmethod
     def capture(cls, native):
         trigger = native._terrain_course.tof_trigger
-        return cls(StairTaskConfig.capture(native), trigger.config, trigger.min_height_m, trigger.max_height_m)
+        return cls(StairTaskConfig.capture(native), trigger.config, trigger.min_height_m, trigger.max_height_m,
+                   getattr(native._terrain_course, 'supermimic_stair_timeout_retry', False))
 
     @classmethod
     def from_dict(cls, value):
         from transformer_rl.formal.lab_env.stair_trigger import TofTriggerConfig
 
-        if value['format'] != 'supermimic-native-stair-source-v1':
+        retry = value.get('timeout_retry', False)
+        expected = ('supermimic-native-stair-source-timeout-retry-v1' if retry
+                    else 'supermimic-native-stair-source-v1')
+        if type(retry) is not bool or value['format'] != expected:
             raise ValueError('Unknown native stair scenario format')
         tof = dict(value['tof'])
         for key in ('trigger_distance_m', 'early_distance_m', 'latency_intervals'):
             tof[key] = tuple(tof[key])
         return cls(StairTaskConfig.from_dict(value['task']), TofTriggerConfig(**tof),
-                   value['min_height_m'], value['max_height_m'])
+                   value['min_height_m'], value['max_height_m'], retry)
 
     def to_dict(self):
-        return {'format': 'supermimic-native-stair-source-v1', **asdict(self),
+        fields = asdict(self)
+        if not self.timeout_retry:
+            fields.pop('timeout_retry')
+        return {'format': ('supermimic-native-stair-source-timeout-retry-v1' if self.timeout_retry
+                           else 'supermimic-native-stair-source-v1'), **fields,
                 'scope': 'existing ideal position-assisted simulator source; not calibrated hardware ToF'}
 
     def build(self, terrain):
         from .stair_task import StairTask
 
         return StairTask(self.task), IdealStairSource(self.tof, terrain=terrain,
-            min_height_m=self.min_height_m, max_height_m=self.max_height_m)
+            min_height_m=self.min_height_m, max_height_m=self.max_height_m, timeout_retry=self.timeout_retry)
 
 
 @dataclass(frozen=True)
@@ -155,9 +168,12 @@ class StairSourceBoundary:
 
 
 class IdealStairSource:
-    def __init__(self, config, *, min_height_m, max_height_m, terrain):
+    def __init__(self, config, *, min_height_m, max_height_m, terrain, timeout_retry=False):
+        if type(timeout_retry) is not bool:
+            raise ValueError('Stair timeout retry must be a boolean')
         self.config, self.min_height_m, self.max_height_m = config, min_height_m, max_height_m
         self.terrain = terrain
+        self.timeout_retry = timeout_retry
 
     @staticmethod
     def signature(config, minimum, maximum, like):
@@ -265,12 +281,21 @@ class IdealStairSource:
 
     def advance(self, source, stair, *, task, motion, physical, wheel_centres, wheel_radius,
                 terrain_tile, queues, readout, goal, estimate, physics_dt_s, latency, draws, external=None,
-                admission=None, base_mode=None, jump_active=None, request_height=None, request_clock=None):
-        """Complete one boundary: detect -> release -> protocol/FSM -> rearm -> goal."""
+                admission=None, base_mode=None, jump_active=None, request_height=None, request_clock=None,
+                reservation=None, request_owned=None):
+        """Complete one boundary: detect -> release -> protocol/FSM -> rearm -> goal.
+
+        Caller reservation suppresses only new ToF submissions. Detection,
+        latency, existing-request completion and external packets still advance.
+        """
         from transformer_rl.formal.tasks.protocol import RequestResponse
 
         trigger = self.restore(source)
         n = len(source.values)
+        if reservation is not None and (not isinstance(reservation, Tensor)
+                or reservation.shape != (n,) or reservation.device != source.values.device
+                or reservation.dtype != torch.bool):
+            raise ValueError('Stair reservation requires one bool per source row')
         external = StairPacket.empty(n, source.values.device) if external is None else external
         now = task.boundary_time(stair, physics_dt_s)
         ready, contact, tilt = task.estimate_inputs(now, estimate, source.values)
@@ -279,6 +304,8 @@ class IdealStairSource:
         idle = ready & ~owned & (stair.ids[:, 1] < 0)
         if jump_active is not None:
             idle = idle & ~jump_active
+        if reservation is not None:
+            idle = idle & ~reservation
         beam = self.profile(physical, terrain_tile, goal)
         fired, measured = self.step(trigger, beam, idle=idle, latency=latency, draws=draws)
         next_id = torch.maximum(source.ids[:, 0], stair.ids[:, 0] + 1)
@@ -292,10 +319,15 @@ class IdealStairSource:
             torch.where(matched, external.completed_id, completed), external.safety_abort)
         boundary = task.advance_motion(stair, packet, motion=motion, queues=queues, readout=readout,
             goal=goal, estimate=estimate, physics_dt_s=physics_dt_s, admission=admission,
-            base_mode=base_mode, jump_active=jump_active, request_height=request_height, request_clock=request_clock)
+            base_mode=base_mode, jump_active=jump_active, request_height=request_height,
+            request_clock=request_clock, request_owned=request_owned)
         result = boundary.stair
         accepted = result.response == int(RequestResponse.ACCEPTED)
         trigger.record_responses(fired, accepted, active_id=result.protocol_active_id)
+        if self.timeout_retry:
+            from ..course.stair_retry import allow_timeout_retry
+
+            allow_timeout_retry(trigger, result.finished_id >= 0, result.end_reason)
         self.arm(trigger, (fired & ~accepted) | (result.finished_id >= 0) | result.exited, draws[:, 4:7])
         following = StairSourceState.from_trigger(trigger, torch.maximum(next_id, result.state.ids[:, 0] + 1),
                                                   segment_end=source.segment_end)

@@ -1,26 +1,37 @@
 """Evaluate the history student in native physics, without its world model."""
-from types import SimpleNamespace
+from pathlib import Path
 import time
+from types import SimpleNamespace
 
 import torch
 
 from ..evaluation import native_tracking_sample, terminal_failure_masks
 from ..ppo.trainer import EpisodeStatistics
+from ..evaluation_reporting import PlatformEvaluationReport
 from .collection import Collector
 
 
 @torch.no_grad()
-def evaluate_native(environment, actor, steps, *, on_progress=None):
+def evaluate_native(environment, actor, steps, *, on_progress=None,
+                    record_dataset: Path | None = None, recording_source=None):
     if steps < 1:
         raise ValueError('Native evaluation requires positive physical exposure')
+    if record_dataset is not None and Path(record_dataset).exists():
+        raise FileExistsError('Use a new native evaluation dataset path')
     if environment.current is None:
         environment.reset()
     owner = environment.adapter
+    platform = getattr(owner.env, 'supermimic_platform_course', None)
+    features = getattr(actor, 'features', None)
+    if features is not None and features.configuration is not None:
+        features.validate_reference(owner.env._terrain_course.tasks.reference.config)
     begin = getattr(owner, 'evaluation_begin', None)
     fixed_suite = callable(begin) and getattr(owner, '_evaluation_configuration', None) is not None
     if fixed_suite:
         begin(environment.schema)
         environment.current = environment._pack(owner.current)
+    # Begin may replace setup births; later mixed-course resets may change rows.
+    platform_reporting = PlatformEvaluationReport(platform, environment.num_envs)
     statistics = EpisodeStatistics(environment.num_envs, environment.device)
     masks, latest = {}, {}
     actor.eval()
@@ -52,9 +63,24 @@ def evaluate_native(environment, actor, steps, *, on_progress=None):
         if on_progress is not None and (record['steps'] % 100 == 0 or record['steps'] == steps):
             on_progress({**record, **statistics.summary(), 'elapsed_s': time.monotonic() - started})
 
-    collector = Collector(environment, decision, capacity_steps=1, action_noise_std=0., advance_training_progress=False)
+    recording = record_dataset is not None
+    source_rng = []
+    source_config = None
+    if recording:
+        from .stair_source import StairScenario
+
+        source_config = StairScenario.capture(owner.env).to_dict()
+    recording_options = ({'record_terrain': True, 'record_tasks': True, 'record_stairs': True,
+        'record_stair_source': True, 'record_jumps': True, 'record_recovery': True} if recording else {})
+    if recording and platform is not None:
+        recording_options.update(platform.recording_options())
+    collector = Collector(environment, decision, capacity_steps=steps if recording else 1,
+        action_noise_std=0., advance_training_progress=False,
+        **recording_options)
     try:
-        collector.collect(steps, on_progress=progress, on_transition=measured)
+        collector.collect(steps, on_progress=progress, on_transition=measured,
+            on_source_rng=((lambda sequence, state: source_rng.append((sequence, state.cpu())))
+                           if recording else None))
     finally:
         finish = getattr(owner, 'evaluation_end', None)
         if fixed_suite and callable(finish):
@@ -67,7 +93,14 @@ def evaluate_native(environment, actor, steps, *, on_progress=None):
               'valid_simulated_seconds': valid_seconds,
               'failures_per_valid_env_minute': (60 * statistics.terminated / valid_seconds
                                                if valid_seconds else None),
-              'scope': 'native physics student only; no teacher, world model, exploration or gradient updates'}
+              'scope': 'native physics policy evaluation; no teacher, world model or gradient updates; '
+                       'action sampling follows the caller'}
     if fixed_suite:
         report['task_suite'] = owner.evaluation_summary()
+    platform_reporting.apply(report, recorded_physics_ticks=recording)
+    if recording:
+        from .dataset import save_native_dataset
+
+        report['dataset'] = save_native_dataset(collector, record_dataset, report.copy(),
+            source_rng=source_rng, stair_source_config=source_config, source=recording_source)
     return report

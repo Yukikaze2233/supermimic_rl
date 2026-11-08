@@ -25,6 +25,8 @@ def audit_fixture(tmp_path, monkeypatch, *, landing=False):
     spec.loader.exec_module(module)
     learner, start, _ = fixture(gated=True)
     producer = learner.imagination.reward
+    producer.jump_task.config = replace(producer.jump_task.config, flight_latch=True)
+    start['jump_flight_latch'] = torch.tensor([[-1, 0, 0], [-1, 0, 0]], dtype=torch.int64)
     producer.extensions = RewardExtensions(jump_missed=1., success_event=5.)
     producer.tuning = replace(producer.tuning, success_event=5.)
     state = decode_physical(start['physical'])
@@ -39,6 +41,7 @@ def audit_fixture(tmp_path, monkeypatch, *, landing=False):
     start['reward_route'][0, 0] = 4.
     start['task_family'][1] = 0.
     if landing:
+        jump.flight_latch[:] = torch.tensor([7, 1, 1])
         jump.ids[:, 1] = jump.ids[:, 4] = 7
         jump.values[:, [1, 9]] = 0.
         jump.values[:, [2, 10, 11, 12, 13]] = 1.

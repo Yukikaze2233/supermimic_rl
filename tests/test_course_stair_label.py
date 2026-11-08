@@ -19,7 +19,7 @@ from transformer_rl.formal.tasks.trajectory import CommandTrajectory, DriveEnvel
 from support.world_v2.stair_task import estimate_at, native_stairs
 
 
-def course_fixture(n=2):
+def course_fixture(n=2, *, hint_lifetime='fixed'):
     native = native_stairs(n, labels=True, assist=True)
     tasks = LabCourseTasks(n, DriveEnvelope(.08, .38, 90.), policy_dt_s=.02)
     native._terrain_course.tasks = tasks
@@ -27,7 +27,7 @@ def course_fixture(n=2):
     tasks.trajectory = CommandTrajectory(
         tasks.stream.current.clone(), tasks.stream.current.clone(),
         torch.full((n,), 5.), torch.zeros(n, dtype=torch.long))
-    install_tof_stair_label(native)
+    install_tof_stair_label(native, height_hint_lifetime=hint_lifetime)
     return native
 
 
@@ -67,8 +67,9 @@ def test_routed_terrain_truth_never_creates_stair_or_slope_actor_labels():
 
 
 @pytest.mark.parametrize('ending', ['complete', 'cancel', 'timeout', 'safety_abort', 'tilt'])
-def test_tof_label_and_height_hint_exit_together_on_native_request_end(ending):
-    native = course_fixture()
+@pytest.mark.parametrize('lifetime', ['fixed', 'request'])
+def test_tof_label_and_height_hint_exit_together_on_native_request_end(ending, lifetime):
+    native = course_fixture(hint_lifetime=lifetime)
     course = native._terrain_course
     course.tof_request_id.fill_(7)
     course.tof_step_height_m.fill_(.20)
@@ -104,8 +105,9 @@ def test_tof_label_and_height_hint_exit_together_on_native_request_end(ending):
     assert native._command_mode.eq(int(CommandMode.NORMAL)).all()
 
 
-def test_new_jump_wins_same_boundary_tof_request_and_is_not_relabelled():
-    native = course_fixture()
+@pytest.mark.parametrize('lifetime', ['fixed', 'request'])
+def test_new_jump_wins_same_boundary_tof_request_and_is_not_relabelled(lifetime):
+    native = course_fixture(hint_lifetime=lifetime)
     course = native._terrain_course
     course._pending_requests['jump'] = RequestCommand(torch.full((2,), 17), torch.full((2,), .10))
     course.tof_request_id.fill_(23)
@@ -125,8 +127,9 @@ def test_new_jump_wins_same_boundary_tof_request_and_is_not_relabelled():
     assert not course.tasks._physical_cancelled.any()
 
 
-def test_existing_stair_request_finishes_before_a_new_jump_can_start():
-    native = course_fixture()
+@pytest.mark.parametrize('lifetime', ['fixed', 'request'])
+def test_existing_stair_request_finishes_before_a_new_jump_can_start(lifetime):
+    native = course_fixture(hint_lifetime=lifetime)
     course = native._terrain_course
     course.tof_request_id.fill_(7)
     course.tof_step_height_m.fill_(.20)

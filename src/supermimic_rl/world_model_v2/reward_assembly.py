@@ -7,6 +7,7 @@ geometry as measured simulator geometry. The caller must provide that geometry.
 from __future__ import annotations
 
 from dataclasses import dataclass, fields, is_dataclass, replace
+from typing import TYPE_CHECKING
 
 import torch
 from torch import Tensor
@@ -14,11 +15,14 @@ from torch import Tensor
 from transformer_rl.formal.tasks.reward import (
     CommandMode, RewardPhysics, RewardReference, RoughDashRewardReference, TerrainRewardReference,
 )
-from ..reward_kernel import RewardHistory, RewardParameters, physical_reward_densities
+from ..reward_kernel import JumpProgress, RewardHistory, RewardParameters, physical_reward_densities
 from .execution import LegExecution, WheelExecution
 from .geometry import WheelGeometry
 from .physical import PhysicalState
 from .support import SupportInputs, SupportState, advance_support
+
+if TYPE_CHECKING:
+    from ..course.jump_physics import PlatformLandingState
 
 
 @dataclass(frozen=True)
@@ -54,7 +58,7 @@ class RewardTick:
     episode_id: Tensor
     control_epoch: Tensor
     policy_owned: Tensor
-    jump_reference_stage: Tensor | None = None
+    jump_progress: JumpProgress | None = None
 
 
 @dataclass(frozen=True)
@@ -68,6 +72,7 @@ class RewardInterval:
     termination_height: Tensor | None = None  # Task/terrain producer's [N, K, 1] height, not a learned label.
     jump_state: object | None = None
     success_credited: Tensor | None = None
+    platform_state: PlatformLandingState | None = None
 
     def finish(self, terminated: Tensor, success_credited: Tensor, parameters: RewardParameters) -> Tensor:
         """One-shot events; the task producer owns success identity/ownership checks."""
@@ -172,7 +177,8 @@ class RewardAssembly:
         physics_ticks, reference_ticks, histories = [], [], []
         invalid = torch.zeros(action.shape[0], dtype=torch.bool, device=action.device)
         history = RewardHistory.from_actions(start.joint_velocity[..., :6], action, memory.previous_action,
-                                              memory.previous_action2, memory.action_count)
+                                              memory.previous_action2, memory.action_count,
+                                              coaxial_action_smoothing=self.parameters.extensions.coaxial_action_smoothing)
         for tick in ticks:
             wheel_speed = previous.joint_velocity[..., 4:6]
             queue = self.wheels.push(queue, self.wheels.motor_input(self.wheels.target(action), wheel_speed,
@@ -196,7 +202,7 @@ class RewardAssembly:
             # within the interval. Native locomotion uses one stable layout.
             for physics, reference, history, tick in zip(physics_ticks, reference_ticks, histories, ticks):
                 densities = physical_reward_densities(physics, reference, history, self.parameters,
-                    jump_reference_stage=tick.jump_reference_stage)
+                    jump_progress=tick.jump_progress)
                 for name, value in densities.components.items():
                     contribution = value.double() * self.parameters.physics_dt_s
                     components[name] = components.get(name, 0.) + contribution
@@ -207,22 +213,19 @@ class RewardAssembly:
                 'passive_knee_limits_rad', 'available_terms', 'velocity_reference',
                 'effort_reference', 'slip_reference', 'boundary_reference'))
             parameters = replace(self.parameters, mass_kg=self.parameters.mass_kg.repeat(expected))
-            stages = tuple(tick.jump_reference_stage for tick in ticks)
-            if all(stage is None for stage in stages):
-                reference_stage = None
-            elif all(stage is not None for stage in stages):
-                reference_stage = torch.cat(stages, dim=0)
-            else:
-                raise ValueError('Jump reference stage coverage changes within a physical interval')
+            progress = JumpProgress.cat(tick.jump_progress for tick in ticks)
             densities = physical_reward_densities(physics, references, self._stack_rows(histories), parameters,
-                                                  jump_reference_stage=reference_stage)
-            # Keep the exact original double-precision tick accumulation order.
-            # Only the stateless elementwise densities share one larger batch.
-            for name, values in densities.components.items():
-                accumulated = 0.
-                for value in values.reshape(expected, action.shape[0]).unbind(0):
-                    accumulated = accumulated + value.double() * self.parameters.physics_dt_s
-                components[name] = accumulated
+                                                  jump_progress=progress)
+            # Batch components as well as rows to avoid separate cast/multiply/
+            # add kernels for every reward term. Keep the original four-tick
+            # double-precision accumulation order; a reduction would reorder it.
+            names = tuple(densities.components)
+            values = torch.stack(tuple(densities.components.values())).reshape(
+                len(names), expected, action.shape[0]).double()
+            accumulated = 0.
+            for value in values.unbind(1):
+                accumulated = accumulated + value * self.parameters.physics_dt_s
+            components = dict(zip(names, accumulated.unbind(0)))
             invalid |= densities.invalid.reshape(expected, action.shape[0]).any(0)
             failure_scale = densities.failure_scale.reshape(expected, action.shape[0])[-1]
         next_memory = RewardMemory(action, memory.previous_action, (memory.action_count + 1).clamp_max(2), support)

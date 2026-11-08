@@ -58,7 +58,7 @@ install('supermimic_rl.cli', native_logs=lambda *a: nullcontext(), _native_schem
 install('supermimic_rl.course.factory', create_course=lambda config: SimpleNamespace(provenance={}, policy_dt_s=.02))
 install('supermimic_rl.world_model_v2.online', OnlineConfig=SimpleNamespace(from_dict=lambda x: x), OnlineTrainer=Trainer)
 install('supermimic_rl.world_model_v2.teacher', load_native_teacher=lambda *a, **k: SimpleNamespace(source_metadata={}),
-        native_teacher_decision=lambda *a: None)
+        native_teacher_decision=lambda *a: None, file_sha256=lambda path: 'fixture')
 install('supermimic_rl.world_model_v2.evaluation', evaluate_native=evaluate)
 install('supermimic_rl.world_model_v2.student_transfer',
         load_student_actor=lambda *a: (None, {'schema_fingerprint': 'fixture'}))

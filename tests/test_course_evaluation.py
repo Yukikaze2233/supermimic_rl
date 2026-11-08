@@ -72,13 +72,133 @@ def test_fixed_suite_preserves_ids_and_maps_real_request_and_recovery_modes(adap
     resolved = plan.description()["resolved_curriculum"]
     assert resolved["stage"] == 7 and resolved["stage_name"] == "combined_dr"
     assert resolved["source_schedule_coordinate"] == 34999
-    assert len(plan.names) == 27 and not plan.description()["unassigned_scenarios"]
+    assert len(plan.names) == 40
+    assert plan.description()["unassigned_scenarios"] == list(plan.names[adapter.num_envs:])
     assert plan.curriculum.terrain_step_up_cap_m() == pytest.approx(.2)
     for motion in ("standing", "moving"):
         assert [plan.scenarios[f"jump_{motion}_{level}"]["jump_height_m"]
                 for level in ("low", "intermediate", "high")] == pytest.approx([.03, .10, .40])
     for row, name in enumerate(plan.row_names):
         assert sample.draw.jump_height_m[row] == pytest.approx(plan.scenarios[name]["jump_height_m"])
+
+
+def test_reviewed_low_speed_authored_and_100mm_cases_are_explicit(adapter):
+    from transformer_rl.formal.tasks.geometry import TerrainKind
+
+    router = adapter.env._terrain_course.router
+    router.manifest = {'tiles': [
+        {'name': 'flat', 'kind': int(TerrainKind.FLAT), 'parameters': {}},
+        {'name': 'step_up', 'kind': int(TerrainKind.STEP_UP), 'parameters': {'step_height_m': .02}},
+        {'name': 'road_step', 'kind': int(TerrainKind.STEP_UP), 'parameters': {'step_height_m': .2}},
+        {'name': 'central_steps', 'kind': int(TerrainKind.TWO_PLATFORMS), 'parameters': {'step_height_m': .2}},
+    ]}
+    plan = FixedCourseScenarios(adapter, CourseEvaluationConfig(scenarios=(
+        'authored_single_step', 'authored_single_step_low', 'authored_two_platforms', 'authored_two_platforms_low',
+        'jump_standing_100mm', 'jump_moving_100mm', 'jump_standing_low')))
+    for canonical in ('authored_single_step', 'authored_two_platforms'):
+        alias = canonical + '_low'
+        assert plan.fixed_tiles[canonical] == plan.fixed_tiles[alias]
+        assert plan.scenarios[alias]['step_up_m'] == .2
+        assert plan.scenarios[alias]['commands'][0][0] == plan.pool.config.approach_forward_m_s[0]
+        assert plan.scenarios[canonical]['commands'][0][0] == plan.pool.config.high_approach_forward_m_s[1]
+    for motion in ('standing', 'moving'):
+        assert plan.scenarios[f'jump_{motion}_100mm']['jump_height_m'] == .1
+    assert plan.scenarios['jump_standing_low']['jump_height_m'] == .03
+
+
+def test_high_speed_turn_cases_append_pool_targets_and_preserve_pressure_corner(adapter):
+    from transformer_rl.formal.tasks.command_pool import CommandPool, SegmentKind
+
+    pool = adapter.env._terrain_course.tasks.command_pool
+    adapter.env._terrain_course.tasks.command_pool = CommandPool(replace(
+        pool.config, approach_yaw_rad_s=.7, normal_yaw_rad_s=4.))
+    plan = FixedCourseScenarios(adapter, CourseEvaluationConfig())
+    appended = (
+        'forward_turning_left', 'forward_turning_right', 'fast_turning_negative',
+        'rough_forward_speed', 'rough_turning_left', 'rough_turning_right')
+    assert plan.names[-9:-3] == appended
+    assert plan.names[-11:-9] == ('jump_standing_100mm', 'jump_moving_100mm')
+    vx, height = plan.domain.forward_m_s[1], plan.domain.nominal_height_m
+    for name, yaw in (
+        ('fast_turning', 4.), ('fast_turning_negative', -4.),
+        ('forward_turning_left', .7), ('forward_turning_right', -.7),
+        ('rough_forward_speed', 0.), ('rough_turning_left', .7), ('rough_turning_right', -.7),
+    ):
+        assert plan.scenarios[name]['commands'] == [[vx, 0., yaw, height]]
+        assert plan.scenarios[name]['gimbal'] == 'hold'
+    # Explicit selection reaches the same ordinary native admission as a
+    # sampled NORMAL/DASH target, including the negative-yaw pressure case.
+    selected = FixedCourseScenarios(adapter, CourseEvaluationConfig(scenarios=appended))
+    selected.install()
+    try:
+        tasks = adapter.env._terrain_course.tasks
+        ids = torch.arange(adapter.num_envs)
+        sample = adapter.env._task_sampler(ids)
+        tasks.reset(ids, sample, torch.zeros(adapter.num_envs, dtype=torch.float64),
+                    terrain_kind=sample.terrain_kind, terrain_step_height_m=sample.draw.step_up_m)
+        assert tasks.segment_kind.eq(int(SegmentKind.NORMAL)).all()
+        assert not tasks.heading_enabled.any()
+        for time in (.02, 5.02, 10.02):
+            tasks.elapsed.fill_(time)
+            tasks.segment_end_s.zero_()
+            admission = tasks.step(torch.full((adapter.num_envs,), time, dtype=torch.float64),
+                                   None, torch.zeros(adapter.num_envs),
+                                   yaw_rad=torch.zeros(adapter.num_envs))[0]
+            torch.testing.assert_close(admission.admitted, sample.command)
+    finally:
+        selected.close()
+
+
+def test_signed_spin_endpoints_keep_zero_translation_through_native_segments(adapter):
+    from transformer_rl.formal.tasks.command_pool import CommandPool
+
+    pool = adapter.env._terrain_course.tasks.command_pool
+    adapter.env._terrain_course.tasks.command_pool = CommandPool(replace(
+        pool.config, spin_mid_rad_s=(3.5, 8.)))
+    names = ('in_place_rotation', 'in_place_rotation_negative',
+             'in_place_rotation_high_positive', 'in_place_rotation_high_negative')
+    plan = FixedCourseScenarios(adapter, CourseEvaluationConfig(scenarios=names))
+    plan.install()
+    try:
+        ids = torch.arange(adapter.num_envs)
+        sample = adapter.env._task_sampler(ids)
+        expected = torch.tensor((3.5, -3.5, 8., -8.)).repeat(adapter.num_envs // 4)
+        torch.testing.assert_close(sample.command[:, :2], torch.zeros(adapter.num_envs, 2))
+        torch.testing.assert_close(sample.command[:, 2], expected)
+        tasks = adapter.env._terrain_course.tasks
+        tasks.reset(ids, sample, torch.zeros(adapter.num_envs, dtype=torch.float64),
+                    terrain_kind=sample.terrain_kind, terrain_step_height_m=sample.draw.step_up_m)
+        for time in (.02, 5.02, 10.02):
+            tasks.elapsed.fill_(time)
+            tasks.segment_end_s.zero_()
+            admission = tasks.step(torch.full((adapter.num_envs,), time, dtype=torch.float64),
+                                   None, torch.zeros(adapter.num_envs),
+                                   yaw_rad=torch.zeros(adapter.num_envs))[0]
+            torch.testing.assert_close(admission.admitted, sample.command)
+    finally:
+        plan.close()
+
+
+def test_high_speed_rough_cases_use_existing_rough_tiles_and_native_mode(adapter):
+    from transformer_rl.formal.control.observation import CommandMode
+    from transformer_rl.formal.tasks.geometry import TerrainKind
+
+    adapter.env._terrain_course.router.manifest = {'tiles': [
+        {'name': 'flat', 'kind': int(TerrainKind.FLAT), 'parameters': {}},
+        {'name': 'rough_low', 'kind': int(TerrainKind.ROUGH), 'parameters': {'roughness_m': .005}},
+        {'name': 'rough_high', 'kind': int(TerrainKind.ROUGH), 'parameters': {'roughness_m': .02}},
+    ]}
+    names = ('forward_turning_left', 'forward_turning_right', 'fast_turning_negative',
+             'rough', 'rough_forward_speed', 'rough_turning_left', 'rough_turning_right')
+    plan = FixedCourseScenarios(adapter, CourseEvaluationConfig(scenarios=names))
+    ids = torch.arange(adapter.num_envs)
+    sample = adapter.env._task_sampler.map_draw(plan.sample(ids))
+    for row, name in enumerate(plan.row_names):
+        rough = name.startswith('rough')
+        assert plan.fixed_tiles[name] == (2 if rough else 0)
+        assert sample.terrain_kind[row] == int(TerrainKind.ROUGH if rough else TerrainKind.FLAT)
+        assert sample.mode[row] == int(CommandMode.NORMAL)
+    assert plan.scenarios['rough']['commands'][0][0] == plan.pool.config.approach_forward_m_s[0]
 
 
 def test_source_task_reset_uses_fixed_braking_segments_and_gimbal_contract(adapter):
@@ -128,6 +248,130 @@ def test_family_selection_and_unassigned_coverage_are_explicit(adapter):
     assert report["unassigned_scenarios"] == list(plan.names[1:])
     with pytest.raises(ValueError, match="Unknown fixed scenario"):
         FixedCourseScenarios(adapter, CourseEvaluationConfig(scenarios=("imagined_success",)))
+
+
+def test_fixed_bridge_cases_keep_native_ids_and_distinct_endpoint_labels(adapter):
+    from supermimic_rl.course.recovery_bridge import BRIDGE_VARIANTS, RECOVERY_VARIANTS
+    from transformer_rl.formal.tasks.recovery import RECOVERY_NAMES
+
+    with pytest.raises(ValueError, match='enabled birth geometry'):
+        FixedCourseScenarios(adapter, CourseEvaluationConfig(recovery_bridges=True))
+    adapter.curriculum = type(adapter.curriculum)(adapter.num_envs, config=replace(
+        adapter.curriculum.config, recovery_roll_bridge=True, recovery_postures=RECOVERY_NAMES))
+    bridge = SimpleNamespace(evaluation=False, fixed_variants=None)
+    adapter.env.supermimic_recovery_bridge = bridge
+    original = adapter.curriculum
+    rng = original.sampler.generator.get_state().clone()
+    plan = FixedCourseScenarios(adapter, CourseEvaluationConfig(family='RECOVERY', recovery_bridges=True))
+    assert plan.names == tuple('recovery_' + name for name in RECOVERY_VARIANTS)
+    plan.install()
+    try:
+        rows = torch.arange(adapter.num_envs)
+        sample = adapter.env._task_sampler(rows)
+        assert sample.draw.recovery_posture[:16].tolist() == list(range(16))
+        assert sample.draw.recovery_posture[16:22].tolist() == [4, 5, 4, 5, 4, 5]
+        assert bridge.fixed_variants.tolist() == (rows % 22).tolist()
+        report = plan.description()
+        assert report['recovery_birth_variants']['row_variant'][16:22] == list(BRIDGE_VARIANTS)
+        assert report['selection']['recovery_bridges'] is True
+        assert torch.equal(original.sampler.generator.get_state(), rng)
+        sample = adapter.env._task_sampler(torch.tensor([21, 4, 16]))
+        assert sample.draw.recovery_posture.tolist() == [5, 4, 4]
+    finally:
+        plan.close()
+    assert bridge.evaluation is False and bridge.fixed_variants is None
+    assert adapter.curriculum is original
+
+
+def test_fixed_bridge_selection_requires_installed_geometry_and_boolean_config(adapter):
+    with pytest.raises(ValueError, match='Invalid fixed'):
+        CourseEvaluationConfig(recovery_bridges=1)
+    adapter.curriculum = type(adapter.curriculum)(adapter.num_envs, config=replace(
+        adapter.curriculum.config, recovery_roll_bridge=True))
+    plan = FixedCourseScenarios(adapter, CourseEvaluationConfig(recovery_bridges=True, family='RECOVERY'))
+    with pytest.raises(ValueError, match='has not been installed'):
+        plan.install()
+    assert plan._restore == []
+
+
+def test_fixed_midpoints_are_explicit_repeatable_and_keep_original_twenty_two(adapter):
+    from supermimic_rl.course.recovery_bridge import MIDPOINT_VARIANTS, RECOVERY_VARIANTS
+    from transformer_rl.formal.tasks.recovery import RECOVERY_NAMES
+
+    with pytest.raises(ValueError, match='Invalid fixed'):
+        CourseEvaluationConfig(recovery_midpoints=1)
+    with pytest.raises(ValueError, match='enabled midpoint birth geometry'):
+        FixedCourseScenarios(adapter, CourseEvaluationConfig(recovery_midpoints=True))
+    adapter.curriculum = type(adapter.curriculum)(adapter.num_envs, config=replace(
+        adapter.curriculum.config, recovery_roll_bridge=True, recovery_midpoint_bridge=True,
+        recovery_postures=RECOVERY_NAMES))
+    bridge = SimpleNamespace(evaluation=False, fixed_variants=None)
+    adapter.env.supermimic_recovery_bridge = bridge
+    # Enabling training midpoints does not opt a fixed evaluation into them.
+    old = FixedCourseScenarios(adapter, CourseEvaluationConfig(family='RECOVERY', recovery_bridges=True))
+    assert old.names == tuple('recovery_' + name for name in RECOVERY_VARIANTS)
+    old.install()
+    assert bridge.fixed_variants.tolist() == (torch.arange(adapter.num_envs) % 22).tolist()
+    old.close()
+    names = tuple('recovery_' + name for name in MIDPOINT_VARIANTS)
+    plan = FixedCourseScenarios(adapter, CourseEvaluationConfig(
+        scenarios=names, recovery_midpoints=True, family='RECOVERY'))
+    rng = adapter.curriculum.sampler.generator.get_state().clone()
+    original = adapter.curriculum
+    plan.install()
+    try:
+        for ids in (torch.arange(adapter.num_envs), torch.tensor([7, 0, 2, 5])):
+            sample = adapter.env._task_sampler(ids)
+            assert sample.draw.recovery_posture.tolist() == [[4, 5, 8, 9][int(i) % 4] for i in ids]
+            assert bridge.fixed_variants[ids].tolist() == (22 + ids % 4).tolist()
+        report = plan.description()
+        assert report['recovery_birth_variants']['row_variant'][:4] == list(MIDPOINT_VARIANTS)
+        assert report['selection']['recovery_midpoints'] is True
+        assert 'recovery_bridges' not in report['selection']
+        assert plan.gimbal_pitch_slots[:8] == (0, 0, 0, 0, 1, 1, 1, 1)
+        assert torch.equal(original.sampler.generator.get_state(), rng)
+    finally:
+        plan.close()
+    assert not bridge.evaluation and bridge.fixed_variants is None
+    assert adapter.curriculum is original
+    ordinary = FixedCourseScenarios(adapter, CourseEvaluationConfig())
+    assert 'recovery_midpoints' not in ordinary.description()['selection']
+    assert not any(name in ordinary.names for name in names)
+
+
+@pytest.mark.parametrize('bridges', [False, True])
+def test_recovery_repetitions_balance_gimbal_endpoints_without_rng_draws(adapter, bridges):
+    from transformer_rl.formal.tasks.gimbal_course import GimbalCourse
+    from transformer_rl.formal.tasks.recovery import RECOVERY_NAMES
+
+    count = 22 if bridges else 16
+    adapter.num_envs = 4 * count
+    adapter.curriculum = type(adapter.curriculum)(adapter.num_envs, config=replace(
+        adapter.curriculum.config, recovery_roll_bridge=bridges, recovery_postures=RECOVERY_NAMES))
+    course = GimbalCourse(adapter.env._gimbal_course.config, adapter.num_envs)
+    adapter.env._gimbal_course = course
+    adapter.env._terrain_course.tasks.elapsed = torch.zeros(adapter.num_envs)
+    adapter.env._terrain_course.recovery = SimpleNamespace(config=SimpleNamespace(timeout_s=5.))
+    rng = adapter.curriculum.sampler.generator.get_state().clone()
+    plan = FixedCourseScenarios(adapter, CourseEvaluationConfig(
+        family='RECOVERY', recovery_qualification=True, recovery_bridges=bridges))
+    assert len(plan.names) == count
+    rows = torch.arange(adapter.num_envs)
+    angles = torch.zeros(adapter.num_envs, 2)
+    eligible = torch.ones(adapter.num_envs, dtype=torch.bool)
+    plan.draw_gimbal(rows, angles, eligible, update=0)
+    initial = course.target[:, 1].clone()
+    for name in plan.names:
+        selected = [row for row, scenario in enumerate(plan.row_names) if scenario == name]
+        assert initial[selected].tolist() == pytest.approx(list(course.config.pitch_target_rad) * 2)
+    description = plan.description()
+    assert description['recovery_gimbal_assignment']['version'] == 1
+    assert [r['initial_pitch_target_rad'] for r in description['row_assignment']] == pytest.approx(initial.tolist())
+    adapter.env._terrain_course.tasks.elapsed.fill_(plan.pool.config.segment_s[0])
+    plan.draw_gimbal(rows, angles, eligible, update=0)
+    assert course.target[:, 1].tolist() == pytest.approx(
+        [course.config.pitch_target_rad[1 - slot] for slot in plan.gimbal_pitch_slots])
+    torch.testing.assert_close(rng, adapter.curriculum.sampler.generator.get_state(), atol=0, rtol=0)
 
 
 def test_fixed_jump_evaluation_uses_the_selected_schedule_order_and_domain(adapter):
@@ -486,9 +730,10 @@ def test_native_jump_request_reaches_course_report_and_hooks_restore(monkeypatch
     env = native_jumps()
     env._episode_id = torch.zeros(1, dtype=torch.long)
     env._interval_policy_owned = torch.ones(1, dtype=torch.bool)
-    counters = {'physical_request_outcomes': {}, 'request_end_counts': {},
-                'recovery': {'counts': {}}, 'authored_stair_completion': {}}
-    env._terrain_course.metrics = lambda: counters
+    env._terrain_course.metrics = lambda: {
+        'physical_request_outcomes': {'verified_success': int(
+            env._terrain_course.tasks.physical_outcome_counts[0])},
+        'request_end_counts': {}, 'recovery': {'counts': {}}, 'authored_stair_completion': {}}
     evaluator = CourseEvaluation(SimpleNamespace(env=env, reset=lambda: None))
     monkeypatch.setattr(evaluation, 'FixedCourseScenarios', Plan)
     evaluator.begin(StateSchema((Field('unused', ()),), ()))
@@ -507,13 +752,42 @@ def test_native_jump_request_reaches_course_report_and_hooks_restore(monkeypatch
         assert request['request_id'] == 7 and request['observed_intervals'] == 1
         assert request['physical_end_reason'] == 'active_at_evaluation_end'
         assert not request['native_verified_physical_success']
+        for _ in range(2):
+            tasks.observe_physics(torch.zeros(1, 2), torch.tensor([.4]), torch.zeros(1),
+                torch.tensor([.38]), angular_speed_rad_s=torch.zeros(1))
+        for _ in range(399):
+            tasks.observe_physics(torch.full((1, 2), 20.), torch.zeros(1), torch.zeros(1),
+                torch.tensor([.32]), angular_speed_rad_s=torch.zeros(1))
+        assert tasks.physical_outcome_counts[0] == 0
+        # The final policy interval certifies at a physics substep. Native
+        # command advancement then clears success_id before snapshot packing.
+        for _ in range(4):
+            tasks.observe_physics(torch.full((1, 2), 20.), torch.zeros(1), torch.zeros(1),
+                torch.tensor([.32]), angular_speed_rad_s=torch.zeros(1))
+        tasks.step(now + .02, estimate, torch.zeros(1))
+        assert tasks.success_id.item() == -1
+        completed = Transition(snapshot, torch.zeros(1, 6), snapshot, torch.ones(1),
+            torch.zeros(1, dtype=torch.bool), torch.zeros(1, dtype=torch.bool), torch.ones(1, dtype=torch.bool))
+        tracking = NativeTrackingSample(torch.zeros(1, 3), torch.zeros(1, 3), course={
+            'command_source': torch.tensor([2]), 'recovery_active': torch.tensor([False]),
+            'recovery_after_handoff': torch.tensor([False])})
+        evaluator.step(completed, tracking)
+        evaluator.step(completed, tracking)  # No new physical event: never pay it twice.
+        report = evaluator.summary()
+        bucket = report['buckets']['jump_fixture']
+        assert bucket['jump_physical_success_events'] == bucket['jump_physical_success_events_raw'] == 1
+        assert bucket['jump_physical_success_events_excluded'] == bucket['jump_endpoint_success_samples'] == 0
+        assert bucket['command_phases']['native_handoff']['jump_physical_success_events'] == 1
+        assert bucket['recovery_phases']['other']['jump_physical_success_events'] == 1
+        assert report['jump_diagnostics']['by_scenario']['jump_fixture']['validated_verified_successes'] == 1
+        assert report['physical_counter_deltas_after_initial_reset']['physical_request_outcomes']['verified_success'] == 1
     finally:
         evaluator.close()
     assert all(name not in tasks.__dict__ for name in ('step', 'observe_physics', 'reset'))
     assert 'step' not in tasks.protocol.__dict__
 
 
-def test_course_metrics_use_transition_endpoint_and_subtract_old_training_counters():
+def test_course_metrics_label_endpoint_flags_separately_from_physical_events():
     schema = StateSchema(tuple(Field(name, ()) for name in (
         "course.tasks.family", "course.tasks.terrain_kind", "course.terrain_tile", "course.gimbal.mode",
         "course.tasks.success_id.valid", "course.recovery._verified")), ())
@@ -545,8 +819,11 @@ def test_course_metrics_use_transition_endpoint_and_subtract_old_training_counte
             "translation_target_m_s": torch.tensor([[0., 1.], [0., 0.]]),
             "translation_active": torch.tensor([True, False])}))
     report = evaluator.summary()
-    assert report["buckets"]["jump"]["jump_physical_success_events"] == 1
-    assert report["buckets"]["righting"]["recovery_physical_success_events"] == 1
+    assert report["buckets"]["jump"]["jump_endpoint_success_samples"] == 1
+    assert report["buckets"]["righting"]["recovery_endpoint_verified_rises"] == 1
+    assert report["buckets"]["jump"]["jump_physical_success_events"] == 0
+    assert report["buckets"]["righting"]["recovery_physical_success_events"] == 0
+    assert report['physical_event_observers'] == {'jump': False, 'recovery': False}
     assert report["buckets"]["jump"]["actual"]["tile"] == {"8": 1}
     assert report["buckets"]["righting"]["policy_owned_samples"] == 0
     assert report["buckets"]["jump"]["tracking"]["rmse"] == [1., 2., 3.]
@@ -557,6 +834,54 @@ def test_course_metrics_use_transition_endpoint_and_subtract_old_training_counte
     delta = report["physical_counter_deltas_after_initial_reset"]
     assert delta["physical_request_outcomes"]["verified_success"] == 1
     assert delta["authored_stair_completion"]["ended_complete_by_tile"] == [1, 0]
+
+
+def test_physical_event_attribution_preserves_raw_counts_and_valid_denominators():
+    from supermimic_rl.course.physical_events import PhysicalSuccessEvents
+
+    n = 6
+    schema = StateSchema((Field('unused', ()),), ())
+    start = Snapshot(torch.zeros(n, 1), torch.zeros(n, 35), torch.zeros(n, 11), torch.empty(n, 0),
+        torch.zeros(n, dtype=torch.long), torch.zeros(n, dtype=torch.long), torch.ones(n, dtype=torch.bool))
+    end = replace(start, episode_id=torch.tensor([0, 0, 0, 0, 1, 0]))
+    transition = Transition(start, torch.zeros(n, 6), end, torch.ones(n),
+        torch.zeros(n, dtype=torch.bool), torch.zeros(n, dtype=torch.bool),
+        torch.tensor([True, False, True, True, True, True]))
+    counters = {'physical_request_outcomes': {}, 'request_end_counts': {},
+                'recovery': {'counts': {}}, 'authored_stair_completion': {}}
+    evaluator = CourseEvaluation(SimpleNamespace(env=SimpleNamespace(
+        _terrain_course=SimpleNamespace(metrics=lambda: counters))))
+    evaluator.schema, evaluator.before = schema, counters
+    evaluator.plan = SimpleNamespace(names=('jump',), row_names=('jump',) * n,
+                                     description=lambda: {})
+    events = PhysicalSuccessEvents(evaluator.plan.row_names)
+    for row in range(n):
+        events.record(row, 99 if row == 5 else 0, request=7,
+                      prior_invalid=row == 2, nonfinite_physical_ticks=int(row == 3))
+    events.record(0, 0, request=7)  # The same native identity cannot create a second event.
+    evaluator.jump_evidence = SimpleNamespace(observe_transition=events.observe_transition,
+        summary=lambda: {'physical_success_events': events.summary()})
+    tracking = NativeTrackingSample(torch.zeros(n, 3), torch.zeros(n, 3), course={
+        'command_source': torch.ones(n, dtype=torch.long),
+        'recovery_active': torch.ones(n, dtype=torch.bool),
+        'recovery_after_handoff': torch.zeros(n, dtype=torch.bool)})
+    evaluator.step(transition, tracking)
+    report = evaluator.summary()
+    bucket = report['buckets']['jump']
+    assert (bucket['samples'], bucket['valid_samples'], bucket['invalid_count']) == (6, 5, 1)
+    assert bucket['jump_physical_success_events_raw'] == 6
+    assert bucket['jump_physical_success_events'] == 1
+    assert bucket['jump_physical_success_events_excluded'] == 5
+    assert bucket['command_phases']['scheduled_segment']['jump_physical_success_events_raw'] == 5
+    assert bucket['command_phases']['scheduled_segment']['jump_physical_success_events'] == 1
+    unmatched = bucket['command_phases']['unattributed_physical_events']
+    assert unmatched['samples'] == unmatched['valid_samples'] == 0
+    assert unmatched['jump_physical_success_events_raw'] == unmatched['jump_physical_success_events_excluded'] == 1
+    assert bucket['recovery_phases']['recovery']['jump_physical_success_events'] == 1
+    assert bucket['recovery_phases']['unattributed_physical_events']['samples'] == 0
+    assert bucket['tracking']['samples'] == 5
+    evaluator.step(transition, tracking)
+    assert evaluator.summary()['buckets']['jump']['jump_physical_success_events_raw'] == 6
 
 
 def test_gimbal_ranges_and_tracking_only_count_active_rows():
@@ -618,7 +943,8 @@ def test_invalid_course_rows_do_not_become_failures_successes_or_tracking_eviden
     assert bucket['samples'] == 5 and bucket['valid_samples'] == 2 and bucket['invalid_count'] == 3
     assert bucket['nonfinite_measurement_count'] == 2
     assert bucket['terminated'] == 1 and bucket['reward_sum'] == 3.
-    assert bucket['jump_physical_success_events'] == bucket['recovery_physical_success_events'] == 2
+    assert bucket['jump_endpoint_success_samples'] == bucket['recovery_endpoint_verified_rises'] == 2
+    assert bucket['jump_physical_success_events'] == bucket['recovery_physical_success_events'] == 0
     assert bucket['actual']['tile'] == {'0': 2}
     assert bucket['tracking']['samples'] == 2
     assert bucket['tracking']['mae'] == pytest.approx([1.6, 1.05, .16])
@@ -627,6 +953,12 @@ def test_invalid_course_rows_do_not_become_failures_successes_or_tracking_eviden
     assert bucket['routed_terrain_ranges']['routed_step_height_m']['max'] == pytest.approx([.2])
     assert bucket['gimbal']['translation_tracking']['samples'] == 2
     assert bucket['authored_whole_course']['ended'] == 2
+    assert bucket['authored_whole_course_raw']['ended'] == 5
+    assert bucket['authored_whole_course_excluded']['ended'] == 3
+    assert bucket['authored_whole_course_raw']['complete'] == 5
+    assert bucket['authored_whole_course_excluded']['complete'] == 3
+    assert bucket['authored_whole_course']['complete'] == 2
+    assert 'Raw completion flags are not certified' in report['authored_counter_semantics']
     assert not evaluator._authored_pending.any()
     assert bucket['command_phases']['scheduled_segment']['invalid_count'] == 3
     assert 'raw upstream' in report['native_counter_semantics']
@@ -669,8 +1001,45 @@ def test_authored_events_keep_row_identity_through_finish_and_reset():
         assert evaluator.buckets["single"]["authored_whole_course"]["complete"] == 1
         assert evaluator.buckets["double"]["authored_whole_course"]["complete"] == 0
         assert evaluator.buckets["double"]["authored_whole_course"]["incomplete"] == 1
+        assert evaluator.buckets['single']['authored_whole_course_raw']['started'] == 2
+        assert evaluator.buckets['double']['authored_whole_course_raw']['started'] == 1
+        assert 'authored_whole_course_excluded' not in evaluator.buckets['single']
         assert evaluator._authored_pending.eq(0).all()
+        # Collision/invalid-reset intervals still close and reopen a native
+        # attempt. They must not disappear or acquire a trusted success.
+        evidence.reset(torch.tensor([0]), torch.tensor([0]), torch.zeros(1, 3))
+        transition.valid[0] = False
+        evaluator.step(transition, NativeTrackingSample(torch.zeros(2, 3), torch.zeros(2, 3)))
+        bucket = evaluator.buckets['single']
+        assert bucket['authored_whole_course_raw']['started'] == 3
+        assert bucket['authored_whole_course_raw']['ended'] == 2
+        assert bucket['authored_whole_course_excluded'] == {
+            'started': 1, 'ended': 1, 'complete': 0, 'ended_complete': 0, 'incomplete': 1}
+        assert bucket['authored_whole_course']['started'] == 2
+        assert bucket['authored_whole_course']['ended'] == 1
+        assert bucket['authored_whole_course']['complete'] == 1
+        transition.valid[0] = True
+        evaluator.step(transition, NativeTrackingSample(torch.zeros(2, 3), torch.zeros(2, 3)))
+        assert bucket['authored_whole_course_raw']['started'] == 3
+        assert bucket['authored_whole_course']['ended'] == 1
     finally:
         evaluator.close()
     assert evidence.observe.__func__ is original_observe
     assert not {"observe", "reset", "_finish"} & evidence.__dict__.keys()
+
+
+def test_fixed_plan_disables_bridge_even_without_factory_evaluation_config(adapter):
+    bridge = SimpleNamespace(evaluation=False)
+    adapter.env.supermimic_recovery_bridge = bridge
+    plan = FixedCourseScenarios(adapter, CourseEvaluationConfig(family='RECOVERY'))
+    plan.install()
+    try:
+        assert bridge.evaluation is True
+        ids = torch.arange(adapter.num_envs)
+        sample = adapter.env._task_sampler(ids)
+        assert (sample.draw.recovery_posture < 16).all()
+        assert all('side_45' not in name and 'side_60' not in name and 'side_75' not in name
+                   for name in plan.row_names)
+    finally:
+        plan.close()
+    assert bridge.evaluation is False

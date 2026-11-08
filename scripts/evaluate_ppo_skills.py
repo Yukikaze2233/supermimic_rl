@@ -2,7 +2,7 @@
 """Per-skill native evaluation of a PPO actor on the fixed course task suite.
 
 The factory config must contain an ``evaluation`` section (fixed scenarios,
-e.g. ``{"evaluation_stage": "combined_dr", "seed": 7}`` for all 27). The PPO
+e.g. ``{"evaluation_stage": "combined_dr", "seed": 7}`` for the full bank). The PPO
 actor reads the native ``obs_buf`` history exactly as in PPO training, not the
 collector's handoff-refilled history; actions default to its deterministic mean.
 Optional PPO Gaussian sampling uses the checkpoint std and an independent RNG
@@ -30,6 +30,8 @@ class NativeHistoryActor:
         if type(sampling_seed) is not int or not 0 <= sampling_seed < 2**63:
             raise ValueError("Evaluation sampling seed must be an integer in [0, 2**63)")
         self.actor, self.environment, self._estimate = actor, environment, None
+        if actor.features.configuration is not None:
+            actor.features.validate_reference(environment.adapter.env._terrain_course.tasks.reference.config)
         self.action_sampling, self.sampling_seed = action_sampling, sampling_seed
         self._action_rng = (torch.Generator(device=actor.log_std.device).manual_seed(sampling_seed)
                             if action_sampling == "ppo-gaussian" else None)
@@ -39,11 +41,12 @@ class NativeHistoryActor:
         return self
 
     def _history(self):
-        from supermimic_rl.ppo.policy import FRAME_DIM, HISTORY_LENGTH
+        from supermimic_rl.ppo.policy import HISTORY_LENGTH
+        from supermimic_rl.chassis_observation import chassis_frame
 
         native = self.environment.adapter.env
         frames = native.obs_buf["policy"].reshape(self.environment.num_envs, HISTORY_LENGTH, NATIVE_FRAME_DIM)
-        return frames[..., :FRAME_DIM]
+        return chassis_frame(frames, self.actor.chassis_command_contract)
 
     def __call__(self, history):
         native = self._history()
@@ -61,6 +64,7 @@ class NativeHistoryActor:
 
     def sampling_report(self):
         return {"mode": self.action_sampling,
+                "actor_features": self.actor.features.configuration,
                 "seed": self.sampling_seed if self._action_rng is not None else None,
                 "checkpoint_std": self.actor.log_std.detach().exp().cpu().tolist(),
                 "std_semantics": "checkpoint Gaussian action units before clipping; unused in deterministic mode",
@@ -72,6 +76,8 @@ def main():
     parser.add_argument("--factory-config", type=Path, required=True)
     parser.add_argument("--checkpoint", type=Path, required=True)
     parser.add_argument("--steps", type=int, default=1000)
+    parser.add_argument("--record-dataset", action="store_true",
+                        help="Save this evaluation's complete compact V2 replay for world-model training")
     parser.add_argument("--action-sampling", choices=("deterministic", "ppo-gaussian"), default="deterministic")
     parser.add_argument("--sampling-seed", type=int, default=0,
                         help="Independent action RNG seed for --action-sampling ppo-gaussian")
@@ -86,7 +92,12 @@ def main():
     if output.exists() and any(output.iterdir()):
         raise FileExistsError("Use a new evaluation output directory")
     output.mkdir(parents=True, exist_ok=True)
-    factory["record_substeps"] = True
+    if args.record_dataset:
+        factory["record_substeps"] = True
+    else:
+        # The native skill observers read physical ticks directly. An unused
+        # world-model substep recorder adds packing work to every physics step.
+        factory.update(record_substeps=False, substep_audit=False, record_disturbances=False)
     factory["native_log_directory"] = str(output / "native")
     (output / "factory-config.json").write_text(json.dumps(factory, indent=2) + "\n")
 
@@ -94,7 +105,6 @@ def main():
     from supermimic_rl.adapters.packed import PackedEnvironment
     from supermimic_rl.cli import _native_schema_source, native_logs
     from supermimic_rl.ppo.trainer import load_actor
-    from supermimic_rl.world_model_v2.evaluation import evaluate_native
     from supermimic_rl.world_model_v2.teacher import file_sha256
 
     with native_logs(output / "native"):
@@ -115,7 +125,20 @@ def main():
             policy = NativeHistoryActor(actor, environment, action_sampling=args.action_sampling,
                                         sampling_seed=args.sampling_seed)
             with torch.no_grad():
-                report = evaluate_native(environment, policy, args.steps, on_progress=progress)
+                if args.record_dataset:
+                    # Recording is still subject to the world-model contract.
+                    # PPO-only physics extensions are not silently encoded as
+                    # a compatible V2 replay by the non-recording evaluator.
+                    from supermimic_rl.world_model_v2.evaluation import evaluate_native
+
+                    report = evaluate_native(environment, policy, args.steps, on_progress=progress,
+                        record_dataset=output / "replay.pt",
+                        recording_source={"kind": "own_ppo_native_evaluation", "checkpoint": str(args.checkpoint.resolve()),
+                            "checkpoint_sha256": digest, "action_sampling": policy.sampling_report()})
+                else:
+                    from supermimic_rl.ppo.native_skill_evaluation import evaluate_native_policy
+
+                    report = evaluate_native_policy(environment, policy, args.steps, on_progress=progress)
             if file_sha256(args.checkpoint) != digest:
                 raise ValueError("Checkpoint changed during evaluation")
             report.update(checkpoint=str(args.checkpoint.resolve()), checkpoint_sha256=digest,

@@ -48,6 +48,14 @@ base COM 的世界 z 速度；`com_velocity()` 根据已有 COM 偏移计算
 落地参考中的当前地面与命令高度也保留连续梯度。物理成功必须满足原生腾空、上升、峰高、
 支持起点与稳定落地条件，不能由请求时钟或预测的奖励网络制造。
 
+开启共享跳跃扩展时，高度／速度参考只有在首次真实腾空后接地才切到落地目标。
+压缩时两轮短暂卸载并重新接触仍可能使原生接触 phase 变成 `LANDING`，但不能因此
+把尚未执行的蹬伸目标清零。原生采样入口和 `JumpTask.observe_interval()` 共用
+`jump_tracking_targets()`，使用已有 first-flight latch；请求协议、接触 phase、
+Actor 输入、力矩限制和成功判据不变。未开启 latch 的原生对齐测试保留旧行为。
+采集来源中的 `reward_kernel.jump_tracking_reference=first_real_flight_landing_v1`
+标识这一奖励变化，旧来源的 checkpoint/replay 不得直接冒充新来源恢复。
+
 ## 可选 Critic 特征
 
 `state.critic_features(physical, motion, config)` 返回 `JUMP_FEATURE_DIM=32`：
@@ -118,3 +126,29 @@ compact 数据没有独立保存四个子步的原生 phase／reward reference�
 因此报告只声称最后物理 phase、持续任务记忆及下一边界协议的一致性；下一参考曲线来自
 实际记录任务状态的重建，不能称为四子步独立 reference 真值验证。
 审计通过也不证明数据源教师有跳跃能力：foundation 教师在 REQUEST 课程采到的失败样本仍是有效动力学数据。
+
+## 跳跃目标修正的在线断点迁移
+
+`upgrade_online_reward_reference.py` 默认处理 `4467228` 修正的提前 LANDING 目标问题。
+输入完整 checkpoint/replay、修正版本的原生参考数据，以及同一教师权重的新原生评价产物。
+物理、观测、任务参数、奖励数值权重和所有记录字段必须相同；只更新 reward kernel 来源。
+Actor、Critic、世界模型、估计器、Adam、归一化、课程及 RNG 全部保留，不追加 warmup。
+
+```sh
+python scripts/upgrade_online_reward_reference.py \
+  --checkpoint /absolute/path/resume.pt \
+  --reference-dataset /absolute/path/native-reference/replay.pt \
+  --source-teacher /absolute/path/source-teacher.pt \
+  --target-teacher /absolute/path/reevaluated-teacher.pt \
+  --output /absolute/path/new-run/training
+```
+
+旧 replay 的物理/任务状态和有效标记保持原样，原有无效任务记录不会变成可用起点。
+存储的 `reward` 仍是旧版本实际测量值，迁移收据的 `legacy_reward_sequence_before`
+标识这些历史行；不能将其用于新版奖励一致性检查。世界模型拟合使用物理子步监督，
+策略/价值目标在想象中按新版公式重新计算，不读取这些历史奖励作为目标。
+后续回放轮换会自然替换旧行；迁移本身不修改样本、任务记忆或模型权重。
+
+`--change recovery-quiet` 是独立的已知来源迁移，仅启用 1/s 恢复接稳扩展；
+要求输入已经包含上述 LANDING 修正，其他奖励权重不变。
+具体公式与使用边界见 [恢复任务说明](WORLD_MODEL_V2_RECOVERY_TASK.md#可选恢复接稳奖励)。

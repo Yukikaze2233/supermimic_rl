@@ -24,6 +24,8 @@ import torch
 from torch import Tensor, nn
 
 from ..contracts import ACTION_BOUNDS
+from ..chassis_observation import COMMAND_CONTRACTS, LEGACY_COMMANDS
+from ..actor_features import ActorFeatures
 
 HISTORY_LENGTH = 5
 FRAME_DIM = 35
@@ -54,11 +56,16 @@ class TeacherActor(nn.Module):
 
     def __init__(self, hidden: tuple[int, ...] = (512, 256, 128), estimator_hidden: tuple[int, ...] = (128, 64),
                  initial_std: float = 1., *, mean_squash: str = "tanh",
-                 action_bounds: tuple[float, ...] = ACTION_BOUNDS):
+                 action_bounds: tuple[float, ...] = ACTION_BOUNDS,
+                 chassis_command_contract: str = LEGACY_COMMANDS, actor_features: dict | None = None):
         super().__init__()
         if mean_squash not in MEAN_SQUASHES:
             raise ValueError(f"mean_squash must be one of {MEAN_SQUASHES}")
         self.mean_squash = mean_squash
+        if chassis_command_contract not in COMMAND_CONTRACTS:
+            raise ValueError("Unknown chassis command contract")
+        self.chassis_command_contract = chassis_command_contract
+        self.features = ActorFeatures(actor_features)
         self.estimator = HistoryEstimator(estimator_hidden)
         self.network = mlp(HISTORY_LENGTH * FRAME_DIM + ESTIMATE_DIM, hidden, 6)
         nn.init.uniform_(self.network[-1].weight, -1e-2, 1e-2)
@@ -72,7 +79,7 @@ class TeacherActor(nn.Module):
             raise ValueError("Teacher actor requires chronological [batch, 5, 35] deployed frames")
         if estimate is None:
             estimate = self.estimator(history)
-        raw = self.network(torch.cat((history.flatten(-2), estimate.detach()), -1))
+        raw = self.network(torch.cat((self.features(history).flatten(-2), estimate.detach()), -1))
         return torch.tanh(raw) * self.action_bounds if self.mean_squash == "tanh" else raw
 
     def distribution(self, history: Tensor) -> torch.distributions.Normal:

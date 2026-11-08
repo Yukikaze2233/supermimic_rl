@@ -5,6 +5,8 @@ from dataclasses import asdict
 
 import torch
 
+from .physical_events import PhysicalSuccessEvents
+
 
 class RecoveryEvaluation:
     """Read native predicates/clocks without changing decisions, state or RNG.
@@ -25,6 +27,7 @@ class RecoveryEvaluation:
         self.row_names = tuple(row_names)
         n, device = self.native.num_envs, self.native.device
         self._restore, self.records, self.pending = [], {}, set()
+        self.success_events = PhysicalSuccessEvents(self.row_names)
         self.pending_birth = set()
         self.keys = [None] * n
         self.after_handoff = torch.zeros(n, dtype=torch.bool, device=device)
@@ -73,8 +76,16 @@ class RecoveryEvaluation:
         def finished(now_s, estimate, *, policy_owned, failed):
             self._bind_pending_births()
             active = owner.active.clone()
+            verified = owner._verified.clone()
             self._observe_estimate(active & policy_owned & ~failed, now_s, estimate)
             result = finish(now_s, estimate, policy_owned=policy_owned, failed=failed)
+            # Native recovery commits its physics-based certificate at interval
+            # finish (jump commits in observe_physics), before handoff/reset.
+            for row in (active & ~verified & owner._verified).nonzero().flatten().cpu().tolist():
+                key = self.keys[row]
+                self.success_events.record(row, key[1],
+                    prior_invalid=self.records[key]['invalid_intervals'],
+                    nonfinite_physical_ticks=int(self.counts[row, 2]))
             if self.qualification is not None:
                 self._finish_qualification(failed)
             self.maximum[:, 1] = torch.maximum(self.maximum[:, 1], owner.estimated_stable_s)
@@ -335,6 +346,7 @@ class RecoveryEvaluation:
         # First attribute the completed interval to its old episode, then bind
         # newborns against the IDs published by the now-complete native reset.
         self._bind_pending_births()
+        return self.success_events.observe_transition(transition, valid)
 
     def sample(self):
         self._bind_pending_births()
@@ -363,6 +375,7 @@ class RecoveryEvaluation:
                 group['validated_outcomes'][outcome] = group['validated_outcomes'].get(outcome, 0) + 1
                 group['validated_verified_episodes'] += int(record['native_verified_physical_success'])
         result = {'configuration': asdict(self.native.config), 'by_scenario': groups, 'episodes': episodes,
+            'physical_success_events': self.success_events.summary(),
             'scope': 'Per native recovery episode, including initial active births and automatic resets. Physical evidence stops at native active=false; no post-handoff certification is invented.',
             'validity': 'Raw native outcomes are retained. Validated boundaries exclude any invalid interval/nonfinite physical tick in that recovery episode and require a valid observed ending interval. Non-policy-owned ticks are counted separately and excluded from predicate statistics.',
             'condition_units': 'Failed/only-failed counts are physical ticks, not independent trials; maxima include every observed substep, not just policy endpoints.'}

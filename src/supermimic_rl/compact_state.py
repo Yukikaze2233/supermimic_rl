@@ -118,7 +118,20 @@ class CompactStateProjector:
             raise ValueError("Native root orientation must be a unit xyzw quaternion")
         quaternion = quaternion / norm
         omega = motion[:, 3:]
-        origin_velocity = motion[:, :3] - torch.linalg.cross(omega, com[:, :3] - link[:, :3])
+        com_position = com[:, :3]
+        local_com = context.get('body_com_pose_local_xyzw')
+        if local_com is not None:
+            if (not isinstance(local_com, Tensor) or local_com.shape != (n, len(self.body_names), 7)
+                    or not local_com.is_floating_point() or not torch.isfinite(local_com).all()):
+                raise ValueError('Invalid native body_com_pose_local_xyzw context')
+            # Match LabStartupDynamics.base_com_position, used by the native
+            # velocity label. SDK p + R*c rounds differently at large world xy.
+            offset = local_com[:, self.root_index, :3]
+            imaginary, scalar = quaternion[:, :3], quaternion[:, 3:]
+            cross = torch.linalg.cross(imaginary, offset)
+            com_position = link[:, :3] + offset + 2 * (
+                scalar * cross + torch.linalg.cross(imaginary, cross))
+        origin_velocity = motion[:, :3] - torch.linalg.cross(omega, com_position - link[:, :3])
         projected = {name: value.clone() for name, value in state.items() if name not in self._REMOVED}
         projected.update({
             "root_height_above_ground_m": link[:, 2:3] - ground.reshape(n, 1),

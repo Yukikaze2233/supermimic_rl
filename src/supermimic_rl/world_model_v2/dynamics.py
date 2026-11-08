@@ -7,11 +7,15 @@ is the 20 ms endpoint; there is no independent endpoint head that can disagree.
 """
 from __future__ import annotations
 
+from contextlib import contextmanager
+
 import torch
 from torch import Tensor, nn
 
 from .records import TICK_LABEL_DIM
 from .physical import INCREMENT_DIM
+
+MODEL_FIT_PRECISIONS = ('float32', 'bfloat16')
 
 
 class RunningNorm(nn.Module):
@@ -67,6 +71,25 @@ class MotionModel(nn.Module):
         nn.init.zeros_(self.net[-1].bias)
         self.input_norm = RunningNorm(input_dim)
         self.output_norm = RunningNorm(self.output_dim, eps=1e-4)
+        # Runtime scope only: checkpoints retain FP32 parameters and buffers.
+        self._fit_precision = 'float32'
+
+    @contextmanager
+    def fitting_precision(self, precision: str):
+        """Select network arithmetic for one fit; imagination keeps its default.
+
+        CPU uses the FP32 reference path even when a resumed configuration
+        requests CUDA BF16. Nested/disposable fits restore the preceding scope,
+        including when a failed fit raises before backward.
+        """
+        if precision not in MODEL_FIT_PRECISIONS:
+            raise ValueError('Model fit precision must be float32 or bfloat16')
+        previous = self._fit_precision
+        self._fit_precision = precision
+        try:
+            yield
+        finally:
+            self._fit_precision = previous
 
     def targets(self, ticks: Tensor) -> Tensor:
         return ticks.flatten(-2)
@@ -77,5 +100,13 @@ class MotionModel(nn.Module):
 
     def forward(self, inputs: Tensor) -> tuple[Tensor, Tensor]:
         """Final increment ``[N, 26]`` and four full tick labels ``[N, 4, 56]``."""
-        raw = self.net(self.input_norm(inputs).to(self.net[0].weight.dtype)).to(inputs.dtype)
+        normalized = self.input_norm(inputs).to(self.net[0].weight.dtype)
+        if self._fit_precision == 'bfloat16' and inputs.is_cuda:
+            # Keep normalization, physical integration, losses and optimizer
+            # state outside autocast; only the motion MLP uses Tensor Cores.
+            with torch.autocast(device_type='cuda', dtype=torch.bfloat16):
+                raw = self.net(normalized)
+            raw = raw.to(inputs.dtype)
+        else:
+            raw = self.net(normalized).to(inputs.dtype)
         return self.split(raw * self.output_norm.std() + self.output_norm.mean)

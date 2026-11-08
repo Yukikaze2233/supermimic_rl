@@ -8,7 +8,8 @@ from __future__ import annotations
 from dataclasses import replace
 from types import SimpleNamespace
 
-from transformer_rl.formal.tasks.command_pool import CommandPool
+import torch
+from transformer_rl.formal.tasks.command_pool import CommandPool, SegmentKind
 from transformer_rl.formal.tasks.curriculum import TaskFamily, interpolate_domain
 
 from .curriculum import CourseCurriculumConfig, STAGE_NAMES, SuperMimicCurriculum, _TransitionBudget
@@ -19,12 +20,59 @@ JUMP_FIRST_STAGE_NAMES = tuple(STAGE_NAMES[index] for index in STAGE_ORDER)
 
 
 class JumpFirstCommandPool(CommandPool):
-    """Keep the requested jump yaw instead of overriding it with random heading."""
+    """Preserve request motion and sample genuinely in-place spin segments.
+
+    The native jump success needs 2 s of stable landing with a body angular
+    speed of at most 0.5 rad/s, which no turning command can meet: in R8 the
+    yaw part of the stable-landing test started failing when moving jumps
+    (with the segment's yaw rate) entered the course. The evaluated moving
+    jumps also command no yaw.
+
+    SCUT's spin pool samples small forward commands but its reward deadzone
+    treats them as zero. Our admitted-command contract has no such deadzone:
+    sample zero explicitly for SPIN_LOW/MID so the existing centering reward
+    is exercised. NORMAL micro-motion and gimbal translation remain distinct.
+    """
 
     def sample(self, family, *args, **kwargs):
         draw = super().sample(family, *args, **kwargs)
-        return replace(draw, heading_enabled=(
-            draw.heading_enabled & (family != int(TaskFamily.REQUEST))))
+        request = family == int(TaskFamily.REQUEST)
+        spin = (draw.kind == int(SegmentKind.SPIN_LOW)) | (draw.kind == int(SegmentKind.SPIN_MID))
+        command = draw.command.clone()
+        command[:, 0] = torch.where(spin, 0., command[:, 0])
+        command[:, 2] = torch.where(request, 0., command[:, 2])
+        return replace(draw, command=command, heading_enabled=draw.heading_enabled & ~request)
+
+    def bind_episode_targets(self, tasks):
+        """Use the curriculum's standing/moving draw throughout each REQUEST birth.
+
+        The native pool otherwise discards ``task.command`` at both the first
+        and later segment draws. Reuse that existing draw rather than adding
+        another random stream or replacing the ordinary/terrain command pool.
+        This cache belongs to physical episodes: a cold physics reset
+        repopulates it from the next actual birth, under the caller's existing
+        sampler restoration semantics.
+        """
+        forward = torch.zeros_like(tasks.stream.current[:, 0])
+        begin_episode, draw_segments = tasks._begin_episode_segments, tasks._draw_segments
+
+        def begin(ids, task):
+            forward[ids] = task.command[:, 0]
+            return begin_episode(ids, task)
+
+        def draw(rows):
+            segment = draw_segments(rows)
+            request = tasks.family[rows] == int(TaskFamily.REQUEST)
+            vx = forward[rows]
+            command = segment.command.clone()
+            command[:, 0] = torch.where(request, vx, command[:, 0])
+            # Native _apply_segment clears translation for STAND. Assign the
+            # kind from this task's target, not the discarded random target.
+            kind = torch.where(vx == 0, int(SegmentKind.STAND), int(SegmentKind.NORMAL))
+            return replace(segment, command=command, kind=torch.where(request, kind, segment.kind))
+
+        tasks._begin_episode_segments = begin
+        tasks._draw_segments = draw
 
 
 def install_jump_first_command_pool(tasks, curriculum):
@@ -34,8 +82,12 @@ def install_jump_first_command_pool(tasks, curriculum):
     if not isinstance(tasks.command_pool, CommandPool):
         raise ValueError('Jump-first course requires the native command pool')
     tasks.command_pool = JumpFirstCommandPool(tasks.command_pool.config)
+    tasks.command_pool.bind_episode_targets(tasks)
     return {'schedule': SCHEDULE, 'request_heading_override': False,
-            'native_handoff_preserved': True,
+            'native_handoff_preserved': True, 'request_yaw_rate': 0.,
+            'request_motion': 'birth_forward_held_v1',
+            'request_motion_resume': 'cold_physics_reset_repopulates_cache',
+            'spin_motion': 'zero_forward_spin_segments_v1',
             'early_jump_domain': list(curriculum.initial_domain.jump_m)}
 
 
@@ -74,6 +126,31 @@ class JumpFirstCurriculum(SuperMimicCurriculum):
             stage_weights=self.stage_weights, continuous=True)
         self.budget = self._budget(0)
 
+    # Keys of performance gates the trainer has opened (``stage@fraction``),
+    # or None when the jump height follows the coordinate. Not checkpointed
+    # here: the trainer restores its gates and re-applies them after resume.
+    opened_gates: frozenset[str] | None = None
+
+    def set_opened_gates(self, keys) -> None:
+        """Use measured gate openings, or None for the authored exposure schedule."""
+        self.opened_gates = None if keys is None else frozenset(keys)
+
+    def ladder_gate_keys(self) -> tuple[str, ...]:
+        """Performance gate keys (``stage@fraction``) of the jump height ladder, in order."""
+        return tuple(f'{self.config.jump_height_stage}@{fraction:g}'
+                     for fraction, _ in self.config.jump_height_gates)
+
+    def jump_height_level(self) -> int | None:
+        """Number of jump height gates opened in order, if performance drives the height."""
+        if self.opened_gates is None or not self.config.jump_height_gates:
+            return None
+        level = 0
+        for key in self.ladder_gate_keys():
+            if key not in self.opened_gates:
+                break
+            level += 1
+        return level
+
     def _budget(self, real_transitions):
         budget = _TransitionBudget(SimpleNamespace(
             stage_transition_budgets=self.stage_budgets,
@@ -103,10 +180,14 @@ class JumpFirstCurriculum(SuperMimicCurriculum):
             index = self.stage_names.index(self.config.jump_height_stage)
             start, budget = sum(self.stage_budgets[:index]), self.stage_budgets[index]
             upper = self.initial_domain.jump_m[1]
-            for fraction, cap in self.config.jump_height_gates:
+            level = self.jump_height_level()
+            for number, (fraction, cap) in enumerate(self.config.jump_height_gates):
                 # Match CourseGates' integer boundary exactly: its held
                 # coordinate is boundary - 1, even for a very large budget.
-                if self.real_transitions >= start + int(fraction * budget):
+                # With reported (non-holding) gates the opened ladder decides.
+                reached = (self.real_transitions >= start + int(fraction * budget) if level is None
+                           else number < level)
+                if reached:
                     upper = cap
             jump = replace(jump, jump_m=(self.initial_domain.jump_m[0], upper))
         return replace(command, height_m=height.height_m,

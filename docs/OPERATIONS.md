@@ -30,6 +30,8 @@ SUPERMIMIC_SCRIPT=scripts/<script>.py bash scripts/run_gpufree.sh <script argume
 
 ## PPO 教师
 
+当前连续训练使用 `course_gate_mode="report"`、`stop_after_gate=false`：记录课程表现，普通失败和未达标继续学习。跳跃高度推进由实际运行配置的 `jump_height_progression` 决定；当前已使用 `schedule` 开放至 0.4 m，同时继续记录各高度档表现，不将门槛通过等同于已掌握高跳。不要把下文历史版本的逐门槛停训编排用于这条连续训练线。
+
 ```bash
 # 训练（新运行或 --resume 完整 checkpoint）
 SUPERMIMIC_SCRIPT=scripts/train_ppo.py bash scripts/run_gpufree.sh train \
@@ -37,7 +39,7 @@ SUPERMIMIC_SCRIPT=scripts/train_ppo.py bash scripts/run_gpufree.sh train \
   --config configs/gpufree/ppo-gated4-fullturn-resume-r5.json \
   --resume <checkpoint.pt> --output <output>
 
-# 27 场景分技能评价（factory 需含 evaluation 段；评价永不安装跳跃助力）
+# 分技能评价（factory 含 evaluation 段、desynchronize_episodes=false；无跳跃助力）
 SUPERMIMIC_SCRIPT=scripts/evaluate_ppo_skills.py bash scripts/run_gpufree.sh \
   --factory-config configs/gpufree/ppo-gated3-fullturn-skills64.json \
   --checkpoint <checkpoint.pt> --steps 1000 --output <output>
@@ -46,9 +48,13 @@ SUPERMIMIC_SCRIPT=scripts/evaluate_ppo_skills.py bash scripts/run_gpufree.sh \
 python scripts/train_ppo.py export --checkpoint <checkpoint.pt> --output teacher.onnx
 ```
 
-输出：`training/metrics.jsonl`（每更新一行，含门槛状态与原生技能计数增量）、`training/checkpoint.pt`（完整可恢复）、`training/checkpoints/update-*.pt`（轻量）。门槛超时会保存后以 `gate_timeout` 结束，必须先诊断再续训。
+输出：`training/metrics.jsonl`（每更新一行，含门槛状态与原生技能计数增量）、`training/checkpoint.pt`（完整可恢复）、`training/checkpoints/update-*.pt`（轻量）。历史 `hold` 模式可因门槛超时保存后以 `gate_timeout` 结束；当前 `report` 连续训练不因此停止。
 
 固定场景评价默认使用 Actor 均值；`--action-sampling ppo-gaussian --sampling-seed <seed>` 可单独检查 checkpoint 的训练探索噪声，动作 RNG 与环境 RNG 分开。`recovery_diagnostics` 按回合记录交接/超时、各物理和估计判据及最长稳定时间；`recovery_phases` 将实际恢复与交接后的跟踪分开。`jump_diagnostics` 按请求记录峰高、上升/离地证据、实际助力冲量和最长落地静稳，并分开协议结束与物理认证。不完整或无效区间保留诊断标记，不计作成功。
+
+PPO 默认能力评价直接使用原生历史、估计器反馈和重置前转移，不建立世界模型布局、replay 或额外子步 recorder。因此可以评价已启用 episode 轮时延等 PPO 物理扩展的策略；这种评价通过不表示世界模型已兼容这些扩展。原生跳跃、恢复和台阶观察器仍在真实物理子步上统计证据。
+
+评价加 `--record-dataset` 可在同一次原生运行中保存 `replay.pt`，供世界模型离线拟合或数据覆盖分析；`train_world_v2.py evaluate` 也支持该选项。录制仍须满足紧凑 V2 的模型合同，不能借默认 PPO 评价绕过不兼容检查。录制包括全部评价步的四个物理子步、执行与观测记忆、任务/台阶/跳跃/恢复状态、实际估计器输出、ToF 随机源和原始有效性/终止边界，失败样本也保留；不会开启训练更新或推进训练课程。报告给出数据文件 SHA256，数据内保存模型 SHA256 和动作采样方式；随机动作采集得到的离地数据不等同确定性部署能力，也不自动授予教师资格。固定场景的出生与指令编排见数据内 `collection.task_suite`，不能把该编排当作普通训练分布。
 
 需要排除原生提前交接造成的恢复认证截断时，在评价 factory 的 `evaluation` 段显式设置 `"recovery_qualification": true`（默认关闭）。固定恢复场景从每次出生起，在原生超时预算内保持事先给定的零平移/零偏航率与该场景恢复高度；预算按策略拥有控制权的物理子步累计，当前配置为 5 s，零力矩释放不消耗预算。原生交接后仍继续独立检查相同物理判据与连续稳定时间，成功也不会提前释放固定指令。
 
@@ -71,9 +77,11 @@ python scripts/run_ppo_gated_course.py \
   --resume <full-checkpoint.pt> --output <new-course-output>
 ```
 
-正式编排要求 `stop_after_gate=true`：通过门槛立即保存不可变 checkpoint，退出该 Isaac 进程，完成 64×1000 无助力的 27 场景评价后才续训。已要求技能缺少物理成功时返回 `diagnostic_required`，进程失败时保留待评价 checkpoint；`--continue-run` 只恢复中断的编排，不跳过技能失败。固定评价没有 200/300 mm 跳跃案例，这两档仍看训练中的无助力计数。`budget_complete` 仅表示预算结束，完整能力仍须审阅各场景结果。
+上述可选的历史编排要求 `stop_after_gate=true`：通过门槛立即保存不可变 checkpoint，退出该 Isaac 进程，完成 64×1000 无助力的 27 场景评价后才续训。已要求技能缺少物理成功时返回 `diagnostic_required`，进程失败时保留待评价 checkpoint；`--continue-run` 只恢复中断的编排，不跳过技能失败。它不适用于当前 `report` 连续训练。固定评价没有 200/300 mm 跳跃案例，这两档仍看训练中的无助力计数。`budget_complete` 仅表示预算结束，完整能力仍须审阅各场景结果。
 
 ## SuperMimic（世界模型 V2）
+
+当前在线学生使用 `guard_mode="report"`，回报监控只供评审，不回滚策略或降低学习率；恢复后在原有策略预热结束的前提下立即恢复统计。单独设置 `course_coordinate` 会固定课程采样位置，增加 cycles 不会自动获得后续台阶/地形数据。可从完整断点启用 `course_progression`，沿原生阶段顺序和比例推进采样；跳跃高度独立按实际结果提升，其他阶段继续。配置与恢复语义见 [世界模型课程接续](WORLD_V2_COURSE_PROGRESS.md)。阶段走完不代表能力通过，也不会自动补齐尚未建模的外部推扰。
 
 ```bash
 # 1. 教师导出（含原生评价证据）
@@ -105,6 +113,17 @@ python scripts/report_world_v2_data.py --online-checkpoint <online>/training/res
 完整在线配对报告通过只读 mmap 视图读取 replay，避免再分配一份完整训练回放；采样窗口仍拥有独立存储。训练恢复默认复制数据，不受此选项影响。读取活跃运行时，应依据最后写入的 `resume.json` 固定同一代 checkpoint/replay，避免两槽轮换期间混用不同循环；报告记录对应循环和 replay 文件名。
 
 离线续拟合可用 `fit_world_v2.py --online-checkpoint <resume.pt> --contact-event-fraction <fraction>` 增加接触事件窗口的采样比例，默认值为 0。事件定义沿用原生两轮支撑载荷 ≤2 N、连续两个 5 ms 子步，包含跨控制步的连续事件；合法窗口和训练/留出环境划分保持不变。其余窗口均匀采样，只有均匀部分更新归一化统计，整个 batch 使用原损失；采样比例需要根据留出集运动与接触指标验证。
+
+用新采集的原生数据接续已有运动模型时，使用显式入口：
+
+```sh
+python scripts/fit_world_v2.py <new-native>/replay.pt \
+  --initial-online-checkpoint <frozen-online.pt> \
+  --linkage <matching-linkage.json> --terrain-atlas <matching-atlas.json> \
+  --device cuda:0 --output <new-fit.json>
+```
+
+该入口只继承运动网络、归一化状态及 Adam，保留模型结构与学习率，不读取原在线 replay，也不更新 Actor/Critic。新数据必须匹配模型 schema；训练/留出环境按新数据划分，不能宣称沿用了原在线留出集。输出保存模型来源及新数据 SHA256。后续通过 `--resume <new-fit.checkpoint.pt>` 恢复独立的模型、Adam、采样 RNG 和新数据划分，无需原在线 checkpoint；数据内容不得被替换。新模型必须检查接触事件和原有能力保留情况，离线拟合完成不代表已接入在线学生。
 
 `--wheel-contact-weight <weight>` 可额外单独归约双轮连续载荷的归一化 MSE，默认 0 保持原损失。该项沿用每个子步的输出尺度与误差下限，按两轮、四个子步及拟合时域取均值；总损失为 `state + ticks + weight * wheel_contact`。候选值 1 表示额外组的系数为 1，叠加原有 56 维 ticks 损失后，双轮通道相对原项的权重为 29 倍；它是待验证的训练系数，不是物理参数。使用相同留出集同时检查运动与接触事件，离线配置和日志会保存权重及分项损失。续训继承已存权重，旧 checkpoint 缺省为 0；改变权重需从明确的在线源另建离线实验。在线训练默认不启用该项。
 

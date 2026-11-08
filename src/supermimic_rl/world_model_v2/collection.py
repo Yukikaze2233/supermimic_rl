@@ -13,8 +13,10 @@ from .replay import CompactReplay
 from .motion_task import MotionTask
 from .stair_task import STAIR_RECORD_FIELDS, StairTaskState
 from .stair_source import TOF_RECORD_FIELDS, StairSourceState
-from .jump_task import JUMP_RECORD_FIELDS, JUMP_TRIGGER_RECORD_FIELDS, JumpTaskState
+from .jump_task import (JUMP_FLIGHT_LATCH_RECORD_FIELDS, JUMP_RECORD_FIELDS, JUMP_TRIGGER_RECORD_FIELDS,
+                        JumpTaskState)
 from .recovery_task import RECOVERY_RECORD_FIELDS, RecoveryTaskState
+from .platform_records import PLATFORM_RECORD_FIELDS, PlatformRecordState, encode_platform_interval
 
 
 def _schema_action_bounds(schema) -> tuple[float, ...]:
@@ -28,16 +30,43 @@ class Collector:
                  replay: CompactReplay | None = None, advance_training_progress: bool = True,
                  record_terrain: bool = False, record_tasks: bool = False, record_stairs: bool = False,
                  record_stair_source: bool = False, record_jumps: bool = False, record_recovery: bool = False,
-                 course_coordinate: int | None = None):
+                 course_coordinate: int | None = None, course_coordinate_at=None,
+                 record_platform: bool = False, platform_landing=None):
         if environment.current is None:
             raise ValueError('Reset the native environment before constructing its collector')
         if action_noise_std < 0 or history_length < 1 or capacity_steps < 1:
             raise ValueError('Invalid collection history or action noise')
         if course_coordinate is not None and (course_coordinate < 0 or not advance_training_progress):
             raise ValueError('A fixed course coordinate must be nonnegative and explicitly applied')
+        if course_coordinate_at is not None and (not callable(course_coordinate_at) or not advance_training_progress):
+            raise ValueError('A course sampling clock must be callable and explicitly applied')
         self.environment, self.decision = environment, decision
-        self.layout = (SnapshotLayout(environment.schema, record_terrain=True) if record_terrain
-                       else SnapshotLayout(environment.schema))
+        if type(record_platform) is not bool or (record_platform and not record_jumps):
+            raise ValueError('Platform collection requires an explicit opt-in and complete jump task records')
+        if not record_platform and platform_landing is not None:
+            raise ValueError('A platform landing owner requires opt-in platform collection')
+        if record_platform:
+            native = environment.adapter.env
+            caller = getattr(native, 'supermimic_platform_intent', None)
+            if (not callable(getattr(caller, 'capture', None))
+                    or getattr(platform_landing, 'native', None) is not native
+                    or getattr(native, 'supermimic_platform_landing', None) is not platform_landing
+                    or not all(callable(getattr(platform_landing, name, None)) for name in
+                               ('capture', 'begin_interval', 'capture_interval', 'abort_interval'))):
+                raise ValueError('Platform collection requires the native caller and actual landing owner capture')
+        self.record_platform, self.platform_landing = record_platform, platform_landing
+        layout_options = {'record_platform': True} if record_platform else {}
+        if record_terrain:
+            layout_options['record_terrain'] = True
+        self.layout = SnapshotLayout(environment.schema, **layout_options)
+        if replay is not None and any((name in replay.data) != record_platform for name in PLATFORM_RECORD_FIELDS):
+            raise ValueError('Collector platform records differ from replay; legacy state is not known inactive')
+        if replay is not None:
+            from .disturbance import DISTURBANCE_RECORD_FIELDS
+
+            records_disturbances = getattr(self.layout, 'record_disturbances', False)
+            if any((name in replay.data) != records_disturbances for name in DISTURBANCE_RECORD_FIELDS):
+                raise ValueError('Collector disturbance records differ from replay; migrate explicitly')
         if replay is not None and ('terrain_tile' in replay.data) != record_terrain:
             raise ValueError('Collector terrain record layout differs from its replay')
         if replay is not None and record_terrain and 'task_family' not in replay.data:
@@ -64,6 +93,10 @@ class Collector:
         record_trigger = record_jumps and getattr(environment.adapter.env, 'supermimic_jump_trigger', None) is not None
         if replay is not None and any((name in replay.data) != record_trigger for name in JUMP_TRIGGER_RECORD_FIELDS):
             raise ValueError('Collector jump trigger differs from replay; migrate the legacy history explicitly')
+        record_latch = record_jumps and hasattr(
+            getattr(getattr(environment.adapter.env, '_terrain_course', None), 'tasks', None), 'supermimic_flight_latch')
+        if replay is not None and any((name in replay.data) != record_latch for name in JUMP_FLIGHT_LATCH_RECORD_FIELDS):
+            raise ValueError('Collector first-flight latch differs from replay; migrate the legacy history explicitly')
         if record_recovery and not record_jumps:
             raise ValueError('Recovery collection requires complete jump and stair arbitration state')
         if replay is not None and any((name in replay.data) != record_recovery
@@ -85,6 +118,7 @@ class Collector:
         self.history_length, self.action_noise_std = history_length, action_noise_std
         self.curriculum_transition_cap = curriculum_transition_cap
         self.course_coordinate = course_coordinate
+        self.course_coordinate_at = course_coordinate_at
         self.advance_training_progress = advance_training_progress
         self.generator = torch.Generator(device=environment.device).manual_seed(seed)
         frame = environment.current.actor_observation
@@ -110,6 +144,8 @@ class Collector:
                           min(real_transitions, self.curriculum_transition_cap))
             if self.course_coordinate is not None:
                 coordinate = self.course_coordinate
+            if self.course_coordinate_at is not None:
+                coordinate = self.course_coordinate_at(self.steps)
             if self.advance_training_progress:
                 env.set_training_progress(real_transitions=coordinate, actor_updates=actor_updates)
             task = MotionTask.capture(env.adapter.env) if self.record_tasks else None
@@ -117,6 +153,8 @@ class Collector:
             source = StairSourceState.capture(env.adapter.env) if self.record_stair_source else None
             jump = JumpTaskState.capture(env.adapter.env) if self.record_jumps else None
             recovery = RecoveryTaskState.capture(env.adapter.env) if self.record_recovery else None
+            platform = (PlatformRecordState.capture(env.adapter.env, self.platform_landing.capture,
+                        count=env.num_envs, device=env.device) if self.record_platform else None)
             action, estimate = self.decision(self.history)
             teacher_rows = getattr(self.decision, 'teacher_rows', None)
             if action.shape != (env.num_envs, 6) or estimate.shape != (env.num_envs, 5):
@@ -130,7 +168,17 @@ class Collector:
                 # Keeping it outside replay avoids duplicating it per environment.
                 generator = env.adapter.env._terrain_course.tof_trigger.generator
                 on_source_rng(self.steps, generator.get_state().clone())
-            transition = env.step((action + noise).clamp(-self.action_bounds, self.action_bounds))
+            if self.record_platform:
+                self.platform_landing.begin_interval()
+                try:
+                    transition = env.step((action + noise).clamp(-self.action_bounds, self.action_bounds))
+                    platform_ticks = encode_platform_interval(self.platform_landing.capture_interval(),
+                                                               count=env.num_envs, device=env.device)
+                except BaseException:
+                    self.platform_landing.abort_interval()
+                    raise
+            else:
+                transition = env.step((action + noise).clamp(-self.action_bounds, self.action_bounds))
             record = self.layout.encode(transition)
             if task is not None:
                 record['motion_task'] = task
@@ -147,6 +195,9 @@ class Collector:
             if recovery is not None:
                 record.update(recovery.record())
                 record['recovery_record_valid'] = task_estimate.new_ones(env.num_envs, 1)
+            if platform is not None:
+                record.update(platform.record())
+                record.update(platform_ticks)
             if self.replay is None:
                 self.replay = CompactReplay({name: tuple(value.shape[1:]) for name, value in record.items()},
                                              env.num_envs, self.capacity, env.device)
@@ -187,7 +238,8 @@ class Collector:
         return {'transitions': self.steps * env.num_envs, 'stored_transitions': len(self.replay),
                 'reward_mean': reward_sum / (steps * self.environment.num_envs),
                 'terminations': terminations, 'truncations': truncations,
-                'course_coordinate': coordinate, 'fixed_course_coordinate': self.course_coordinate,
+                'course_coordinate': coordinate,
+                'fixed_course_coordinate': self.course_coordinate if self.course_coordinate_at is None else None,
                 **{f'{name}_{key}': value for name, totals in populations.items() if totals['transitions']
                    for key, value in (('reward_mean', totals['reward'] / totals['transitions']),
                                       ('transitions', totals['transitions']),

@@ -19,6 +19,25 @@ def read_actor(path, device):
     return load_student_actor(path, device)
 
 
+def read_source_lineage(path, schema):
+    """Read authenticated source receipts from the small model file only."""
+    if path is None:
+        return ()
+    from supermimic_rl.world_model_v2.migrations.source_lineage import source_lineage_from_saved
+
+    saved = torch.load(path, map_location='cpu', weights_only=True, mmap=True)
+    return source_lineage_from_saved(saved, schema)
+
+
+def read_course_migrations(path, schema):
+    """Keep the legacy sampling-only reader output for existing callers."""
+    if path is None:
+        return ()
+    from supermimic_rl.world_model_v2.migrations.course import FORMAT
+
+    return tuple(proof for proof in read_source_lineage(path, schema) if proof['format'] == FORMAT)
+
+
 def exit_native_failure(output, error):
     """Preserve the original failure without entering Kit's default exit-zero close."""
     try:
@@ -56,6 +75,8 @@ def main():
     train.add_argument('--linkage', type=Path, default=Path('configs/linkage/leg_linkage_e726d23c.json'))
     commands.choices['evaluate'].add_argument('--checkpoint', type=Path, required=True)
     commands.choices['evaluate'].add_argument('--steps', type=int, default=1000)
+    commands.choices['evaluate'].add_argument('--record-dataset', action='store_true',
+        help='Save this evaluation\'s complete compact V2 replay for world-model training')
     export = commands.add_parser('export')
     export.add_argument('--checkpoint', type=Path, required=True)
     export.add_argument('--output', type=Path, required=True)
@@ -85,8 +106,9 @@ def main():
             if args.command == 'train':
                 from supermimic_rl.world_model_v2.online import OnlineConfig, OnlineTrainer
                 from supermimic_rl.world_model_v2.teacher import load_native_teacher, native_teacher_decision
+                source_lineage = read_source_lineage(args.resume, env.schema)
                 teacher = load_native_teacher(args.teacher, args.teacher_sha256,
-                                              device=env.device, native_provenance=adapter.provenance)
+                    device=env.device, native_provenance=adapter.provenance, source_lineage=source_lineage)
 
                 def teacher_decision():
                     return native_teacher_decision(teacher, env)
@@ -112,6 +134,9 @@ def main():
                     signal.signal(signal.SIGUSR1, previous_handler)
             else:
                 from supermimic_rl.world_model_v2.evaluation import evaluate_native
+                from supermimic_rl.world_model_v2.teacher import file_sha256
+
+                digest = file_sha256(args.checkpoint)
                 actor, saved = read_actor(args.checkpoint, env.device)
                 if saved['schema_fingerprint'] != env.schema.fingerprint:
                     raise ValueError('Student and native evaluation schema/source differ')
@@ -120,8 +145,15 @@ def main():
                     with (output / 'progress.jsonl').open('a') as stream:
                         stream.write(json.dumps(record) + '\n')
 
-                report = evaluate_native(env, actor, args.steps, on_progress=progress)
+                report = evaluate_native(env, actor, args.steps, on_progress=progress,
+                    record_dataset=output / 'replay.pt' if args.record_dataset else None,
+                    recording_source={'kind': 'student_native_evaluation',
+                        'checkpoint': str(args.checkpoint.resolve()), 'checkpoint_sha256': digest,
+                        'action_sampling': 'deterministic'})
+                if file_sha256(args.checkpoint) != digest:
+                    raise ValueError('Student checkpoint changed during evaluation')
                 report['checkpoint'] = str(args.checkpoint.resolve())
+                report['checkpoint_sha256'] = digest
             (output / 'summary.json').write_text(json.dumps(report, indent=2) + '\n')
             print(json.dumps(report), flush=True)
         except BaseException as error:

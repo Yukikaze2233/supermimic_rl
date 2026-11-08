@@ -8,6 +8,7 @@ import torch
 from torch import nn
 
 from ..contracts import action_bounds_from_source
+from ..chassis_observation import LEGACY_COMMANDS, chassis_frame
 from ..ppo.policy import FRAME_DIM, HISTORY_LENGTH, TeacherActor
 
 PPO_TEACHER_FORMAT = 'supermimic-native-ppo-teacher-v1'
@@ -69,7 +70,9 @@ def export_ppo_teacher_payload(checkpoint, evaluation_path, qualified_for):
     config = PPOConfig.from_dict(saved['config'])
     with torch.random.fork_rng(devices=[]):
         actor = TeacherActor(config.actor_hidden, config.estimator_hidden, config.initial_std,
-                             mean_squash=config.mean_squash, action_bounds=config.action_bounds)
+                             mean_squash=config.mean_squash, action_bounds=config.action_bounds,
+                             chassis_command_contract=config.chassis_command_contract,
+                             actor_features=config.actor_features)
     actor.load_state_dict(saved['actor'], strict=True)
     bounds = action_bounds_from_source(source)
     if (not all(torch.isfinite(value).all() for value in actor.state_dict().values())
@@ -80,9 +83,12 @@ def export_ppo_teacher_payload(checkpoint, evaluation_path, qualified_for):
     metadata = {'format': PPO_TEACHER_FORMAT, 'initial_checkpoint': {'path': str(checkpoint), 'sha256': digest,
         'updates': saved['updates'], 'transitions': saved['transitions']},
         'history_length': HISTORY_LENGTH, 'observation_dim': FRAME_DIM, 'action_bounds': list(bounds),
+        'chassis_command_contract': config.chassis_command_contract,
+        'actor_features': config.actor_features,
         'action_semantics': ('own PPO deterministic mean followed by existing per-axis hard clipping; '
                              f'mean squash {config.mean_squash}'),
-        'history_semantics': 'native obs_buf policy [N,5,42], oldest first, first 35 channels; native reset filling',
+        'history_semantics': ('native obs_buf policy [N,5,42], oldest first; versioned chassis_frame '
+                              'preprocessing; native reset filling'),
         'estimate_semantics': 'body velocity xyz and two wheel-contact logits; no privileged labels',
         'native_source': source, 'qualified_for': scopes,
         'qualification': {'declaration': 'caller-reviewed scope; no automatic success threshold',
@@ -94,8 +100,9 @@ def export_ppo_teacher_payload(checkpoint, evaluation_path, qualified_for):
             'mean_squash': config.mean_squash}
 
 
-def load_native_teacher(path, expected_sha256, *, device, native_provenance):
-    """Load the qualified own MLP artifact or retain the existing CP18026 bridge."""
+def load_native_teacher(path, expected_sha256, *, device, native_provenance, course_migrations=(),
+                        source_lineage=()):
+    """Load pinned weights; sampling compatibility never expands qualification."""
     path = Path(path).resolve(strict=True)
     if file_sha256(path) != expected_sha256:
         raise ValueError('Native teacher checkpoint SHA256 differs')
@@ -114,7 +121,16 @@ def load_native_teacher(path, expected_sha256, *, device, native_provenance):
                 or not source.get('qualified_for')):
             raise ValueError('Own PPO teacher deployment contract differs')
         native = json.loads(_native_schema_source(native_provenance))
-        if source['native_source'] != native:
+        compatible = native
+        if source_lineage:
+            from .migrations.source_lineage import compatible_source_lineage
+
+            compatible = compatible_source_lineage(source['native_source'], native, source_lineage)
+        elif course_migrations:
+            from .migrations.course import compatible_course_source
+
+            compatible = compatible_course_source(source['native_source'], native, course_migrations)
+        if source['native_source'] != compatible:
             raise ValueError('Own PPO teacher evaluation and native collection source differ')
         if tuple(source['action_bounds']) != action_bounds_from_source(native):
             raise ValueError('Own PPO teacher action bounds differ from the native collection')
@@ -122,7 +138,9 @@ def load_native_teacher(path, expected_sha256, *, device, native_provenance):
             # Artifacts exported before the bounded mean carry no squash field.
             actor = TeacherActor(tuple(payload['actor_hidden']), tuple(payload['estimator_hidden']),
                                  mean_squash=payload.get('mean_squash', 'none'),
-                                 action_bounds=tuple(source['action_bounds']))
+                                 action_bounds=tuple(source['action_bounds']),
+                                 chassis_command_contract=source.get('chassis_command_contract', LEGACY_COMMANDS),
+                                 actor_features=source.get('actor_features'))
         actor.load_state_dict(payload['actor'], strict=True)
         teacher = PinnedPpoTeacher(actor, {**source, 'teacher_artifact': {'path': str(path), 'sha256': expected_sha256}})
         if file_sha256(path) != expected_sha256:
@@ -138,4 +156,6 @@ def native_teacher_decision(teacher, environment):
     """
     native = environment.adapter.env
     history = native.obs_buf['policy'].reshape(environment.num_envs, teacher.history_length, 42)
-    return teacher.action_and_estimate(history[..., :FRAME_DIM])
+    actor = teacher.actor if isinstance(teacher, PinnedPpoTeacher) else teacher
+    return teacher.action_and_estimate(chassis_frame(
+        history, getattr(actor, 'chassis_command_contract', LEGACY_COMMANDS)))
