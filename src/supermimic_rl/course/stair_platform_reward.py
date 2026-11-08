@@ -7,7 +7,7 @@ from pathlib import Path
 
 import torch
 
-from ..reward_kernel import StairPlatformGeometry
+from ..reward_kernel import StairPlatformGeometry, stair_support_masks
 
 
 class NativeStairPlatformReward:
@@ -25,6 +25,7 @@ class NativeStairPlatformReward:
         self.episode_id = torch.full_like(native._episode_id, -1)
         self.top = torch.zeros_like(self.protocol.height_m)
         self.lower = torch.zeros_like(self.top)
+        self.transfer_started = torch.zeros_like(self.request_id, dtype=torch.bool)
         self._originals = None
 
     def install(self):
@@ -36,6 +37,7 @@ class NativeStairPlatformReward:
             result = record(fired, accepted, active_id=active_id)
             # An accepted external replacement must not inherit a ToF target.
             self.request_id.masked_fill_(accepted, -1)
+            self.transfer_started.masked_fill_(accepted, False)
             beam = self.course._last_tof_beam
             if active_id is not None and beam is not None:
                 # detect() is pure. Reuse the current, already queried beam;
@@ -49,16 +51,20 @@ class NativeStairPlatformReward:
                 self.episode_id.copy_(torch.where(bound, self.native._episode_id, self.episode_id))
                 self.top.copy_(torch.where(bound, top, self.top))
                 self.lower.copy_(torch.where(bound, lower, self.lower))
+            if active_id is not None:
+                self.transfer_started &= (self.request_id >= 0) & (self.request_id == active_id)
             return result
 
         def reset_rows(ids, now_s):
             result = reset(ids, now_s)
             self.request_id[ids] = -1
+            self.transfer_started[ids] = False
             return result
 
         def clear_rows(mask):
             result = clear(mask)
             self.request_id.masked_fill_(mask, -1)
+            self.transfer_started.masked_fill_(mask, False)
             return result
 
         self._originals = record, reset, clear
@@ -84,7 +90,27 @@ class NativeStairPlatformReward:
         else:
             bottoms = support.wheel_bottom_world_z_m
             valid = bound & support.valid & ~self.course.query_invalid
-        return StairPlatformGeometry(bottoms, self.top, self.lower, valid)
+        return StairPlatformGeometry(bottoms, self.top, self.lower, valid, self.transfer_started & bound)
+
+    @torch.no_grad()
+    def observe(self, sample, reference, base_net_upward_n, *, input_valid):
+        """Advance once at this pre-reset physical endpoint, then score that tick.
+
+        The composer supplies its complete identity/timestamp validation and
+        the force scoped by install_stair_support_reference to this observe.
+        Missing support geometry cannot start the phase, but unloading after
+        the first support cannot return the same request to its approach reward.
+        """
+        geometry = self(sample)
+        current = ((self.request_id >= 0) & (self.request_id == self.protocol.active_id)
+                   & (self.episode_id == self.native._episode_id))
+        self.transfer_started &= current
+        _, supported, _ = stair_support_masks(reference, base_net_upward_n)
+        same_control = sample.control_epoch == self.native._control_epoch
+        finite_geometry = (torch.isfinite(geometry.wheel_bottom_world_z_m).all(-1)
+                           & torch.isfinite(self.top) & torch.isfinite(self.lower) & (self.top > self.lower))
+        self.transfer_started |= geometry.valid & finite_geometry & input_valid & same_control & supported
+        return self(sample)
 
     @property
     def receipt(self):
@@ -92,7 +118,7 @@ class NativeStairPlatformReward:
             return hashlib.sha256(Path(inspect.getfile(value)).read_bytes()).hexdigest()
 
         return {
-            'format': 'ordinary-stair-accepted-platform-height-v1',
+            'format': 'ordinary-stair-accepted-platform-height-transfer-v2',
             'source_sha256': source_sha(type(self)),
             'native_trigger_source_sha256': source_sha(type(self.trigger)),
             'native_protocol_source_sha256': source_sha(type(self.protocol)),
@@ -100,10 +126,13 @@ class NativeStairPlatformReward:
             'target': 'lower=beam.height_m[:,0]; top=lower+detected_rise; actual world metres',
             'wheel_bottom': 'same-tick TerrainSupportSample.wheel_bottom_world_z_m',
             'lifetime': 'accepted request ID and episode; reset/clear invalidate; no external-request target',
+            'phase': 'first valid same-tick stair_base_supported latches transfer_started until request end/reset/replace',
+            'phase_identity': 'composer pre-reset timestamp/episode/control validation plus current native episode/control',
             'score': 'mean_wheels(clamp(1-relu(top-wheel_bottom)/(top-lower),0,1))',
             'budget': 'replace existing positive.height, maximum 1 per second; all costs unchanged',
-            'scope': 'existing stair_base_supported gate and a valid bound target',
-            'fallback': 'original height objective when unsupported or target unavailable; not completion',
+            'scope': 'ordinary STAIR, not special gimbal, valid bound target and latched transfer_started',
+            'fallback': 'original height objective before first support or when target unavailable; not completion',
+            'boundary': 'first phase entry and request end can still change reward discontinuously; not smoothed',
             'sensor': 'no extra terrain query or random draw; ideal simulator geometry, not hardware ToF',
-            'world_model': 'unsupported: accepted target context is not recorded or advanced in imagination',
+            'world_model': 'unsupported: accepted target and transfer phase are not recorded or advanced in imagination',
         }

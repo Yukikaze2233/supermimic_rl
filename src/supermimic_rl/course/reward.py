@@ -75,14 +75,18 @@ class SharedRewardComposer(PhysicalRewardComposer):
                 curve = self.supermimic_jump_tasks.jump_reference()
                 window['jump_tracking_curve'] = curve
             physical_reference = self.supermimic_jump_physical_reference.sample(sample, reference, curve)
+        stair_force = getattr(self, 'supermimic_stair_base_net_upward_n', None)
+        stair_geometry = None
+        if self.supermimic_stair_platform_geometry is not None:
+            stair_geometry = self.supermimic_stair_platform_geometry.observe(
+                sample, reference, stair_force, input_valid=~invalid)
         densities = physical_reward_densities(
             sample, reference,
             RewardHistory(window['dq'], window['action_cost'], window['action2_cost'], self._action_count),
             RewardParameters.from_composer(self), jump_progress=progress,
-            stair_base_net_upward_n=getattr(self, 'supermimic_stair_base_net_upward_n', None),
+            stair_base_net_upward_n=stair_force,
             jump_physical_reference=physical_reference,
-            stair_platform_geometry=(None if self.supermimic_stair_platform_geometry is None
-                                     else self.supermimic_stair_platform_geometry(sample)))
+            stair_platform_geometry=stair_geometry)
         if (invalid | densities.invalid).any():
             raise ValueError('reward input, PRE-reset identity, timing, phase or finite density bound differs')
         positive, cost = densities.positive, densities.cost

@@ -170,7 +170,7 @@ class RewardExtensions:
     coaxial_action_smoothing: bool = False  # common-period leg target differences; unchanged wheel speed costs
     jump_tuck_endpoint_normalized: bool = False  # zero tuck reward at full source extension, same maximum budget
     recovery_tilt_geodesic: bool = False  # recovery-only attitude cost without the Euler pitch branch cut
-    stair_platform_height: bool = False  # replace supported STAIR height budget with accepted-riser wheel progress
+    stair_platform_height: bool = False  # after first support, keep accepted-riser wheel progress until request end
 
     # Opt-ins added after the first extension receipts. Their disabled values
     # are omitted, so sources recorded before each opt-in keep their identity.
@@ -286,12 +286,15 @@ class StairPlatformGeometry:
     The two wheel bottoms come from this physical tick. Top and lower heights
     are the accepted ToF beam's actual terrain samples, not its noisy request
     height or the body-height command. A missing target is a valid fallback.
+    transfer_started is request memory: once supported, unloading does not
+    return the same request to the original approach-height objective.
     """
 
     wheel_bottom_world_z_m: Tensor
     platform_top_world_z_m: Tensor
     platform_lower_world_z_m: Tensor
     valid: Tensor
+    transfer_started: Tensor
 
     def validate(self, prototype: Tensor) -> None:
         for value, shape in ((self.wheel_bottom_world_z_m, (*prototype.shape, 2)),
@@ -299,9 +302,9 @@ class StairPlatformGeometry:
                              (self.platform_lower_world_z_m, prototype.shape)):
             if value.shape != shape or value.device != prototype.device or not value.is_floating_point():
                 raise ValueError('Stair platform geometry requires matching float world heights')
-        if (self.valid.shape != prototype.shape or self.valid.device != prototype.device
-                or self.valid.dtype != torch.bool):
-            raise ValueError('Stair platform geometry requires matching bool validity rows')
+        if any(flag.shape != prototype.shape or flag.device != prototype.device or flag.dtype != torch.bool
+               for flag in (self.valid, self.transfer_started)):
+            raise ValueError('Stair platform geometry requires matching bool validity and transfer-phase rows')
 
 
 @dataclass(frozen=True)
@@ -574,6 +577,24 @@ def gimbal_tracking_densities(reference, velocity_world):
     return positive, cost, errors
 
 
+def stair_support_masks(reference: RewardReference, base_net_upward_n: Tensor):
+    """The existing ordinary support rule, shared by the density and phase owner."""
+    mode = reference.mode
+    if (base_net_upward_n is None or base_net_upward_n.shape != mode.shape
+            or base_net_upward_n.device != mode.device or not base_net_upward_n.is_floating_point()):
+        raise ValueError('Stair support transfer requires same-tick base net upward force rows')
+    eligible = torch.zeros_like(mode, dtype=torch.bool)
+    if reference.intentional_base_contact is not None:
+        eligible = (mode == int(CommandMode.STAIR)) & reference.intentional_base_contact
+        if reference.gimbal is not None:
+            eligible &= ~reference.gimbal.active
+    valid_force = torch.isfinite(base_net_upward_n) & (base_net_upward_n >= 0)
+    # Reuse the native harmful-contact threshold; horizontal load alone is
+    # not support. Invalid force never starts a transfer phase.
+    supported = eligible & valid_force & (base_net_upward_n > 3.)
+    return eligible, supported, valid_force
+
+
 def physical_reward_densities(sample: RewardPhysics, reference: RewardReference,
                              history: RewardHistory, parameters: RewardParameters, *,
                              jump_progress: JumpProgress | None = None,
@@ -654,20 +675,9 @@ def physical_reward_densities(sample: RewardPhysics, reference: RewardReference,
             reference.rough_dash.body_extension_m - command[:, 3], ordinary_eh)
     stair_transfer = stair_supported = torch.zeros_like(ordinary)
     if parameters.extensions.stair_support_transfer:
-        if (stair_base_net_upward_n is None
-                or stair_base_net_upward_n.shape != ordinary.shape
-                or stair_base_net_upward_n.device != ordinary.device
-                or not stair_base_net_upward_n.is_floating_point()):
-            raise ValueError('Stair support transfer requires same-tick base net upward force rows')
-        if reference.intentional_base_contact is not None:
-            stair_transfer = ((reference.mode == int(CommandMode.STAIR))
-                              & reference.intentional_base_contact & ~gimbal_active)
-        valid_force = torch.isfinite(stair_base_net_upward_n) & (stair_base_net_upward_n >= 0)
+        stair_transfer, stair_supported, valid_force = stair_support_masks(reference, stair_base_net_upward_n)
         invalid |= stair_transfer & ~valid_force
         stair_base_net_upward_n = torch.where(valid_force, stair_base_net_upward_n, 0.)
-        # Reuse the native harmful-contact threshold, without treating a
-        # horizontal collision's large normal load as vertical support.
-        stair_supported = stair_transfer & (stair_base_net_upward_n > 3.)
         ordinary_eh = torch.where(stair_supported, ordinary_eh.clamp_min(0), ordinary_eh)
     full, zero = VELOCITY_HEIGHT_GATE_M
     velocity_gate = torch.where((reference.mode == int(CommandMode.NORMAL)) & ~terrain_active,
@@ -870,9 +880,11 @@ def physical_reward_densities(sample: RewardPhysics, reference: RewardReference,
                                geometry.wheel_bottom_world_z_m)
         numeric = (torch.isfinite(top) & torch.isfinite(lower) & torch.isfinite(bottoms).all(-1)
                    & (top > lower))
-        invalid |= stair_supported & geometry.valid & ~numeric
+        transfer_phase = ((reference.mode == int(CommandMode.STAIR)) & ~gimbal_active
+                          & geometry.transfer_started)
+        invalid |= transfer_phase & geometry.valid & ~numeric
         stair_target_available = geometry.valid & numeric
-        stair_target_active = stair_supported & stair_target_available
+        stair_target_active = transfer_phase & stair_target_available
         # Mask before arithmetic: unavailable geometry must not contaminate
         # ordinary rows or their gradients. No new success/completion event.
         safe_top = torch.where(stair_target_active, top, 0.)
@@ -1155,6 +1167,7 @@ def physical_reward_densities(sample: RewardPhysics, reference: RewardReference,
         errors['stair_base_net_upward_n'] = torch.where(stair_transfer, stair_base_net_upward_n, 0.)
     if extensions.stair_platform_height:
         gates['stair_platform_target_available'] = stair_target_available
+        gates['stair_platform_transfer_started'] = stair_platform_geometry.transfer_started
         gates['stair_platform_height_active'] = stair_target_active
         errors['stair_platform_wheel_shortfall_m'] = stair_wheel_shortfall
         errors['stair_platform_rise_m'] = stair_rise
