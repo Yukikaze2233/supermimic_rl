@@ -170,15 +170,19 @@ class RewardExtensions:
     coaxial_action_smoothing: bool = False  # common-period leg target differences; unchanged wheel speed costs
     jump_tuck_endpoint_normalized: bool = False  # zero tuck reward at full source extension, same maximum budget
     recovery_tilt_geodesic: bool = False  # recovery-only attitude cost without the Euler pitch branch cut
+    stair_platform_height: bool = False  # replace supported STAIR height budget with accepted-riser wheel progress
 
     # Opt-ins added after the first extension receipts. Their disabled values
     # are omitted, so sources recorded before each opt-in keep their identity.
     _RECEIPT_OPT_INS = ('jump_flight_clearance', 'jump_tuck', 'jump_peak_completion', 'stationary_quiet',
                         'jump_physical_tail', 'jump_extension_height_floor', 'stair_support_transfer',
                         'jump_takeoff_extension', 'jump_physical_reference', 'coaxial_action_smoothing',
-                        'jump_tuck_endpoint_normalized', 'recovery_tilt_geodesic')
+                        'jump_tuck_endpoint_normalized', 'recovery_tilt_geodesic', 'stair_platform_height')
 
     def __post_init__(self):
+        if (type(self.stair_platform_height) is not bool
+                or self.stair_platform_height and not self.stair_support_transfer):
+            raise ValueError('Stair platform height requires a boolean flag and stair_support_transfer')
         if type(self.recovery_tilt_geodesic) is not bool:
             raise ValueError('Geodesic recovery tilt requires a boolean flag')
         if type(self.coaxial_action_smoothing) is not bool:
@@ -273,6 +277,31 @@ class JumpPhysicalReference:
                 or any(flag.shape != prototype.shape or flag.device != prototype.device
                        or flag.dtype != torch.bool for flag in flags)):
             raise ValueError('Physical jump reference requires matching float targets and bool phase rows')
+
+
+@dataclass(frozen=True)
+class StairPlatformGeometry:
+    """Reward-only world heights bound to one accepted ordinary stair request.
+
+    The two wheel bottoms come from this physical tick. Top and lower heights
+    are the accepted ToF beam's actual terrain samples, not its noisy request
+    height or the body-height command. A missing target is a valid fallback.
+    """
+
+    wheel_bottom_world_z_m: Tensor
+    platform_top_world_z_m: Tensor
+    platform_lower_world_z_m: Tensor
+    valid: Tensor
+
+    def validate(self, prototype: Tensor) -> None:
+        for value, shape in ((self.wheel_bottom_world_z_m, (*prototype.shape, 2)),
+                             (self.platform_top_world_z_m, prototype.shape),
+                             (self.platform_lower_world_z_m, prototype.shape)):
+            if value.shape != shape or value.device != prototype.device or not value.is_floating_point():
+                raise ValueError('Stair platform geometry requires matching float world heights')
+        if (self.valid.shape != prototype.shape or self.valid.device != prototype.device
+                or self.valid.dtype != torch.bool):
+            raise ValueError('Stair platform geometry requires matching bool validity rows')
 
 
 @dataclass(frozen=True)
@@ -549,7 +578,8 @@ def physical_reward_densities(sample: RewardPhysics, reference: RewardReference,
                              history: RewardHistory, parameters: RewardParameters, *,
                              jump_progress: JumpProgress | None = None,
                              stair_base_net_upward_n: Tensor | None = None,
-                             jump_physical_reference: JumpPhysicalReference | None = None) -> RewardDensities:
+                             jump_physical_reference: JumpPhysicalReference | None = None,
+                             stair_platform_geometry: StairPlatformGeometry | None = None) -> RewardDensities:
     """Pure densities; integrate with the physical dt exactly once outside."""
     invalid = torch.zeros_like(reference.mode, dtype=torch.bool)
     failure_scale = torch.ones_like(sample.height_above_ground_m)
@@ -829,6 +859,31 @@ def physical_reward_densities(sample: RewardPhysics, reference: RewardReference,
         cost['stand_world_xy'] = cost['stand_world_xy'] * ~gimbal_active
         positive.update(gp)
         cost.update(gc)
+    stair_target_available = stair_target_active = torch.zeros_like(ordinary)
+    stair_wheel_shortfall = stair_rise = torch.zeros_like(sample.height_above_ground_m)
+    if parameters.extensions.stair_platform_height:
+        if stair_platform_geometry is None:
+            raise ValueError('Stair platform height requires the accepted-riser geometry producer')
+        geometry = stair_platform_geometry
+        geometry.validate(reference.mode)
+        top, lower, bottoms = (geometry.platform_top_world_z_m, geometry.platform_lower_world_z_m,
+                               geometry.wheel_bottom_world_z_m)
+        numeric = (torch.isfinite(top) & torch.isfinite(lower) & torch.isfinite(bottoms).all(-1)
+                   & (top > lower))
+        invalid |= stair_supported & geometry.valid & ~numeric
+        stair_target_available = geometry.valid & numeric
+        stair_target_active = stair_supported & stair_target_available
+        # Mask before arithmetic: unavailable geometry must not contaminate
+        # ordinary rows or their gradients. No new success/completion event.
+        safe_top = torch.where(stair_target_active, top, 0.)
+        safe_lower = torch.where(stair_target_active, lower, -1.)
+        safe_bottoms = torch.where(stair_target_active[:, None], bottoms, 0.)
+        rise = safe_top - safe_lower
+        shortfall = (safe_top[:, None] - safe_bottoms).clamp_min(0)
+        progress = (1 - shortfall / rise[:, None]).clamp(0, 1).mean(-1)
+        positive['height'] = torch.where(stair_target_active, progress, positive['height'])
+        stair_wheel_shortfall = torch.where(stair_target_active, shortfall.mean(-1), 0.)
+        stair_rise = torch.where(stair_target_active, rise, 0.)
     if sample.available_terms is not None:
         available = set(sample.available_terms)
         positive = {key: value if key in available else torch.zeros_like(value)
@@ -1098,6 +1153,11 @@ def physical_reward_densities(sample: RewardPhysics, reference: RewardReference,
         gates['stair_base_supported'] = stair_supported
         errors['stair_objective_height_error_m'] = torch.where(stair_transfer, ordinary_eh, 0.)
         errors['stair_base_net_upward_n'] = torch.where(stair_transfer, stair_base_net_upward_n, 0.)
+    if extensions.stair_platform_height:
+        gates['stair_platform_target_available'] = stair_target_available
+        gates['stair_platform_height_active'] = stair_target_active
+        errors['stair_platform_wheel_shortfall_m'] = stair_wheel_shortfall
+        errors['stair_platform_rise_m'] = stair_rise
     if extensions.jump_missed and jump_progress is not None and jump_progress.platform_target is not None:
         target = jump_progress.platform_target
         gates['jump_target_eligible'] = target.eligible

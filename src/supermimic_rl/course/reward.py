@@ -80,7 +80,9 @@ class SharedRewardComposer(PhysicalRewardComposer):
             RewardHistory(window['dq'], window['action_cost'], window['action2_cost'], self._action_count),
             RewardParameters.from_composer(self), jump_progress=progress,
             stair_base_net_upward_n=getattr(self, 'supermimic_stair_base_net_upward_n', None),
-            jump_physical_reference=physical_reference)
+            jump_physical_reference=physical_reference,
+            stair_platform_geometry=(None if self.supermimic_stair_platform_geometry is None
+                                     else self.supermimic_stair_platform_geometry(sample)))
         if (invalid | densities.invalid).any():
             raise ValueError('reward input, PRE-reset identity, timing, phase or finite density bound differs')
         positive, cost = densities.positive, densities.cost
@@ -311,7 +313,7 @@ def install_stair_support_reference(native) -> dict:
 
 def install_shared_reward(composer, *, verify_native=False, extensions: RewardExtensions = RewardExtensions(),
                           jump_tasks=None, platform_landing=None, flight_geometry=None,
-                          joint_speed_turn_initial_forward_m_s=None):
+                          joint_speed_turn_initial_forward_m_s=None, stair_platform_geometry=None):
     """Instance-local installation; the frozen native source stays untouched.
 
     Extensions add opt-in terms (and may replace the success event); they are
@@ -336,6 +338,8 @@ def install_shared_reward(composer, *, verify_native=False, extensions: RewardEx
         raise ValueError('Platform reward evidence must share the native jump task owner')
     if extensions.needs_flight_geometry != (flight_geometry is not None):
         raise ValueError('Jump geometry producer must match the enabled geometry reward extensions')
+    if extensions.stair_platform_height != (stair_platform_geometry is not None):
+        raise ValueError('Stair platform geometry producer must match stair_platform_height')
     exposure = None
     if joint_speed_turn_initial_forward_m_s is not None and not verify_native:
         low, high = map(float, joint_speed_turn_initial_forward_m_s)
@@ -351,6 +355,7 @@ def install_shared_reward(composer, *, verify_native=False, extensions: RewardEx
         }
     composer.supermimic_joint_speed_turn_exposure = exposure
     composer.supermimic_jump_geometry = flight_geometry
+    composer.supermimic_stair_platform_geometry = stair_platform_geometry
     composer.supermimic_reward_extensions = extensions
     composer.supermimic_jump_tasks = jump_tasks
     composer.supermimic_platform_landing = platform_landing
@@ -374,6 +379,8 @@ def install_shared_reward(composer, *, verify_native=False, extensions: RewardEx
         receipt['joint_speed_turn_exposure'] = dict(exposure)
     if flight_geometry is not None:
         receipt['jump_flight_geometry'] = flight_geometry.receipt
+    if stair_platform_geometry is not None:
+        receipt['stair_platform_height'] = stair_platform_geometry.receipt
     if composer.supermimic_jump_physical_reference is not None:
         receipt['jump_physical_reference'] = composer.supermimic_jump_physical_reference.receipt()
     if extensions.active:

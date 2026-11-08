@@ -194,9 +194,15 @@ def create_course(configuration):
             jump_geometry = NativeJumpRewardGeometry(JumpRewardGeometry.load(asset_directory,
                 linkage_pin.get('path'), expected_linkage_sha256=linkage_pin.get('sha256')),
                 native._terrain_course)
+        stair_geometry = None
+        if extensions.stair_platform_height:
+            from .stair_platform_reward import NativeStairPlatformReward
+
+            stair_geometry = NativeStairPlatformReward(native).install()
         reward_kernel_receipt = install_shared_reward(
             native._formal_reward.composer, verify_native=configuration.get("audit_reward_kernel", False),
             extensions=extensions, flight_geometry=jump_geometry,
+            stair_platform_geometry=stair_geometry,
             jump_tasks=native._terrain_course.tasks,
             joint_speed_turn_initial_forward_m_s=curriculum.initial_domain.forward_m_s,
             **({} if platform_owner is None else {'platform_landing': platform_owner.landing}))

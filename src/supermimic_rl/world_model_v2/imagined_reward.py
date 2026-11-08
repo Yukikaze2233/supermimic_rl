@@ -189,6 +189,9 @@ class OrdinaryFlatReward:
             raise ValueError('The four-tick reward requires the recorded 200/50 Hz clocks')
         # Native-collection extensions (if any) are part of the pinned source identity.
         self.extensions = RewardExtensions(**source.get('reward_kernel', {}).get('extensions', {}))
+        if self.extensions.stair_platform_height:
+            raise ValueError('Stair platform height is unsupported by compact world-model task records: '
+                             'accepted-riser top/lower target context is not recorded or advanced')
         if self.extensions.jump_physical_reference:
             raise ValueError('Physical jump reference is unsupported by compact world-model task records: '
                              'first-flight root position, velocity and timestamp are not recorded')
