@@ -208,6 +208,17 @@ class FixedCourseScenarios:
             terrain="TWO_PLATFORMS", step=d.step_up_m[1])
         for motion, forward in (("standing", 0.), ("moving", p.approach_forward_m_s[0])):
             add(f"jump_{motion}_100mm", "REQUEST", [command(forward)], jump=.1)
+        # Keep the historical high-speed/max-yaw corner as a pressure case.
+        # These appended cases separate lower-yaw turning and rough coverage;
+        # their existing pool/domain targets do not certify traction capacity.
+        for direction, sign in (("left", 1), ("right", -1)):
+            add(f"forward_turning_{direction}", "ROTATION",
+                [command(vx, sign * p.approach_yaw_rad_s)])
+        add("fast_turning_negative", "ROTATION", [command(vx, -p.normal_yaw_rad_s)])
+        add("rough_forward_speed", "TERRAIN", [command(vx)], terrain="ROUGH")
+        for direction, sign in (("left", 1), ("right", -1)):
+            add(f"rough_turning_{direction}", "TERRAIN",
+                [command(vx, sign * p.approach_yaw_rad_s)], terrain="ROUGH")
         return bank
 
     def _selected(self, ids):
