@@ -95,6 +95,11 @@ class RewardExtensions:
     supplies a settling signal without damping the whole flip or changing the
     recovery handoff. It is not physical success or contact certification.
 
+    ``recovery_tilt_geodesic`` measures recovery attitude error between the
+    current and target up directions. It removes the Euler roll jump when
+    pitch crosses 90 degrees, keeping the native pseudo-Huber coefficient
+    and scale. Positive upright/height/quiet terms and other modes stay intact.
+
     ``stationary_quiet`` rewards low angular speed and low horizontal motion
     after an explicit NORMAL zero command, with both wheels supported and no
     harmful body contact. Its translation factor reuses the existing stand
@@ -164,15 +169,18 @@ class RewardExtensions:
     jump_physical_reference: bool = False  # retain release targets until actual takeoff; re-anchor flight tracking
     coaxial_action_smoothing: bool = False  # common-period leg target differences; unchanged wheel speed costs
     jump_tuck_endpoint_normalized: bool = False  # zero tuck reward at full source extension, same maximum budget
+    recovery_tilt_geodesic: bool = False  # recovery-only attitude cost without the Euler pitch branch cut
 
     # Opt-ins added after the first extension receipts. Their disabled values
     # are omitted, so sources recorded before each opt-in keep their identity.
     _RECEIPT_OPT_INS = ('jump_flight_clearance', 'jump_tuck', 'jump_peak_completion', 'stationary_quiet',
                         'jump_physical_tail', 'jump_extension_height_floor', 'stair_support_transfer',
                         'jump_takeoff_extension', 'jump_physical_reference', 'coaxial_action_smoothing',
-                        'jump_tuck_endpoint_normalized')
+                        'jump_tuck_endpoint_normalized', 'recovery_tilt_geodesic')
 
     def __post_init__(self):
+        if type(self.recovery_tilt_geodesic) is not bool:
+            raise ValueError('Geodesic recovery tilt requires a boolean flag')
         if type(self.coaxial_action_smoothing) is not bool:
             raise ValueError('Coaxial action smoothing requires a boolean flag')
         if (type(self.jump_tuck_endpoint_normalized) is not bool
@@ -205,7 +213,8 @@ class RewardExtensions:
                     or self.jump_landing_rate or self.recovery_quiet or self.success_event is not None
                     or self.ordinary_leg_acceleration is not None or self.stationary_quiet
                     or self.jump_extension_height_floor or self.jump_tuck or self.stair_support_transfer
-                    or self.jump_takeoff_extension or self.jump_physical_reference or self.coaxial_action_smoothing)
+                    or self.jump_takeoff_extension or self.jump_physical_reference or self.coaxial_action_smoothing
+                    or self.recovery_tilt_geodesic)
 
     @property
     def needs_jump_progress(self) -> bool:
@@ -706,11 +715,22 @@ def physical_reward_densities(sample: RewardPhysics, reference: RewardReference,
     # is the pitch component of projected gravity; gy is the roll component.
     ordinary_attitude = 32 * relief.square() * (
         torch.where(terrain_airborne, 0., gx.square()) + gy.square())
+    recovery_attitude = 2 * h(pose / .8).sum(-1)
+    if parameters.extensions.recovery_tilt_geodesic:
+        target_roll, target_pitch = reference.target_roll_pitch_rad.to(sample.gravity_body).unbind(-1)
+        target_up = torch.stack((-target_pitch.sin(), target_roll.sin() * target_pitch.cos(),
+                                 target_roll.cos() * target_pitch.cos()), -1)
+        current_up = -sample.gravity_body
+        # atan2 remains finite at inversion; vector_norm selects a finite
+        # zero subgradient at exact alignment/antipodes, without a flip bias.
+        tilt = torch.atan2(torch.linalg.vector_norm(torch.linalg.cross(current_up, target_up), dim=-1),
+                           (current_up * target_up).sum(-1))
+        recovery_attitude = 2 * h(tilt / .8)
     harmful_contact = (sample.body_normal_load_n[:, parameters.harmful_indices] > 3).any(-1)
     cost = {'forward': (~recovery) * velocity_gate * forward_square_weight * (.25 * ev).square(),
             'yaw': (~recovery) * velocity_gate * VELOCITY_SQUARE_WEIGHT * (.5 * ew).square(),
             'height': height_gate * (10 * eh).square() * (~terrain_airborne),
-            'attitude': torch.where(recovery, 2 * h(pose / .8).sum(-1),
+            'attitude': torch.where(recovery, recovery_attitude,
                                      torch.where(jump, .25 * h(pose / .5).sum(-1),
                                                  ordinary_attitude)),
             # SCUT ang_vel_xy 0.05; recovery flips are ungated, jump uses its own gain.
