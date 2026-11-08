@@ -20,6 +20,7 @@ from transformer_rl.formal.tasks.reward import (
     VELOCITY_SQUARE_WEIGHT, STAND_STILL_WEIGHT, SPIN_CENTERING_WEIGHT,
 )
 from transformer_rl.formal.tasks.gimbal_course import GimbalCourse
+from transformer_rl.formal.control.ownership import canonical_coaxial_displacement
 
 if TYPE_CHECKING:
     from .course.platform_target_reward import PlatformTargetProgress
@@ -130,6 +131,12 @@ class RewardExtensions:
     onto the step. Only that supported base is exempt from harmful contact;
     other bodies retain their costs. Net world-Z force is separate evidence:
     a scalar contact norm cannot distinguish support from a riser impact.
+
+    ``coaxial_action_smoothing`` measures successive leg target differences
+    modulo one COMMON full turn per coupled pair, then differences those
+    increments for the second-order cost. Raw action history remains intact.
+    Wheel speed targets are not periodic. This removes representation cuts,
+    not relative joint motion or actual measured velocity/acceleration costs.
     """
 
     jump_flight: float = 0.        # per second in the request's first real flight (after real ascent)
@@ -151,14 +158,17 @@ class RewardExtensions:
     stair_support_transfer: bool = False  # permit supported ordinary STAIR leg retraction
     jump_takeoff_extension: float = 0.  # per second at the source's maximum virtual leg length while pushing up
     jump_physical_reference: bool = False  # retain release targets until actual takeoff; re-anchor flight tracking
+    coaxial_action_smoothing: bool = False  # common-period leg target differences; unchanged wheel speed costs
 
     # Opt-ins added after the first extension receipts. Their disabled values
     # are omitted, so sources recorded before each opt-in keep their identity.
     _RECEIPT_OPT_INS = ('jump_flight_clearance', 'jump_tuck', 'jump_peak_completion', 'stationary_quiet',
                         'jump_physical_tail', 'jump_extension_height_floor', 'stair_support_transfer',
-                        'jump_takeoff_extension', 'jump_physical_reference')
+                        'jump_takeoff_extension', 'jump_physical_reference', 'coaxial_action_smoothing')
 
     def __post_init__(self):
+        if type(self.coaxial_action_smoothing) is not bool:
+            raise ValueError('Coaxial action smoothing requires a boolean flag')
         if type(self.jump_physical_reference) is not bool:
             raise ValueError('Physical jump reference requires a boolean flag')
         if type(self.stair_support_transfer) is not bool:
@@ -186,7 +196,7 @@ class RewardExtensions:
                     or self.jump_landing_rate or self.recovery_quiet or self.success_event is not None
                     or self.ordinary_leg_acceleration is not None or self.stationary_quiet
                     or self.jump_extension_height_floor or self.jump_tuck or self.stair_support_transfer
-                    or self.jump_takeoff_extension or self.jump_physical_reference)
+                    or self.jump_takeoff_extension or self.jump_physical_reference or self.coaxial_action_smoothing)
 
     @property
     def needs_jump_progress(self) -> bool:
@@ -430,9 +440,23 @@ class RewardHistory:
     action_count: Tensor
 
     @classmethod
-    def from_actions(cls, velocity, action, previous, previous2, action_count):
+    def from_actions(cls, velocity, action, previous, previous2, action_count, *,
+                     coaxial_action_smoothing=False):
         first = (action - previous).square()
         second = (action - 2 * previous + previous2).square()
+        if coaxial_action_smoothing:
+            # Native decode uses q_target = q_nominal + 0.25 * action and
+            # one winding shared by L/LL or R/RR. Keep that same quotient:
+            # an independent wrap would silently alter the closed-chain phi.
+            # Work from consecutive increments, not a wrapped second
+            # difference: real reversals/accelerations must remain costly.
+            delta, _ = canonical_coaxial_displacement(action[:, :4] * .25, previous[:, :4] * .25)
+            previous_delta, _ = canonical_coaxial_displacement(previous[:, :4] * .25,
+                                                               previous2[:, :4] * .25)
+            delta = (delta / .25).to(action.dtype)
+            previous_delta = (previous_delta / .25).to(action.dtype)
+            first = torch.cat((delta.square(), first[:, 4:]), -1)
+            second = torch.cat(((delta - previous_delta).square(), second[:, 4:]), -1)
         first = .0025 * first[:, :4].sum(-1) + .01 * first[:, 4:].sum(-1)
         second = .0125 * second[:, :4].sum(-1) + .01 * second[:, 4:].sum(-1)
         return cls(velocity, torch.where(action_count > 0, first, 0.),

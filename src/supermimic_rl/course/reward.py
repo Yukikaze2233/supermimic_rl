@@ -18,6 +18,16 @@ class SharedRewardComposer(PhysicalRewardComposer):
     """Keep native event ownership/clock semantics around the differentiable kernel."""
 
     @torch.no_grad()
+    def begin(self, *args, **kwargs):
+        PhysicalRewardComposer.begin(self, *args, **kwargs)
+        if self.supermimic_reward_extensions.coaxial_action_smoothing:
+            window = self._window
+            history = RewardHistory.from_actions(
+                window['dq'], window['issued'], self._previous, self._previous2, self._action_count,
+                coaxial_action_smoothing=True)
+            window['action_cost'], window['action2_cost'] = history.action_cost, history.action2_cost
+
+    @torch.no_grad()
     def observe(self, sample: RewardPhysics, reference: RewardReference):
         window = self._window
         if window is None or window['steps'] >= self.substeps:
@@ -328,6 +338,29 @@ def install_shared_reward(composer, *, verify_native=False, extensions: RewardEx
         receipt['jump_physical_reference'] = composer.supermimic_jump_physical_reference.receipt()
     if extensions.active:
         receipt["extensions"] = extensions.receipt()
+    if extensions.coaxial_action_smoothing:
+        from transformer_rl.formal.control.ownership import canonical_coaxial_displacement
+        from transformer_rl.formal.contracts import ACTION_ORDER
+        from .action_contract import OWNERSHIP_SOURCE_SHA256
+
+        ownership = Path(inspect.getfile(canonical_coaxial_displacement))
+        ownership_sha = hashlib.sha256(ownership.read_bytes()).hexdigest()
+        if ownership_sha != OWNERSHIP_SOURCE_SHA256:
+            raise ValueError('Coaxial action smoothing requires the verified common-winding source')
+        order = tuple(composer.binding.native_joint_names[i] for i in composer.binding.policy_joint_indices)
+        if order != ACTION_ORDER:
+            raise ValueError('Coaxial action smoothing requires the named native policy joint order')
+        composer.begin = MethodType(SharedRewardComposer.begin, composer)
+        receipt['coaxial_action_smoothing'] = {
+            'contract': 'coaxial-action-smoothing-v1',
+            'leg_action_scale_rad': .25,
+            'pairs': [list(ACTION_ORDER[:2]), list(ACTION_ORDER[2:4])],
+            'first_difference': 'nearest common full-turn displacement of successive leg targets',
+            'second_difference': 'difference of consecutive common-aligned increments; no second wrap',
+            'wheels': 'original nonperiodic speed action differences',
+            'history': 'original raw issued actions and native action_count; no new state',
+            'ownership_source_sha256': ownership_sha,
+        }
     return receipt
 
 

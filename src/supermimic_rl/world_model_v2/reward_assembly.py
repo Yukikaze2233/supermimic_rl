@@ -177,7 +177,8 @@ class RewardAssembly:
         physics_ticks, reference_ticks, histories = [], [], []
         invalid = torch.zeros(action.shape[0], dtype=torch.bool, device=action.device)
         history = RewardHistory.from_actions(start.joint_velocity[..., :6], action, memory.previous_action,
-                                              memory.previous_action2, memory.action_count)
+                                              memory.previous_action2, memory.action_count,
+                                              coaxial_action_smoothing=self.parameters.extensions.coaxial_action_smoothing)
         for tick in ticks:
             wheel_speed = previous.joint_velocity[..., 4:6]
             queue = self.wheels.push(queue, self.wheels.motor_input(self.wheels.target(action), wheel_speed,
